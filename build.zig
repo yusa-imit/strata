@@ -46,6 +46,21 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Tidy lint (Tiger Style mechanical checks) — always runs as part of `test`.
+    const tidy = b.addExecutable(.{
+        .name = "tidy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tidy.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_tidy = b.addRunArtifact(tidy);
+    run_tidy.addArgs(&.{ "--root", b.pathFromRoot(".") });
+    test_step.dependOn(&run_tidy.step);
+
+    const tidy_step = b.step("tidy", "Run the tidy lint on its own");
+    tidy_step.dependOn(&run_tidy.step);
+
     // Benchmarks
     const bench = b.addExecutable(.{
         .name = "strata-bench",

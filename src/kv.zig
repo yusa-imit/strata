@@ -1,4 +1,5 @@
-//! strata.kv — Embedded KV engine: Db open/get/put/delete/scan, WriteBatch, Snapshot, engine selection.
+//! strata.kv — Embedded KV engine: Db open/get/put/delete/scan, WriteBatch, Snapshot,
+//! engine selection.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `kv/db.zig`

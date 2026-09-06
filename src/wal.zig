@@ -1,4 +1,5 @@
-//! strata.wal — Segmented write-ahead log: frames, group-commit writer, reader, checkpoint, recovery.
+//! strata.wal — Segmented write-ahead log: frames, group-commit writer, reader,
+//! checkpoint, recovery.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `wal/frame.zig`

@@ -1,4 +1,5 @@
-//! strata.btree — Page-based B+Tree: slotted nodes, split/merge, overflow pages, range cursors, bulk load.
+//! strata.btree — Page-based B+Tree: slotted nodes, split/merge, overflow pages,
+//! range cursors, bulk load.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `btree/node.zig`
