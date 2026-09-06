@@ -1,4 +1,5 @@
-//! strata.file — Platform file I/O: sync policies (fdatasync/fsync/F_FULLFSYNC), O_DIRECT, preallocate, locks, mmap.
+//! strata.file — Platform file I/O: sync policies (fdatasync/fsync/F_FULLFSYNC),
+//! O_DIRECT, preallocate, locks, mmap.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `file/file.zig`

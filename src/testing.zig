@@ -1,4 +1,5 @@
-//! strata.testing — Crash-injection harness (torn writes, truncation at arbitrary offsets), differential model.
+//! strata.testing — Crash-injection harness (torn writes, truncation at arbitrary
+//! offsets), differential model.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `testing/crash.zig`

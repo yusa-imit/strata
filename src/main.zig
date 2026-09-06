@@ -1,3 +1,5 @@
+//! strata's CLI binary: `strata version` / `strata --help`.
+
 const std = @import("std");
 const strata = @import("strata");
 

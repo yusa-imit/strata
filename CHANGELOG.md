@@ -15,3 +15,6 @@ All notable changes to this project are documented in this file. The format foll
 ### Added
 
 - This changelog.
+- `tools/tidy.zig`: kingdom `tidy` lint, shape checks (line length ≤ 100 Unicode code
+  points, every `.zig` file under `src/` opens with a `//!` doc header). Wired into
+  `zig build test` via a new `zig build tidy` step so it cannot be skipped.
