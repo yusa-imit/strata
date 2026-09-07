@@ -18,3 +18,9 @@ All notable changes to this project are documented in this file. The format foll
 - `tools/tidy.zig`: kingdom `tidy` lint, shape checks (line length ≤ 100 Unicode code
   points, every `.zig` file under `src/` opens with a `//!` doc header). Wired into
   `zig build test` via a new `zig build tidy` step so it cannot be skipped.
+- `tools/tidy.zig`: function-length ratchet (≤ 70 lines clean, 71–72 tolerated only via
+  a shrink-only exception table in `tools/tidy_baseline.txt`, 73+ always fails); ban
+  list (`catch unreachable` without a `// proof:` comment, `std.debug.print` outside
+  `src/main.zig`/`bench/`, `std.time.*` in `src/` outside `src/main.zig`); a
+  strata-specific `// wire-format`-scoped check banning `usize` inside on-disk format
+  structs (fixed-width `u32`/`u64` only).
