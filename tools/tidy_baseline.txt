@@ -1,0 +1,8 @@
+# tidy function-length red-zone baseline.
+#
+# Format: path:fn_name:lines — one entry per function that is legitimately
+# 71-72 lines long (the "red zone"; 73+ lines fails regardless of any entry
+# here). Entries may only shrink or disappear as code shrinks; a stale entry
+# (function shrank to <=70 lines, grew past 72, or no longer exists) fails
+# tidy's "stale-baseline" check. Empty until Phase 1 introduces the first
+# legitimately long function.
