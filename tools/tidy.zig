@@ -7,7 +7,7 @@
 //! `zig-pkg`, loads `--baseline` (default `tools/tidy_baseline.txt`, a
 //! missing file means an empty baseline), lints every `.zig` file found,
 //! prints the report to stdout, and exits 1 on any finding.
-//! Built for Zig 0.15.2 (`std.fs`); no allocator is retained past `main`'s own arena.
+//! Built for Zig 0.16.0 (`std.Io.Dir`); no allocator is retained past `main`'s own arena.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -564,9 +564,9 @@ pub fn formatFindings(allocator: Allocator, findings: []const Finding) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem glue (std.fs, Zig 0.15.2). Bounded, non-recursive directory walk:
-// a `queue` of relative directory paths stands in for the explicit bounded
-// stack Tiger Style requires in place of recursion (`dir_queue_max`).
+// Filesystem glue (std.Io.Dir, Zig 0.16.0). Bounded, non-recursive directory
+// walk: a `queue` of relative directory paths stands in for the explicit
+// bounded stack Tiger Style requires in place of recursion (`dir_queue_max`).
 // ---------------------------------------------------------------------------
 
 const max_file_bytes: usize = 8 * 1024 * 1024;
@@ -588,17 +588,21 @@ fn shouldCollectFile(name: []const u8) bool {
 /// and appending every `.zig` file it finds to `out`.
 fn walkOneDir(
     gpa: Allocator,
-    root: std.fs.Dir,
+    io: std.Io,
+    root: std.Io.Dir,
     rel: []const u8,
     queue: *std.ArrayList([]const u8),
     out: *std.ArrayList([]const u8),
 ) !void {
     std.debug.assert(rel.len > 0);
-    var dir = root.openDir(rel, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = root.openDir(io, rel, .{ .iterate = true }) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return,
+    };
+    defer dir.close(io);
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind == .directory and shouldSkipDirName(entry.name)) continue;
         if (entry.kind != .directory and entry.kind != .file) continue;
         const child = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel, entry.name });
@@ -620,7 +624,8 @@ fn walkOneDir(
 /// this repo's own layout.
 fn walkDir(
     gpa: Allocator,
-    root: std.fs.Dir,
+    io: std.Io,
+    root: std.Io.Dir,
     start: []const u8,
     out: *std.ArrayList([]const u8),
 ) !void {
@@ -633,19 +638,23 @@ fn walkDir(
     while (queue.pop()) |rel| {
         std.debug.assert(iterations < dir_queue_max);
         iterations += 1;
-        try walkOneDir(gpa, root, rel, &queue, out);
+        try walkOneDir(gpa, io, root, rel, &queue, out);
     }
     std.debug.assert(queue.items.len == 0);
 }
 
 fn collectTopLevel(
     gpa: Allocator,
-    root: std.fs.Dir,
+    io: std.Io,
+    root: std.Io.Dir,
     name: []const u8,
     out: *std.ArrayList([]const u8),
 ) !void {
     std.debug.assert(name.len > 0);
-    root.access(name, .{}) catch return;
+    root.access(io, name, .{}) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return,
+    };
     try out.append(gpa, try gpa.dupe(u8, name));
     std.debug.assert(out.items.len > 0);
 }
@@ -653,12 +662,12 @@ fn collectTopLevel(
 /// Collects every `.zig` file under `src/`, `bench/`, `tests/`, plus the
 /// top-level `build.zig` when present, relative to `root`. Caller frees the
 /// returned slice (and each element) with `gpa`.
-fn collectFiles(gpa: Allocator, root: std.fs.Dir) ![][]const u8 {
+fn collectFiles(gpa: Allocator, io: std.Io, root: std.Io.Dir) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(gpa);
 
-    try collectTopLevel(gpa, root, "build.zig", &out);
-    for (scan_roots) |name| try walkDir(gpa, root, name, &out);
+    try collectTopLevel(gpa, io, root, "build.zig", &out);
+    for (scan_roots) |name| try walkDir(gpa, io, root, name, &out);
 
     const result = try out.toOwnedSlice(gpa);
     std.debug.assert(scan_roots.len == 3);
@@ -688,9 +697,14 @@ fn parseBaselineArg(args: []const []const u8) []const u8 {
 /// Reads and parses the baseline file at `path` (relative to `root_dir`); a
 /// missing file is an empty baseline, not an error — a fresh checkout with
 /// no red-zone exceptions yet is the expected common case.
-fn loadBaseline(gpa: Allocator, root_dir: std.fs.Dir, path: []const u8) !Baseline {
+fn loadBaseline(gpa: Allocator, io: std.Io, root_dir: std.Io.Dir, path: []const u8) !Baseline {
     std.debug.assert(path.len > 0);
-    const content = root_dir.readFileAlloc(gpa, path, max_file_bytes) catch |err| switch (err) {
+    const content = root_dir.readFileAlloc(
+        io,
+        path,
+        gpa,
+        .limited(max_file_bytes),
+    ) catch |err| switch (err) {
         error.FileNotFound => return Baseline.init(gpa),
         else => return err,
     };
@@ -758,7 +772,8 @@ fn lintFileFunctionLength(
 
 fn lintAllFiles(
     gpa: Allocator,
-    root_dir: std.fs.Dir,
+    io: std.Io,
+    root_dir: std.Io.Dir,
     paths: []const []const u8,
     baseline: Baseline,
     actual_out: *std.StringHashMap(ActualLen),
@@ -766,7 +781,10 @@ fn lintAllFiles(
 ) !void {
     std.debug.assert(paths.len < 1_000_000);
     for (paths) |p| {
-        const content = root_dir.readFileAlloc(gpa, p, max_file_bytes) catch continue;
+        const content = root_dir.readFileAlloc(io, p, gpa, .limited(max_file_bytes)) catch |err| switch (err) {
+            error.Canceled => return err,
+            else => continue,
+        };
         defer gpa.free(content);
 
         try lintFile(gpa, p, content, findings);
@@ -777,36 +795,35 @@ fn lintAllFiles(
 
 /// Entry point: walks `--root` (default `.`), lints every `.zig` file found,
 /// prints the report to stdout, and exits 1 if any finding was reported.
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const gpa = arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.arena.allocator();
+    const io = init.io;
 
-    const raw_args = try std.process.argsAlloc(gpa);
+    const raw_args = try init.minimal.args.toSlice(gpa);
     const args = raw_args[@min(1, raw_args.len)..];
     const root = parseRootArg(args);
     const baseline_path = parseBaselineArg(args);
     std.debug.assert(root.len > 0);
     std.debug.assert(baseline_path.len > 0);
 
-    var root_dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
-    defer root_dir.close();
+    var root_dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer root_dir.close(io);
 
-    const baseline = try loadBaseline(gpa, root_dir, baseline_path);
-    const paths = try collectFiles(gpa, root_dir);
+    const baseline = try loadBaseline(gpa, io, root_dir, baseline_path);
+    const paths = try collectFiles(gpa, io, root_dir);
 
     var findings: std.ArrayList(Finding) = .empty;
     var actual = std.StringHashMap(ActualLen).init(gpa);
-    try lintAllFiles(gpa, root_dir, paths, baseline, &actual, &findings);
+    try lintAllFiles(gpa, io, root_dir, paths, baseline, &actual, &findings);
 
     const stale_findings = try reconcileBaseline(gpa, baseline, actual);
     for (stale_findings) |f| try findings.append(gpa, f);
 
     const report = try formatFindings(gpa, findings.items);
-    try std.fs.File.stdout().writeAll(report);
+    try std.Io.File.stdout().writeStreamingAll(io, report);
 
     std.debug.assert(findings.items.len < 1_000_000);
-    if (findings.items.len > 0) std.posix.exit(1);
+    if (findings.items.len > 0) std.process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
