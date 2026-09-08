@@ -7,6 +7,20 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+
+- Migrated to Zig 0.16.0 (plan 001, items 4/7): `src/main.zig` now takes
+  `init: std.process.Init` and threads `io: std.Io` through its filesystem/stdout calls
+  (`argsAlloc`/`argsFree` → `init.minimal.args.toSlice`, `GeneralPurposeAllocator` →
+  `init.arena`, `std.fs.File.stdout()` → `std.Io.File.stdout()`). `tools/tidy.zig` and
+  `bench/main.zig` needed the same rewrite (`std.fs.Dir` → `std.Io.Dir`, `std.fs.cwd()` →
+  `std.Io.Dir.cwd()`, `std.posix.exit` → `std.process.exit`, `std.time.Timer` →
+  `std.Io.Clock.Timestamp`, `mem.indexOf` → `mem.find`) since both are compiled as part of
+  `zig build test`/`zig build bench`. The library (`src/root.zig` and its ten stub modules)
+  needed no changes — already 0.16-clean; the formal library-sweep ban-list extension (item
+  5) is still open. `build.zig.zon` `.minimum_zig_version` is now `"0.16.0"`; CI no longer
+  pins a Zig version, resolving it from the manifest instead.
+
 ### Fixed
 
 - `src/root.zig` doc comment pointed at `docs/milestones.md`, renamed to
