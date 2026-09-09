@@ -25,6 +25,10 @@ All notable changes to this project are documented in this file. The format foll
 
 - `src/root.zig` doc comment pointed at `docs/milestones.md`, renamed to
   `docs/plans/000-inherited.md`; now points at `docs/plans/`.
+- README/CHANGELOG reconciled with reality (plan 001, item: README/CHANGELOG reconciled):
+  Zig badge `0.15.x` → `0.16.x`; the module table now labels all ten modules `Planned`
+  (none are landed — every one is still a stub); the install snippet pointed at a `v0.1.0`
+  tag that was never published, repointed at the eventual `v0.2.0`.
 
 ### Added
 

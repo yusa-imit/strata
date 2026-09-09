@@ -6,33 +6,37 @@ strata는 플랫폼 파일 I/O 추상화(fsync 정책, mmap, 락), 체크섬이 
 
 [![CI](https://github.com/yusa-imit/strata/workflows/CI/badge.svg)](https://github.com/yusa-imit/strata/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.15.x-orange.svg)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/zig-0.16.x-orange.svg)](https://ziglang.org)
 
 ---
 
 ## Status
 
-**Bootstrap** — API 설계 및 Phase 1 구현 중. 안정 릴리즈 전까지 API는 변경될 수 있다.
+**Bootstrap** — API 설계 중, Phase 1 구현 착수 전. No storage functionality ships yet: every
+module below is a stub (a doc comment and an `Error` set). 안정 릴리즈 전까지 API는 변경될 수 있다.
 
 ## Modules
 
-| Module | Purpose |
-|---|---|
-| `strata.codec` | varint (LEB128/zigzag), fixed-width LE, CRC32C (hw-accelerated), xxhash64. |
-| `strata.file` | Platform file I/O: sync policies (fdatasync/fsync/F_FULLFSYNC), O_DIRECT, preallocate, locks, mmap. |
-| `strata.page` | Page header/format, page manager, freelist, file header. |
-| `strata.cache` | Buffer pool (CLOCK), pin/unpin guards, dirty tracking, stats. |
-| `strata.wal` | Segmented write-ahead log: frames, group-commit writer, reader, checkpoint, recovery. |
-| `strata.btree` | Page-based B+Tree: slotted nodes, split/merge, overflow pages, range cursors, bulk load. |
-| `strata.lsm` | LSM tree: skiplist memtable, SSTable (blocks, index, bloom), compaction, manifest. |
-| `strata.kv` | Embedded KV engine: Db open/get/put/delete/scan, WriteBatch, Snapshot, engine selection. |
-| `strata.snapshot` | Streaming snapshot writer/reader with versioned chunked format. |
-| `strata.testing` | Crash-injection harness (torn writes, truncation at arbitrary offsets), differential model. |
+| Module | Purpose | Status |
+|---|---|---|
+| `strata.codec` | varint (LEB128/zigzag), fixed-width LE, CRC32C (hw-accelerated), xxhash64. | Planned |
+| `strata.file` | Platform file I/O: sync policies (fdatasync/fsync/F_FULLFSYNC), O_DIRECT, preallocate, locks, mmap. | Planned |
+| `strata.page` | Page header/format, page manager, freelist, file header. | Planned |
+| `strata.cache` | Buffer pool (CLOCK), pin/unpin guards, dirty tracking, stats. | Planned |
+| `strata.wal` | Segmented write-ahead log: frames, group-commit writer, reader, checkpoint, recovery. | Planned |
+| `strata.btree` | Page-based B+Tree: slotted nodes, split/merge, overflow pages, range cursors, bulk load. | Planned |
+| `strata.lsm` | LSM tree: skiplist memtable, SSTable (blocks, index, bloom), compaction, manifest. | Planned |
+| `strata.kv` | Embedded KV engine: Db open/get/put/delete/scan, WriteBatch, Snapshot, engine selection. | Planned |
+| `strata.snapshot` | Streaming snapshot writer/reader with versioned chunked format. | Planned |
+| `strata.testing` | Crash-injection harness (torn writes, truncation at arbitrary offsets), differential model. | Planned |
 
 ## Install
 
+No tagged release exists yet — `v0.1.0` was never published. Once plan 001 lands a v0.2.0
+release:
+
 ```bash
-zig fetch --save https://github.com/yusa-imit/strata/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save https://github.com/yusa-imit/strata/archive/refs/tags/v0.2.0.tar.gz
 ```
 
 ```zig
