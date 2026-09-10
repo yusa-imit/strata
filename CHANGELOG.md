@@ -17,9 +17,8 @@ All notable changes to this project are documented in this file. The format foll
   `std.Io.Dir.cwd()`, `std.posix.exit` → `std.process.exit`, `std.time.Timer` →
   `std.Io.Clock.Timestamp`, `mem.indexOf` → `mem.find`) since both are compiled as part of
   `zig build test`/`zig build bench`. The library (`src/root.zig` and its ten stub modules)
-  needed no changes — already 0.16-clean; the formal library-sweep ban-list extension (item
-  5) is still open. `build.zig.zon` `.minimum_zig_version` is now `"0.16.0"`; CI no longer
-  pins a Zig version, resolving it from the manifest instead.
+  needed no changes — already 0.16-clean. `build.zig.zon` `.minimum_zig_version` is now
+  `"0.16.0"`; CI no longer pins a Zig version, resolving it from the manifest instead.
 
 ### Fixed
 
@@ -42,3 +41,9 @@ All notable changes to this project are documented in this file. The format foll
   `src/main.zig`/`bench/`, `std.time.*` in `src/` outside `src/main.zig`); a
   strata-specific `// wire-format`-scoped check banning `usize` inside on-disk format
   structs (fixed-width `u32`/`u64` only).
+- `tools/tidy.zig`: ban list extended (plan 001, item 5 — 0.16 library sweep, frozen) with
+  5 more 0.15-only spellings, confirmed absent from `src`/`bench`/`tests` by the sweep: a
+  bare `ArrayList` `.{}` init instead of `.empty`, `mem.indexOf`/`mem.lastIndexOf` instead
+  of `mem.find`/`mem.findLast`, `std.net.*`, every removed `std.Thread.*` sync primitive
+  (`Mutex`/`Condition`/`Semaphore`/`RwLock`/`ResetEvent`/`WaitGroup`/`Pool`), and
+  `fs.cwd()` instead of `Io.Dir.cwd()`.
