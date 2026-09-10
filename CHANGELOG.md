@@ -47,3 +47,8 @@ All notable changes to this project are documented in this file. The format foll
   of `mem.find`/`mem.findLast`, `std.net.*`, every removed `std.Thread.*` sync primitive
   (`Mutex`/`Condition`/`Semaphore`/`RwLock`/`ResetEvent`/`WaitGroup`/`Pool`), and
   `fs.cwd()` instead of `Io.Dir.cwd()`.
+- `src/testing.zig`: a real `std.testing.tmpDir` round-trip test (plan 001, item: 0.16
+  tests) — writes and reads back a file through `std.testing.io` and the 0.16 `Io.Dir`
+  API, plus a negative-space check that a missing file returns `error.FileNotFound`.
+  The first I/O-touching test in the repo (the prior 12 were `refAllDecls` compile-checks
+  only); exercises the `Io` + `tmpDir` harness before `src/file.zig` needs it in Phase 1A.
