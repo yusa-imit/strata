@@ -52,3 +52,10 @@ All notable changes to this project are documented in this file. The format foll
   API, plus a negative-space check that a missing file returns `error.FileNotFound`.
   The first I/O-touching test in the repo (the prior 12 were `refAllDecls` compile-checks
   only); exercises the `Io` + `tmpDir` harness before `src/file.zig` needs it in Phase 1A.
+- `docs/adr/0001-io-injection.md` (plan 001, item: `io: Io` convention in the public API):
+  strata never constructs an `Io`; exactly one type, `kv.Db`, caches it (set once at
+  `open`, never reassigned) — every other module takes `io: Io` per call, first parameter
+  after the receiver (first parameter for no-receiver constructors). `docs/PRD.md` §4.2 and
+  §4.4–§4.9 rewritten to match: `file`/`page`/`cache`/`wal`/`btree`/`lsm` signatures now sit
+  on `Io.Dir`/`Io.File` instead of `std.fs`; `snapshot.Writer`/`Reader` take `*Io.Writer`/
+  `*Io.Reader` instead of `anytype`. Binding on all of Phase 1–6 implementation to come.
