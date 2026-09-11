@@ -59,3 +59,10 @@ All notable changes to this project are documented in this file. The format foll
   §4.4–§4.9 rewritten to match: `file`/`page`/`cache`/`wal`/`btree`/`lsm` signatures now sit
   on `Io.Dir`/`Io.File` instead of `std.fs`; `snapshot.Writer`/`Reader` take `*Io.Writer`/
   `*Io.Reader` instead of `anytype`. Binding on all of Phase 1–6 implementation to come.
+- `tools/tidy.zig`: assertion-density check (plan 001, item: assertion baseline) — every
+  `src/` file with at least one function-with-a-body must average ≥ 2 assertions
+  (`assert(`/`assert_always(`, ignoring `//` comment text) per function; a stub file with
+  no such function is silent. `zig build test`/`zig build tidy` now print a per-file
+  density report unconditionally, so the figure stays visible as Phase 1 code lands.
+  `src/main.zig`'s `main` gets a paired precondition/postcondition assertion on `args` as
+  the worked example (today's only real function body in `src/`).
