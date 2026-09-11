@@ -635,6 +635,142 @@ pub fn checkWireFormatUsize(allocator: Allocator, path: []const u8, lines: []con
     return result;
 }
 
+/// Mean assertions per function must be at least this to satisfy plan `001`'s
+/// "Assertion baseline" item; today's figure is a floor that may only rise.
+const assertion_density_min: usize = 2;
+
+/// One `src/` file's assertion-density measurement: how many functions with a
+/// measurable body were found (via `extractFnName`/`measureFunctionLines`),
+/// and how many `assert(`/`assert_always(` calls appear across their combined
+/// line spans. Files outside `src/`, and `src/` files with no such function
+/// (a stub), report zero for both fields.
+pub const AssertionDensity = struct {
+    path: []const u8,
+    functions: usize,
+    assertions: usize,
+};
+
+/// Returns the portion of `line` before a `//` line comment, using the same
+/// string/char-literal tracking as `braceDelta` so a `//` inside a string
+/// literal does not truncate real code. A multiline string literal line
+/// (`isMultilineStringLine`) has no code of its own and returns empty.
+fn stripLineComment(line: []const u8) []const u8 {
+    std.debug.assert(line.len < 1_000_000); // sanity: never an absurd line
+    if (isMultilineStringLine(line)) return line[0..0];
+
+    var in_string = false;
+    var in_char = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (in_string) {
+            if (c == '\\') i += 1 else if (c == '"') in_string = false;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\') i += 1 else if (c == '\'') in_char = false;
+            continue;
+        }
+        switch (c) {
+            '/' => if (i + 1 < line.len and line[i + 1] == '/') return line[0..i],
+            '"' => in_string = true,
+            '\'' => in_char = true,
+            else => {},
+        }
+    }
+
+    std.debug.assert(i == line.len);
+    return line;
+}
+
+/// Counts `assert(`/`assert_always(` occurrences (one match per line, per
+/// needle, ignoring any `//` line-comment tail) across the inclusive line
+/// span `[start_idx, start_idx + span)`.
+fn countAssertionsInSpan(lines: []const []const u8, start_idx: usize, span: usize) usize {
+    std.debug.assert(span > 0);
+    std.debug.assert(start_idx + span <= lines.len);
+    var count: usize = 0;
+    var i = start_idx;
+    while (i < start_idx + span) : (i += 1) {
+        const code = stripLineComment(lines[i]);
+        if (std.mem.indexOf(u8, code, "assert(") != null) count += 1;
+        if (std.mem.indexOf(u8, code, "assert_always(") != null) count += 1;
+    }
+    std.debug.assert(count <= span * 2);
+    return count;
+}
+
+/// Measures every function-with-a-body in `path` (`src/` only; other paths
+/// report zero functions and zero assertions), summing `assert(`/
+/// `assert_always(` calls across each function's line span.
+pub fn measureAssertionDensity(path: []const u8, lines: []const []const u8) AssertionDensity {
+    std.debug.assert(path.len > 0);
+    var functions: usize = 0;
+    var assertions: usize = 0;
+
+    if (std.mem.startsWith(u8, path, "src/")) {
+        var idx: usize = 0;
+        while (idx < lines.len) : (idx += 1) {
+            _ = extractFnName(lines[idx]) orelse continue;
+            const span = measureFunctionLines(lines, idx) orelse continue;
+            functions += 1;
+            assertions += countAssertionsInSpan(lines, idx, span);
+        }
+    }
+
+    std.debug.assert(functions <= lines.len);
+    return .{ .path = path, .functions = functions, .assertions = assertions };
+}
+
+/// Check: a `src/` file with at least one function-with-a-body must average
+/// at least `assertion_density_min` assertions per function; a file with no
+/// such functions (a stub) is silent — there is nothing yet to assert over.
+pub fn checkAssertionDensity(allocator: Allocator, density: AssertionDensity) ![]Finding {
+    std.debug.assert(density.path.len > 0);
+    var out: std.ArrayList(Finding) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (density.functions > 0 and density.assertions < density.functions * assertion_density_min) {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "{d} assertion(s) across {d} function(s) is below the floor of {d} per function",
+            .{ density.assertions, density.functions, assertion_density_min },
+        );
+        try out.append(allocator, .{
+            .path = density.path,
+            .line = 1,
+            .rule = "assertion-density",
+            .message = msg,
+        });
+    }
+
+    const result = try out.toOwnedSlice(allocator);
+    std.debug.assert(result.len <= 1);
+    return result;
+}
+
+/// Renders one density-report line per `src/` file that has at least one
+/// function-with-a-body, in input order: `tidy: density path: A assertion(s)
+/// / F function(s)`. Files with zero such functions are omitted; printed
+/// unconditionally by `main`, independent of pass/fail, so density stays
+/// visible as Phase 1 code lands. Caller frees the result with `allocator`.
+pub fn formatDensityReport(allocator: Allocator, densities: []const AssertionDensity) ![]u8 {
+    std.debug.assert(densities.len < 1_000_000); // sanity: never a runaway file list
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    for (densities) |d| {
+        if (d.functions == 0) continue;
+        try buf.print(allocator, "tidy: density {s}: {d} assertion(s) / {d} function(s)\n", .{
+            d.path, d.assertions, d.functions,
+        });
+    }
+
+    const result = try buf.toOwnedSlice(allocator);
+    std.debug.assert(result.len == 0 or densities.len > 0);
+    return result;
+}
+
 /// Renders every finding as `path:line: rule: message\n`, then a summary line
 /// `tidy: N finding(s)\n`. Caller frees the result with `allocator`.
 pub fn formatFindings(allocator: Allocator, findings: []const Finding) ![]u8 {
@@ -833,6 +969,32 @@ fn lintFile(
     std.debug.assert(lines.len < 1_000_000); // sanity: matches formatFindings' bound
 }
 
+/// Lints one already-read file's assertion density, appending onto both
+/// `densities_out` (unconditionally, for `formatDensityReport`) and
+/// `findings` (only when the density check fails). Kept apart from
+/// `lintFile` for the same reason as `lintFileFunctionLength`: that
+/// function's signature is pinned by its own unit tests.
+fn lintFileAssertionDensity(
+    gpa: Allocator,
+    path: []const u8,
+    content: []const u8,
+    densities_out: *std.ArrayList(AssertionDensity),
+    findings: *std.ArrayList(Finding),
+) !void {
+    std.debug.assert(path.len > 0);
+    const lines = try splitLines(gpa, content);
+    defer gpa.free(lines);
+
+    const density = measureAssertionDensity(path, lines);
+    try densities_out.append(gpa, density);
+
+    const density_findings = try checkAssertionDensity(gpa, density);
+    defer gpa.free(density_findings);
+    for (density_findings) |f| try findings.append(gpa, f);
+
+    std.debug.assert(lines.len < 1_000_000); // sanity: matches lintFile's own bound
+}
+
 /// Reads and lints every collected `paths`, skipping (not failing on) a path
 /// that fails to read — a file removed between the walk and the read is not
 /// this tool's problem to report.
@@ -866,6 +1028,7 @@ fn lintAllFiles(
     paths: []const []const u8,
     baseline: Baseline,
     actual_out: *std.StringHashMap(ActualLen),
+    densities_out: *std.ArrayList(AssertionDensity),
     findings: *std.ArrayList(Finding),
 ) !void {
     std.debug.assert(paths.len < 1_000_000);
@@ -878,6 +1041,7 @@ fn lintAllFiles(
 
         try lintFile(gpa, p, content, findings);
         try lintFileFunctionLength(gpa, p, content, baseline, actual_out, findings);
+        try lintFileAssertionDensity(gpa, p, content, densities_out, findings);
     }
     std.debug.assert(findings.items.len < 1_000_000);
 }
@@ -903,10 +1067,14 @@ pub fn main(init: std.process.Init) !void {
 
     var findings: std.ArrayList(Finding) = .empty;
     var actual = std.StringHashMap(ActualLen).init(gpa);
-    try lintAllFiles(gpa, io, root_dir, paths, baseline, &actual, &findings);
+    var densities: std.ArrayList(AssertionDensity) = .empty;
+    try lintAllFiles(gpa, io, root_dir, paths, baseline, &actual, &densities, &findings);
 
     const stale_findings = try reconcileBaseline(gpa, baseline, actual);
     for (stale_findings) |f| try findings.append(gpa, f);
+
+    const density_report = try formatDensityReport(gpa, densities.items);
+    try std.Io.File.stdout().writeStreamingAll(io, density_report);
 
     const report = try formatFindings(gpa, findings.items);
     try std.Io.File.stdout().writeStreamingAll(io, report);
@@ -1669,6 +1837,141 @@ test "checkWireFormatUsize does not flag usize as a substring of a longer identi
     const findings = try checkWireFormatUsize(gpa, "src/wal.zig", &lines);
     defer freeFindings(gpa, findings);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+// -- measureAssertionDensity / checkAssertionDensity / formatDensityReport ------
+// Plan 001 item "Assertion baseline": a src/ file with at least one
+// function-with-a-body must average >= 2 assertions per function.
+
+test "measureAssertionDensity counts assert( and assert_always( calls in one function" {
+    const lines = [_][]const u8{
+        "fn f(x: u32) u32 {",
+        "    std.debug.assert(x > 0);",
+        "    assert_always(x < 100);",
+        "    return x;",
+        "}",
+    };
+    const d = measureAssertionDensity("src/a.zig", &lines);
+    try std.testing.expectEqual(@as(usize, 1), d.functions);
+    try std.testing.expectEqual(@as(usize, 2), d.assertions);
+}
+
+test "measureAssertionDensity does not count assert( mentioned only in a comment" {
+    const lines = [_][]const u8{
+        "fn f() void {",
+        "    // TODO: add assert(x) here once the invariant is known",
+        "    doWork();",
+        "}",
+    };
+    const d = measureAssertionDensity("src/a.zig", &lines);
+    try std.testing.expectEqual(@as(usize, 1), d.functions);
+    try std.testing.expectEqual(@as(usize, 0), d.assertions);
+}
+
+test "measureAssertionDensity still counts a real assert( followed by a trailing comment" {
+    const lines = [_][]const u8{
+        "fn f() void {",
+        "    assert(true); // reason",
+        "}",
+    };
+    const d = measureAssertionDensity("src/a.zig", &lines);
+    try std.testing.expectEqual(@as(usize, 1), d.functions);
+    try std.testing.expectEqual(@as(usize, 1), d.assertions);
+}
+
+test "measureAssertionDensity sums assertions across multiple functions" {
+    const lines = [_][]const u8{
+        "fn f() void {",
+        "    assert(true);",
+        "    assert(true);",
+        "}",
+        "fn g() void {",
+        "    assert(true);",
+        "}",
+    };
+    const d = measureAssertionDensity("src/a.zig", &lines);
+    try std.testing.expectEqual(@as(usize, 2), d.functions);
+    try std.testing.expectEqual(@as(usize, 3), d.assertions);
+}
+
+test "measureAssertionDensity reports zero functions for a stub file with no fn opener" {
+    const lines = [_][]const u8{ "//! doc", "pub const Error = error{NotImplemented};" };
+    const d = measureAssertionDensity("src/codec.zig", &lines);
+    try std.testing.expectEqual(@as(usize, 0), d.functions);
+    try std.testing.expectEqual(@as(usize, 0), d.assertions);
+}
+
+test "measureAssertionDensity is silent outside src/ regardless of content" {
+    const lines = [_][]const u8{ "fn f() void {", "}" };
+    const d = measureAssertionDensity("tools/tidy.zig", &lines);
+    try std.testing.expectEqual(@as(usize, 0), d.functions);
+    try std.testing.expectEqual(@as(usize, 0), d.assertions);
+}
+
+test "checkAssertionDensity is silent when a file has no functions with a body" {
+    const gpa = std.testing.allocator;
+    const findings = try checkAssertionDensity(
+        gpa,
+        .{ .path = "src/a.zig", .functions = 0, .assertions = 0 },
+    );
+    defer freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "checkAssertionDensity is silent when the mean meets the floor of 2" {
+    const gpa = std.testing.allocator;
+    const findings = try checkAssertionDensity(
+        gpa,
+        .{ .path = "src/a.zig", .functions = 2, .assertions = 4 },
+    );
+    defer freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "checkAssertionDensity fails a fixture asserting nothing" {
+    const gpa = std.testing.allocator;
+    const findings = try checkAssertionDensity(
+        gpa,
+        .{ .path = "src/a.zig", .functions = 1, .assertions = 0 },
+    );
+    defer freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("assertion-density", findings[0].rule);
+}
+
+test "checkAssertionDensity fails a mean just below the floor" {
+    const gpa = std.testing.allocator;
+    const findings = try checkAssertionDensity(
+        gpa,
+        .{ .path = "src/a.zig", .functions = 2, .assertions = 3 },
+    );
+    defer freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("assertion-density", findings[0].rule);
+}
+
+test "formatDensityReport renders one line per file with functions, in order" {
+    const gpa = std.testing.allocator;
+    const densities = [_]AssertionDensity{
+        .{ .path = "src/a.zig", .functions = 2, .assertions = 4 },
+        .{ .path = "src/codec.zig", .functions = 0, .assertions = 0 },
+        .{ .path = "src/b.zig", .functions = 1, .assertions = 1 },
+    };
+    const out = try formatDensityReport(gpa, &densities);
+    defer gpa.free(out);
+    const expected = "tidy: density src/a.zig: 4 assertion(s) / 2 function(s)\n" ++
+        "tidy: density src/b.zig: 1 assertion(s) / 1 function(s)\n";
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "formatDensityReport renders nothing when no file has a function with a body" {
+    const gpa = std.testing.allocator;
+    const densities = [_]AssertionDensity{
+        .{ .path = "src/codec.zig", .functions = 0, .assertions = 0 },
+    };
+    const out = try formatDensityReport(gpa, &densities);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("", out);
 }
 
 // -- lintFile integration (multi-rule fixture through the real wiring) -----------
