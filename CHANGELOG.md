@@ -66,3 +66,9 @@ All notable changes to this project are documented in this file. The format foll
   density report unconditionally, so the figure stays visible as Phase 1 code lands.
   `src/main.zig`'s `main` gets a paired precondition/postcondition assertion on `args` as
   the worked example (today's only real function body in `src/`).
+- `tools/tidy.zig`: file-length check (the 800-line hard limit from
+  `citadel/core/rules/tiger-style.md`'s mechanical checks table, previously unenforced
+  locally) — a whole-file check wired into `lintFile` alongside the other per-file checks.
+  No baseline exemption: a file over 800 lines fails outright. `tools/` itself stays
+  outside `scan_roots` (`src`, `bench`, `tests` only), so `tools/tidy.zig` — now past 800
+  lines itself — is not yet checked by its own rule; tracked as a known gap in STATE.md.
