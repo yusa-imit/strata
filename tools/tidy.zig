@@ -1,7 +1,8 @@
 //! strata's copy of the kingdom reference `tidy` lint (plan
 //! `docs/plans/001-zig-0.16-and-tiger-baseline.md`, items 2 and 3): line
-//! length, doc header, function length with a shrink-only red-zone
-//! baseline, a three-rule ban list, and the wire-format `usize` check.
+//! length, doc header, a hard 800-line file-length limit, function length
+//! with a shrink-only red-zone baseline, a three-rule ban list, and the
+//! wire-format `usize` check.
 //! Single file, zero dependencies. Walks `src/`, `build.zig`, `bench/`,
 //! `tests/` under `--root` (default `.`), skipping `.zig-cache`, `zig-out`,
 //! `zig-pkg`, loads `--baseline` (default `tools/tidy_baseline.txt`, a
@@ -15,8 +16,8 @@ const Allocator = std.mem.Allocator;
 pub const Finding = struct {
     path: []const u8,
     line: usize,
-    rule: []const u8, // "line-length", "doc-header", "function-length", "stale-baseline",
-    // "ban-list", or "wire-format-usize".
+    rule: []const u8, // "line-length", "doc-header", "file-length", "function-length",
+    // "stale-baseline", "ban-list", or "wire-format-usize".
     message: []const u8,
     // Non-null on ban-list and function-length findings: a suggested fix to
     // print alongside the message.
@@ -108,6 +109,40 @@ pub fn checkDocHeader(
             .path = path,
             .line = 1,
             .rule = "doc-header",
+            .message = msg,
+        });
+    }
+
+    const result = try out.toOwnedSlice(allocator);
+    std.debug.assert(result.len <= 1);
+    return result;
+}
+
+const max_file_lines: usize = 800;
+
+/// Check 3: a file may not exceed `max_file_lines` (800) lines, no
+/// exemption by path — the same hard limit `tiger-style.md`'s mechanical
+/// checks table imposes kingdom-wide. Unlike `checkFunctionLength`, no
+/// baseline rescues an existing offender; a file over the limit shrinks.
+pub fn checkFileLength(
+    allocator: Allocator,
+    path: []const u8,
+    lines: []const []const u8,
+) ![]Finding {
+    std.debug.assert(path.len > 0);
+    var out: std.ArrayList(Finding) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (lines.len > max_file_lines) {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "file is {d} lines (limit {d})",
+            .{ lines.len, max_file_lines },
+        );
+        try out.append(allocator, .{
+            .path = path,
+            .line = lines.len,
+            .rule = "file-length",
             .message = msg,
         });
     }
@@ -958,6 +993,10 @@ fn lintFile(
     defer gpa.free(header_findings);
     for (header_findings) |f| try findings.append(gpa, f);
 
+    const file_length_findings = try checkFileLength(gpa, path, lines);
+    defer gpa.free(file_length_findings);
+    for (file_length_findings) |f| try findings.append(gpa, f);
+
     const ban_findings = try checkBanList(gpa, path, lines);
     defer gpa.free(ban_findings);
     for (ban_findings) |f| try findings.append(gpa, f);
@@ -1236,6 +1275,39 @@ test "checkDocHeader fails an empty src/ file (no first line to carry a header)"
     defer freeFindings(gpa, findings);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(@as(usize, 1), findings[0].line);
+}
+
+// -- checkFileLength --------------------------------------------------------
+
+fn linesOfLength(comptime n: usize) [n][]const u8 {
+    var lines: [n][]const u8 = undefined;
+    for (&lines) |*l| l.* = "const x = 1;";
+    return lines;
+}
+
+test "checkFileLength passes a file at exactly the 800-line limit" {
+    const gpa = std.testing.allocator;
+    const lines = linesOfLength(800);
+    const findings = try checkFileLength(gpa, "src/a.zig", &lines);
+    defer freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "checkFileLength fails a file one line past the limit" {
+    const gpa = std.testing.allocator;
+    const lines = linesOfLength(801);
+    const findings = try checkFileLength(gpa, "src/a.zig", &lines);
+    defer freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("file-length", findings[0].rule);
+    try std.testing.expectEqual(@as(usize, 801), findings[0].line);
+}
+
+test "checkFileLength is silent on an empty file" {
+    const gpa = std.testing.allocator;
+    const findings = try checkFileLength(gpa, "src/a.zig", &.{});
+    defer freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 // -- formatFindings ----------------------------------------------------------
