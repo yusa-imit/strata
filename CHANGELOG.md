@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-16
+
 ### Changed
 
 - Migrated to Zig 0.16.0 (plan 001, items 4/7): `src/main.zig` now takes

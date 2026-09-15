@@ -32,12 +32,13 @@ module below is a stub (a doc comment and an `Error` set). 안정 릴리즈 전�
 
 ## Install
 
-No tagged release exists yet — `v0.1.0` was never published. Once plan 001 lands a v0.2.0
-release:
-
 ```bash
 zig fetch --save https://github.com/yusa-imit/strata/archive/refs/tags/v0.2.0.tar.gz
 ```
+
+v0.2.0 ships the Zig 0.16.0 toolchain migration and the Tiger Style `tidy` baseline (see
+`CHANGELOG.md`); every module in the table above is still `Planned` — v0.2.0 provides no
+storage-kernel functionality yet.
 
 ```zig
 // build.zig
