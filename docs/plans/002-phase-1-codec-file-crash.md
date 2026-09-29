@@ -21,7 +21,7 @@ mapping, and nothing in the kingdom maps a file today.
 
 No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
 
-- [ ] **`tools/tidy.zig` self-hosting gap** (`tools/`). Fix the Tiger Style gap before adding
+- [x] **`tools/tidy.zig` self-hosting gap** (`tools/`). Fix the Tiger Style gap before adding
       features: the lint that will guard Phase 1 does not lint itself — `scan_roots` excludes
       `tools/` and `tidy.zig` is 2100 lines against its own 800-line rule (open since cycle 5).
       Split into modules under 800 lines (checks / scanner / reporter); add `"tools"` to

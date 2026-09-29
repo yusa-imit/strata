@@ -75,14 +75,19 @@ fn addTestStep(
     return mod_tests;
 }
 
-/// Tidy lint (Tiger Style mechanical checks) — always runs as part of `test`.
+/// Tidy lint (Tiger Style mechanical checks) — always runs as part of `test`, together with
+/// tidy's own unit tests (`tools/tidy.zig` imports every module under `tools/tidy/`).
 fn addTidyStep(b: *std.Build, test_step: *std.Build.Step) void {
+    const tidy_module = b.createModule(.{
+        .root_source_file = b.path("tools/tidy.zig"),
+        .target = b.graph.host,
+    });
+    const tidy_tests = b.addTest(.{ .root_module = tidy_module });
+    test_step.dependOn(&b.addRunArtifact(tidy_tests).step);
+
     const tidy = b.addExecutable(.{
         .name = "tidy",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/tidy.zig"),
-            .target = b.graph.host,
-        }),
+        .root_module = tidy_module,
     });
     const run_tidy = b.addRunArtifact(tidy);
     run_tidy.addArgs(&.{
