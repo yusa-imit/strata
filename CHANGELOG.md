@@ -7,6 +7,12 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+
+- `tools/tidy.zig` split into `tools/tidy/*.zig` modules, each under the 800-line limit, and
+  `tools` joins tidy's `scan_roots`, so the lint now lints itself with no exemption (plan 002,
+  item 1). `zig build test` now also runs tidy's own unit tests.
+
 ## [0.2.0] - 2026-09-16
 
 ### Changed
