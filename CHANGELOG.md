@@ -13,6 +13,10 @@ All notable changes to this project are documented in this file. The format foll
   buffers (`error.BufferTooSmall`), and `codec.varint`: canonical LEB128 `u64` plus zigzag
   `i64` with a 10-byte cap and typed `Truncated`/`Overlong`/`BufferTooSmall` errors (plan 002,
   item 2).
+- `codec.crc32c`: Castagnoli CRC32C with `checksum`, a streaming `Hasher`, and a named
+  `Path` (`software` table-driven, `hardware` SSE4.2/ARMv8). The hardware path is chosen at
+  compile time from the target CPU features (`-Dcpu=`), so a generic x86_64 build runs the
+  software path (plan 002, item 3).
 
 ### Changed
 

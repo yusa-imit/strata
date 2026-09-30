@@ -32,7 +32,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       `error.BufferTooSmall`. `varint`: LEB128 `u64` and zigzag `i64`, hard cap 10 bytes, typed
       errors on truncated/overlong input, never `@panic` (REALM.md). Verify: boundary vectors 0,
       1, 127, 128, 2^14-1, 2^21, `maxInt(u64)` round-trip; truncated/overlong buffers each error.
-- [ ] **`codec/crc32c.zig`** (`src/codec/`). Castagnoli CRC32C: table-driven software path plus a
+- [x] **`codec/crc32c.zig`** (`src/codec/`). Castagnoli CRC32C: table-driven software path plus a
       hardware path (SSE4.2 `crc32`, ARMv8 `crc32cx`) selected by CPU *feature* detection
       (`std.Target.<arch>.featureSetHas`), not `builtin.os.tag` — keeps REALM.md's "platform
       branching only in `file/`" rule intact; note this in the `//!` header. Software path may
