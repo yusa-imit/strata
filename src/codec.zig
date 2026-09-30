@@ -11,6 +11,7 @@
 
 const std = @import("std");
 
+pub const crc32c = @import("codec/crc32c.zig");
 pub const fixed = @import("codec/fixed.zig");
 pub const varint = @import("codec/varint.zig");
 
