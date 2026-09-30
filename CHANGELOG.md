@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `codec.fixed`: bounds-checked little-endian `u16`/`u32`/`u64` `read`/`write` over caller
+  buffers (`error.BufferTooSmall`), and `codec.varint`: canonical LEB128 `u64` plus zigzag
+  `i64` with a 10-byte cap and typed `Truncated`/`Overlong`/`BufferTooSmall` errors (plan 002,
+  item 2).
+
 ### Changed
 
 - `tools/tidy.zig` split into `tools/tidy/*.zig` modules, each under the 800-line limit, and

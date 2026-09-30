@@ -1,14 +1,18 @@
 //! strata.codec — varint (LEB128/zigzag), fixed-width LE, CRC32C (hw-accelerated), xxhash64.
 //!
-//! Planned files (see docs/PRD.md):
-//!   - `codec/varint.zig`
-//!   - `codec/fixed.zig`
-//!   - `codec/crc32c.zig`
-//!   - `codec/xxhash.zig`
+//! Files (see docs/PRD.md):
+//!   - `codec/varint.zig` (landed)
+//!   - `codec/fixed.zig` (landed)
+//!   - `codec/crc32c.zig` (planned)
+//!   - `codec/xxhash.zig` (planned)
 //!
-//! Status: stub. Public declarations are added as PRD phases land.
+//! Status: `fixed` and `varint` landed (plan 002 item 2); `crc32c` and `xxhash` are still to
+//! come, so `Error` keeps `NotImplemented` until they land.
 
 const std = @import("std");
+
+pub const fixed = @import("codec/fixed.zig");
+pub const varint = @import("codec/varint.zig");
 
 /// Module-level error set. Extend as functionality lands; keep names descriptive
 /// (`error.ChecksumMismatch`, not `error.Invalid`).
