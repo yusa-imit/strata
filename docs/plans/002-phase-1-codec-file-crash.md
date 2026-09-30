@@ -27,7 +27,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       Split into modules under 800 lines (checks / scanner / reporter); add `"tools"` to
       `scan_roots`, adjust `assert(scan_roots.len == 3)`. No exemption table — PR #13 refused one
       on purpose. Verify: `zig build tidy` exits 0 with `tools/` in scope, no file over 800.
-- [ ] **`codec/fixed.zig` + `codec/varint.zig`** (`src/codec/`). Paired: both pure byte-slice
+- [x] **`codec/fixed.zig` + `codec/varint.zig`** (`src/codec/`). Paired: both pure byte-slice
       codecs, same test shape. `fixed`: LE `u16/u32/u64` read/write, bounds-checked with
       `error.BufferTooSmall`. `varint`: LEB128 `u64` and zigzag `i64`, hard cap 10 bytes, typed
       errors on truncated/overlong input, never `@panic` (REALM.md). Verify: boundary vectors 0,
