@@ -17,6 +17,10 @@ All notable changes to this project are documented in this file. The format foll
   `Path` (`software` table-driven, `hardware` SSE4.2/ARMv8). The hardware path is chosen at
   compile time from the target CPU features (`-Dcpu=`), so a generic x86_64 build runs the
   software path (plan 002, item 3).
+- `codec.xxhash`: asserted XXH64 wrapper (`hash`, streaming `Hasher`) with a frozen digest
+  spelling, 8 little-endian bytes via `digest_write`/`digest_read`. The seed is part of any
+  persisted format and has no default. Checked against published vectors and an independent
+  from-the-spec reference (plan 002, item 4).
 
 ### Changed
 
