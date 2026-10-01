@@ -39,7 +39,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       wrap `std.hash.crc.Crc32Iscsi`. Verify: RFC 3720 B.4 vectors (32×`0x00` → `0x8A9136AA`,
       32×`0xFF` → `0x62A8AB43`, `0x00..0x1F` → `0x46DD794E`), check value
       `crc32c("123456789") == 0xE3069283`; hw/sw parity over lengths 0..256 plus random buffers.
-- [ ] **`codec/xxhash.zig`** (`src/codec/`). xxhash64 for bloom filters (§4.7) and memtable
+- [x] **`codec/xxhash.zig`** (`src/codec/`). xxhash64 for bloom filters (§4.7) and memtable
       bucketing — an asserted wrapper over `std.hash.XxHash64` plus a frozen on-disk digest
       spelling (LE `u64` via `codec.fixed`) and a documented seed contract. Verify: reference
       vectors at seed 0 and non-zero; one-shot vs streaming parity; digest byte order asserted.
