@@ -6,9 +6,13 @@
 //!   - `file/mmap.zig`
 //!   - `file/lock.zig`
 //!
-//! Status: stub. Public declarations are added as PRD phases land.
+//! Status: `file/file.zig` core landed (open, positional read/write, length, setLength).
+//! `file/mmap.zig` and `file/lock.zig` are planned; sync policies and `direct` are still stored
+//! or rejected only. `Error` keeps `NotImplemented` for the unlanded surface.
 
 const std = @import("std");
+
+pub const file = @import("file/file.zig");
 
 /// Module-level error set. Extend as functionality lands; keep names descriptive
 /// (`error.ChecksumMismatch`, not `error.Invalid`).

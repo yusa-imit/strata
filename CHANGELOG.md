@@ -21,6 +21,11 @@ All notable changes to this project are documented in this file. The format foll
   spelling, 8 little-endian bytes via `digest_write`/`digest_read`. The seed is part of any
   persisted format and has no default. Checked against published vectors and an independent
   from-the-spec reference (plan 002, item 4).
+- `file.file`: `File` leaf value over `std.Io` with `open`, `close`, `readAt`/`readAtAll`,
+  `writeAt`/`writeAtAll`, `length` and `setLength`, plus `SyncPolicy` and `OpenOptions`. Short
+  reads return the count, `readAtAll` past EOF is `error.UnexpectedEof`, `direct` is
+  `error.UnsupportedDirectIo` until a later item; truncation happens after the requested lock
+  is held. Sync, preallocate and lock calls follow in plan 002 item 6.
 
 ### Changed
 

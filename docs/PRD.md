@@ -71,7 +71,7 @@ const Io = std.Io;
 pub const SyncPolicy = enum(u8) { none, fdatasync, fsync, full_fsync /* macOS F_FULLFSYNC */ };
 
 pub const OpenOptions = struct {
-    mode: Io.File.Mode = .read_write,
+    mode: Mode = .read_write,              // = Io.Dir.OpenFileOptions.Mode (0.16 has no Io.File.Mode)
     create: bool = false,
     truncate: bool = false,
     direct: bool = false,                  // O_DIRECT / F_NOCACHE
