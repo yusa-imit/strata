@@ -43,7 +43,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       bucketing — an asserted wrapper over `std.hash.XxHash64` plus a frozen on-disk digest
       spelling (LE `u64` via `codec.fixed`) and a documented seed contract. Verify: reference
       vectors at seed 0 and non-zero; one-shot vs streaming parity; digest byte order asserted.
-- [ ] **`file/file.zig` core — open, close, positional I/O** (`src/file/`). `SyncPolicy`,
+- [x] **`file/file.zig` core — open, close, positional I/O** (`src/file/`). `SyncPolicy`,
       `OpenOptions`, `File` exactly as PRD §4.2: a copyable leaf value type that never caches `io`
       (ADR-0001), `io: Io` first for `open`, first after the receiver elsewhere, on
       `Io.Dir`/`Io.File`. This cycle: `open`/`close`/`readAt`/`readAtAll`/`writeAt`/`writeAtAll`/
@@ -61,8 +61,10 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       prerequisite for Phase 3E/4E — lands before mmap. A `File`-shaped sink that stops after N
       bytes (clean truncation) or writes a partial 512-byte sector (torn write), plus
       `forEachTruncation` enumerating every cut point under a `count_max` bound. Deterministic:
-      seeded PRNG and injected `io` only, no wall clock. Verify: sink writes exactly N bytes;
-      enumerator visits `len + 1` points and no more.
+      seeded PRNG and injected `io` only, no wall clock. Also owns the fault-injecting `Io`
+      wrapper (short count, zero count, `error.Canceled`) that proves `File.writeAtAll`'s
+      `NoSpaceLeft` and `readAtAll`'s short-read loops, which real files cannot provoke. Verify:
+      sink writes exactly N bytes; enumerator visits `len + 1` points and no more.
 - [ ] **Truncation matrix over a checksummed record** (`src/testing/`, `tests/`). Proves the
       harness catches corruption: write a `codec`-checksummed record through the crash sink at
       every truncation point and assert each prefix is rejected as a typed error
