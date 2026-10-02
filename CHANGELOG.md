@@ -33,6 +33,12 @@ All notable changes to this project are documented in this file. The format foll
   `File.lock`/`tryLock`/`unlock` wrap the `Io` file locks; a contended `tryLock` returns
   `error.WouldBlock`. Platform branching lives only in `src/file/platform.zig` (plan 002
   item 6).
+- `testing.crash`: `CrashSink`, a positional `writeAt` sink that persists only what survives a
+  `Cut` (`truncate` after N bytes, or `torn` inside a 512-byte sector with seeded garbage in the
+  rest of the sector), and `TruncationPoints`, an iterator over all `len + 1` cut points under a
+  `count_max` bound. `testing.fault_io`: `FaultIo`, an `Io` wrapper that injects short, zero-count
+  and `error.Canceled` positional reads and writes, to exercise `File.writeAtAll`/`readAtAll`
+  loops. Simulated cuts are a floor, not a proof of power-loss safety (plan 002, item 7).
 
 ### Changed
 

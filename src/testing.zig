@@ -1,19 +1,32 @@
 //! strata.testing — Crash-injection harness (torn writes, truncation at arbitrary
 //! offsets), differential model.
 //!
-//! Planned files (see docs/PRD.md):
-//!   - `testing/crash.zig`
-//!   - `testing/model.zig`
+//! Files (see docs/PRD.md):
+//!   - `testing/crash.zig` (landed: crash sink with truncate and torn cuts, and the
+//!     truncation-point enumerator; simulated cuts are a floor, not a proof of power-loss
+//!     safety, since reordered or partially flushed sectors are not reproduced)
+//!   - `testing/fault_io.zig` (landed: fault-injecting `std.Io` wrapper for positional reads
+//!     and writes: short, zero, canceled)
+//!   - `testing/model.zig` (planned)
 //!
-//! Status: stub. Public declarations are added as PRD phases land.
+//! Status: crash and fault_io have landed; model is added as its PRD phase lands. Neither
+//! landed file allocates after `init`.
 
 const std = @import("std");
+
+pub const crash = @import("testing/crash.zig");
+pub const fault_io = @import("testing/fault_io.zig");
 
 /// Module-level error set. Extend as functionality lands; keep names descriptive
 /// (`error.ChecksumMismatch`, not `error.Invalid`).
 pub const Error = error{
     NotImplemented,
 };
+
+test {
+    _ = @import("testing/crash_test.zig");
+    _ = @import("testing/fault_io_test.zig");
+}
 
 test "testing: module compiles" {
     std.testing.refAllDecls(@This());
