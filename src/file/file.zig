@@ -4,28 +4,39 @@
 //! (ADR-0001): every call takes the caller's `Io` right after the receiver; `open` has no
 //! receiver, so `io` comes first. Paths are never strings alone: `Io.Dir` plus `sub_path`.
 //!
-//! Contract (PRD 4.2, plan 002 item 5): `readAt` returns the short count (0 at or after EOF);
+//! Contract (PRD 4.2, plan 002 items 5-6): `readAt` returns the short count (0 at or after EOF);
 //! `readAtAll` fills the whole buffer or fails with `error.UnexpectedEof`; `writeAtAll` loops
 //! until every byte is written; writing past EOF extends the file and the gap reads as zeros;
 //! `setLength` zero-fills growth. `options.direct` is rejected with `error.UnsupportedDirectIo`
 //! this cycle, before anything is created. `options.lock` is forwarded to the open call (so a
-//! requested lock is never silently dropped); `options.sync_policy` is only stored here and
-//! takes effect with the durability item.
+//! requested lock is never silently dropped).
+//!
+//! Durability: `sync` honors `sync_policy` (`none` touches nothing; `fdatasync`, `fsync` and
+//! `full_fsync` flush as far as the platform allows, see `platform.zig`). It flushes the file,
+//! not its directory entry: `sync` does not make a created file's name durable, callers fsync
+//! the parent directory. `preallocate` reserves blocks best-effort and then guarantees
+//! length == max(old, len): it never shrinks and new bytes read as zeros. `lock`, `tryLock`
+//! and `unlock` are per open file description (flock-style); `unlock` is only legal while the
+//! lock is held. Locks are advisory on posix; on Windows they are mandatory byte-range locks
+//! (NtLockFile) that can fail other handles' reads and writes. Callers serialize `preallocate`
+//! against other writers.
 //! Ownership: the caller closes every `File` it opens; nothing is allocated.
 //!
-//! Status: core landed. Open, positional read/write, length and setLength are implemented;
-//! sync, `direct`, preallocation and platform branching come with later plan items.
+//! Status: core and durability landed; `direct`, `Mmap` and a cross-process lock file are later.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
+const platform = @import("platform.zig");
 
 /// When a write reaches the platform's durable storage; chosen by the caller, never skipped.
 pub const SyncPolicy = enum(u8) {
     none,
     fdatasync,
     fsync,
-    /// macOS `F_FULLFSYNC`; behaves as `fsync` on platforms without it.
+    /// macOS `F_FULLFSYNC`; behaves as `fsync` on platforms without it. On darwin a filesystem
+    /// that does not support `F_FULLFSYNC` (network, FUSE) silently downgrades to `fsync` for
+    /// that file; real I/O errors are returned, never downgraded.
     full_fsync,
 };
 
@@ -45,6 +56,9 @@ pub const ReadError = Io.File.ReadPositionalError || error{UnexpectedEof};
 pub const WriteError = Io.File.WritePositionalError || error{NoSpaceLeft};
 pub const SetLengthError = Io.File.SetLengthError;
 pub const LengthError = Io.File.LengthError;
+pub const SyncError = Io.File.SyncError;
+pub const PreallocateError = SetLengthError || LengthError || error{NoSpaceLeft};
+pub const TryLockError = Io.File.LockError || error{WouldBlock};
 
 /// Leaf value type: copyable, no `io` cached (ADR-0001).
 pub const File = struct {
@@ -162,11 +176,64 @@ pub const File = struct {
         return len;
     }
 
-    /// Truncates or grows the file to `len`; growth reads as zeros.
+    /// Truncates or grows the file to `len`; growth reads as zeros. Precondition: the handle
+    /// must be writable (File carries no mode, so this cannot be asserted); on filesystems
+    /// without fallocate support a reservation degrades to a sparse extension and ENOSPC may
+    /// surface on a later write.
     pub fn setLength(self: File, io: Io, len: u64) SetLengthError!void {
         assert(len <= offset_max);
         assert(!self.direct);
         try self.handle.setLength(io, len);
+    }
+
+    /// Flushes per `sync_policy`: `.none` returns without touching the handle.
+    pub fn sync(self: File, io: Io) SyncError!void {
+        assert(!self.direct);
+        assert(@intFromEnum(self.sync_policy) <= @intFromEnum(SyncPolicy.full_fsync));
+        switch (self.sync_policy) {
+            .none => return,
+            .fdatasync => try platform.sync_data(io, self.handle),
+            .fsync => try self.handle.sync(io),
+            .full_fsync => try platform.sync_full(io, self.handle),
+        }
+    }
+
+    /// Reserves space (best-effort) and grows the file to `len` if shorter; never shrinks.
+    /// Precondition: the handle must be writable (File carries no mode, so this cannot be
+    /// asserted); on filesystems without fallocate support the reservation degrades to a sparse
+    /// extension and ENOSPC may surface on a later write.
+    pub fn preallocate(self: File, io: Io, len: u64) PreallocateError!void {
+        assert(len <= offset_max);
+        assert(!self.direct);
+        const before = try self.length(io);
+        try platform.reserve(self.handle, before, len);
+        // Re-read: `setLength` must not shrink if the file grew meanwhile.
+        if (try self.length(io) < len) try self.setLength(io, len);
+        const after = try self.length(io);
+        assert(after >= before);
+        assert(after >= len);
+    }
+
+    /// Non-blocking lock (advisory on posix, mandatory byte-range on Windows);
+    /// `error.WouldBlock` when another open holds a conflicting one.
+    pub fn tryLock(self: File, io: Io, lock_kind: Io.File.Lock) TryLockError!void {
+        assert(lock_kind != .none);
+        assert(!self.direct);
+        if (!try self.handle.tryLock(io, lock_kind)) return error.WouldBlock;
+    }
+
+    /// Blocking lock; the file must not already be locked through this handle.
+    pub fn lock(self: File, io: Io, lock_kind: Io.File.Lock) Io.File.LockError!void {
+        assert(lock_kind != .none);
+        assert(!self.direct);
+        try self.handle.lock(io, lock_kind);
+    }
+
+    /// Releases the lock taken by `lock` or `tryLock` (or `options.lock` at open).
+    pub fn unlock(self: File, io: Io) void {
+        assert(!self.direct);
+        assert(@intFromEnum(self.sync_policy) <= @intFromEnum(SyncPolicy.full_fsync));
+        self.handle.unlock(io);
     }
 };
 
@@ -717,4 +784,5 @@ test "file: a multi-megabyte writeAtAll round-trips without leaks" {
 
 test {
     _ = @import("file_model_test.zig"); // Seeded model-based tests live in their own file.
+    _ = @import("file_durability_test.zig"); // Sync, preallocate and lock tests (item 6).
 }
