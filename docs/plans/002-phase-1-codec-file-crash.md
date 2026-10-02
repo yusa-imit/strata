@@ -50,7 +50,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       `length`/`setLength`. `direct: true` returns `error.UnsupportedDirectIo` for now. Verify:
       `std.testing.tmpDir` + `std.testing.io` round-trips at offset 0, non-zero offset, past EOF;
       `readAtAll` short read returns `error.UnexpectedEof`, `readAt` returns the short count.
-- [ ] **`file/file.zig` durability — sync, preallocate, lock** (`src/file/`). The one
+- [x] **`file/file.zig` durability — sync, preallocate, lock** (`src/file/`). The one
       platform-branch cycle `file/` is allowed: `sync` exhaustively switches on `SyncPolicy`
       (`none` no-op, `fdatasync`, `fsync`, `full_fsync` → `F_FULLFSYNC` on macOS), `preallocate`
       uses `fallocate`/`F_PREALLOCATE` falling back to `setLength`, `lock`/`unlock` wrap

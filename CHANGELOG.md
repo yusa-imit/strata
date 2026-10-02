@@ -25,7 +25,14 @@ All notable changes to this project are documented in this file. The format foll
   `writeAt`/`writeAtAll`, `length` and `setLength`, plus `SyncPolicy` and `OpenOptions`. Short
   reads return the count, `readAtAll` past EOF is `error.UnexpectedEof`, `direct` is
   `error.UnsupportedDirectIo` until a later item; truncation happens after the requested lock
-  is held. Sync, preallocate and lock calls follow in plan 002 item 6.
+  is held.
+- `file.file` durability: `File.sync` dispatches on `SyncPolicy` (`none` is a no-op, `fdatasync`
+  on Linux, `fsync`, and `F_FULLFSYNC` on macOS with a fallback only for filesystems that do not
+  support it; real I/O errors are never downgraded). `File.preallocate` grows without ever
+  shrinking (`fallocate` with keep-size on Linux, `F_PREALLOCATE` on macOS, then `setLength`).
+  `File.lock`/`tryLock`/`unlock` wrap the `Io` file locks; a contended `tryLock` returns
+  `error.WouldBlock`. Platform branching lives only in `src/file/platform.zig` (plan 002
+  item 6).
 
 ### Changed
 
