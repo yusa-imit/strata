@@ -57,11 +57,11 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       `flock`/`LockFileEx`. fsync is policy, never a silent skip (REALM.md). Verify: `tmpDir` test
       per policy asserting data survives reopen; exclusive lock taken twice returns
       `error.WouldBlock`; compile-time exhaustiveness test over `SyncPolicy`.
-- [ ] **`testing/crash.zig` — torn-write generator** (`src/testing/`). PRD §8's first pillar,
+- [x] **`testing/crash.zig` — torn-write generator** (`src/testing/`). PRD §8's first pillar,
       prerequisite for Phase 3E/4E — lands before mmap. A `File`-shaped sink that stops after N
       bytes (clean truncation) or writes a partial 512-byte sector (torn write), plus
-      `forEachTruncation` enumerating every cut point under a `count_max` bound. Deterministic:
-      seeded PRNG and injected `io` only, no wall clock. Also owns the fault-injecting `Io`
+      `TruncationPoints` (an iterator, not a callback) enumerating every cut point under a
+      `count_max` bound. Deterministic: seeded PRNG and injected `io` only, no wall clock. Also owns the fault-injecting `Io`
       wrapper (short count, zero count, `error.Canceled`) that proves `File.writeAtAll`'s
       `NoSpaceLeft` and `readAtAll`'s short-read loops, which real files cannot provoke. Verify:
       sink writes exactly N bytes; enumerator visits `len + 1` points and no more.
