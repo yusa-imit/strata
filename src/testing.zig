@@ -7,6 +7,8 @@
 //!     safety, since reordered or partially flushed sectors are not reproduced)
 //!   - `testing/fault_io.zig` (landed: fault-injecting `std.Io` wrapper for positional reads
 //!     and writes: short, zero, canceled)
+//!   - `testing/truncation_matrix_test.zig` (landed, test-only: every truncation and torn cut
+//!     of a checksummed record must decode to a typed error, never to a damaged payload)
 //!   - `testing/model.zig` (planned)
 //!
 //! Status: crash and fault_io have landed; model is added as its PRD phase lands. Neither
@@ -26,6 +28,7 @@ pub const Error = error{
 test {
     _ = @import("testing/crash_test.zig");
     _ = @import("testing/fault_io_test.zig");
+    _ = @import("testing/truncation_matrix_test.zig");
 }
 
 test "testing: module compiles" {

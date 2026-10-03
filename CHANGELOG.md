@@ -39,6 +39,10 @@ All notable changes to this project are documented in this file. The format foll
   `count_max` bound. `testing.fault_io`: `FaultIo`, an `Io` wrapper that injects short, zero-count
   and `error.Canceled` positional reads and writes, to exercise `File.writeAtAll`/`readAtAll`
   loops. Simulated cuts are a floor, not a proof of power-loss safety (plan 002, item 7).
+- Truncation matrix (test-only): a CRC32C-framed record is replayed through `CrashSink` at every
+  truncation and torn cut, for record sizes spanning 8 B to 64 KiB around the 512-byte sector
+  boundary; each damaged prefix must be `TornWrite` or `ChecksumMismatch`, and a decoder that
+  skips the checksum fails the sweep (plan 002, item 8).
 
 ### Changed
 
