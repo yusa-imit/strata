@@ -65,7 +65,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       wrapper (short count, zero count, `error.Canceled`) that proves `File.writeAtAll`'s
       `NoSpaceLeft` and `readAtAll`'s short-read loops, which real files cannot provoke. Verify:
       sink writes exactly N bytes; enumerator visits `len + 1` points and no more.
-- [ ] **Truncation matrix over a checksummed record** (`src/testing/`, `tests/`). Proves the
+- [x] **Truncation matrix over a checksummed record** (`src/testing/`, `tests/`). Proves the
       harness catches corruption: write a `codec`-checksummed record through the crash sink at
       every truncation point and assert each prefix is rejected as a typed error
       (`error.TornWrite`/`error.ChecksumMismatch`), never silently accepted, never `@panic`
