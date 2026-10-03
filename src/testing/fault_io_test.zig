@@ -77,6 +77,18 @@ test "fault_io: io() carries the FaultIo as userdata over its own failing-based 
     fio.check_invariants();
 }
 
+test "fault_io: checkCancel is forwarded, so raw-syscall paths can poll cancelation" {
+    var fio: FaultIo = undefined;
+    FaultIo.init(&fio, testing.io, none_plan);
+    const wrapped = fio.io();
+
+    // `Io.failing.checkCancel` is `unreachable`; Linux `sync_data` calls it before fdatasync.
+    try testing.expect(wrapped.vtable.checkCancel != std.Io.failing.vtable.checkCancel);
+    try wrapped.checkCancel();
+    try testing.expectEqual(@as(u32, 0), fio.write_calls);
+    fio.check_invariants();
+}
+
 test "fault_io: a slot that is not forwarded fails safely instead of reading FaultIo" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

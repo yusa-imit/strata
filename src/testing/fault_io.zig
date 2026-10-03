@@ -9,7 +9,7 @@
 //!     through; every call is counted.
 //!   - forwarders to the inner `Io` with the inner userdata: `dirCreateFile`, `dirOpenFile`,
 //!     `fileClose`, `fileSync`, `fileLength`, `fileSetLength`, `fileStat`, `fileLock`,
-//!     `fileTryLock`, `fileUnlock`: everything `strata.file.File` uses.
+//!     `fileTryLock`, `fileUnlock`, `checkCancel`: everything `strata.file.File` uses.
 //! Any other `Io` operation through the wrapper is not supported: use the inner `Io` directly.
 //!
 //! Allocation: none, ever. Ownership: nothing is owned; the inner `Io` is borrowed and must
@@ -79,6 +79,7 @@ pub const FaultIo = struct {
         target.vtable.fileLock = forward_file_lock;
         target.vtable.fileTryLock = forward_file_try_lock;
         target.vtable.fileUnlock = forward_file_unlock;
+        target.vtable.checkCancel = forward_check_cancel;
         assert(target.write_calls == 0);
         assert(target.read_calls == 0);
     }
@@ -188,6 +189,15 @@ fn forward_file_unlock(userdata: ?*anyopaque, file: File) void {
     assert(self.inner.vtable.fileUnlock != forward_file_unlock);
     assert(self.inner.userdata != userdata); // Forward the inner userdata, never ours.
     self.inner.vtable.fileUnlock(self.inner.userdata, file);
+}
+
+/// `Io.failing.checkCancel` is `unreachable`, and `file.platform.sync_data` polls it on Linux
+/// before its raw `fdatasync`, so the wrapper must answer with the inner `Io`'s verdict.
+fn forward_check_cancel(userdata: ?*anyopaque) Io.Cancelable!void {
+    const self = self_of(userdata);
+    assert(self.inner.vtable.checkCancel != forward_check_cancel);
+    assert(self.inner.userdata != userdata); // Forward the inner userdata, never ours.
+    return self.inner.vtable.checkCancel(self.inner.userdata);
 }
 
 /// Counts one call and returns the fault that applies to it: `.none` before `after_calls`.
