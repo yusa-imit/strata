@@ -43,6 +43,10 @@ All notable changes to this project are documented in this file. The format foll
   truncation and torn cut, for record sizes spanning 8 B to 64 KiB around the 512-byte sector
   boundary; each damaged prefix must be `TornWrite` or `ChecksumMismatch`, and a decoder that
   skips the checksum fails the sweep (plan 002, item 8).
+- Codec benchmark baseline: `zig build bench -- [filter]` measures CRC32C (software, and
+  hardware when the target CPU has it), xxhash64 and varint encode/decode over seeded inputs
+  and prints GB/s, ops/s and ns/op per line. The harness's kernels and report formatting are
+  also unit-tested by `zig build test` (plan 002, item 9).
 
 ### Changed
 

@@ -62,4 +62,8 @@
 
 | 날짜 | 지표 | 측정값 | 목표 | 비고 |
 |---|---|---|---|---|
-| | | | | |
+| 2026-10-04 | crc32c hardware (1 MiB buffer) | 5.342 GB/s | — | Apple aarch64, ReleaseFast |
+| 2026-10-04 | crc32c software (1 MiB buffer) | 0.577 GB/s | — | Apple aarch64, ReleaseFast |
+| 2026-10-04 | xxhash64 (1 MiB buffer) | 26.237 GB/s | — | Apple aarch64, ReleaseFast |
+| 2026-10-04 | varint encode (mixed 1–10 B) | 198.4 M ops/s | — | Apple aarch64, ReleaseFast |
+| 2026-10-04 | varint decode (mixed 1–10 B) | 151.1 M ops/s | — | Apple aarch64, ReleaseFast |
