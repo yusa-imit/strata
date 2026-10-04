@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const mod_tests = addTestStep(b, mod, exe, test_step);
     addTidyStep(b, test_step);
-    addBenchStep(b, mod, target);
+    addBenchStep(b, mod, target, test_step);
     addDocsStep(b, mod_tests);
 }
 
@@ -100,7 +100,15 @@ fn addTidyStep(b: *std.Build, test_step: *std.Build.Step) void {
     tidy_step.dependOn(&run_tidy.step);
 }
 
-fn addBenchStep(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+/// The ReleaseFast bench executable is compiled (not run) by `zig build test`, so `main` cannot
+/// drift from std; the harness is also built as a Debug test binary, which checks its kernels
+/// and report formatting without timing anything.
+fn addBenchStep(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    test_step: *std.Build.Step,
+) void {
     const bench = b.addExecutable(.{
         .name = "strata-bench",
         .root_module = b.createModule(.{
@@ -112,6 +120,17 @@ fn addBenchStep(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolve
             },
         }),
     });
+    const bench_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "strata", .module = mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(bench_tests).step);
+    test_step.dependOn(&bench.step);
     const run_bench = b.addRunArtifact(bench);
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run benchmarks");

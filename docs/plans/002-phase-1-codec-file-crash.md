@@ -71,7 +71,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       (`error.TornWrite`/`error.ChecksumMismatch`), never silently accepted, never `@panic`
       (REALM.md). Include lengths spanning 512B and 64KB. Verify: matrix green; a deliberately
       unchecked decode path fails the test.
-- [ ] **Codec bench baseline** (`bench/main.zig`). PRD §8 wants ±10% regression detection with no
+- [x] **Codec bench baseline** (`bench/main.zig`). PRD §8 wants ±10% regression detection with no
       baseline yet; codec is the only measurable layer this milestone. Measure crc32c GB/s (hw
       and sw), xxhash64 GB/s, varint ops/s. Verify: `zig build bench` exits 0 in ReleaseFast,
       prints all four figures, recorded in `docs/plans/000-inherited.md`'s table.
