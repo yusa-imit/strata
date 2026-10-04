@@ -19,12 +19,6 @@ const std = @import("std");
 pub const crash = @import("testing/crash.zig");
 pub const fault_io = @import("testing/fault_io.zig");
 
-/// Module-level error set. Extend as functionality lands; keep names descriptive
-/// (`error.ChecksumMismatch`, not `error.Invalid`).
-pub const Error = error{
-    NotImplemented,
-};
-
 test {
     _ = @import("testing/crash_test.zig");
     _ = @import("testing/fault_io_test.zig");

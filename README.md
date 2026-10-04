@@ -12,15 +12,16 @@ strata는 플랫폼 파일 I/O 추상화(fsync 정책, mmap, 락), 체크섬이 
 
 ## Status
 
-**Bootstrap** — API 설계 중, Phase 1 구현 착수 전. No storage functionality ships yet: every
-module below is a stub (a doc comment and an `Error` set). 안정 릴리즈 전까지 API는 변경될 수 있다.
+**Phase 1 landed (v0.3.0)** — `codec`, `file` (without mmap) and the `testing` crash harness
+are real, tested code. `page`, `cache`, `wal`, `btree`, `lsm`, `kv` and `snapshot` are still
+stubs (a doc comment and an `Error` set). 안정 릴리즈 전까지 API는 변경될 수 있다.
 
 ## Modules
 
 | Module | Purpose | Status |
 |---|---|---|
-| `strata.codec` | varint (LEB128/zigzag), fixed-width LE, CRC32C (hw-accelerated), xxhash64. | Planned |
-| `strata.file` | Platform file I/O: sync policies (fdatasync/fsync/F_FULLFSYNC), O_DIRECT, preallocate, locks, mmap. | Planned |
+| `strata.codec` | varint (LEB128/zigzag), fixed-width LE, CRC32C (hw-accelerated), xxhash64. | Landed |
+| `strata.file` | Platform file I/O: sync policies (fdatasync/fsync/F_FULLFSYNC), O_DIRECT, preallocate, locks, mmap. | Landed (mmap planned) |
 | `strata.page` | Page header/format, page manager, freelist, file header. | Planned |
 | `strata.cache` | Buffer pool (CLOCK), pin/unpin guards, dirty tracking, stats. | Planned |
 | `strata.wal` | Segmented write-ahead log: frames, group-commit writer, reader, checkpoint, recovery. | Planned |
@@ -28,17 +29,17 @@ module below is a stub (a doc comment and an `Error` set). 안정 릴리즈 전�
 | `strata.lsm` | LSM tree: skiplist memtable, SSTable (blocks, index, bloom), compaction, manifest. | Planned |
 | `strata.kv` | Embedded KV engine: Db open/get/put/delete/scan, WriteBatch, Snapshot, engine selection. | Planned |
 | `strata.snapshot` | Streaming snapshot writer/reader with versioned chunked format. | Planned |
-| `strata.testing` | Crash-injection harness (torn writes, truncation at arbitrary offsets), differential model. | Planned |
+| `strata.testing` | Crash-injection harness (torn writes, truncation at arbitrary offsets), differential model. | Landed (model planned) |
 
 ## Install
 
 ```bash
-zig fetch --save https://github.com/yusa-imit/strata/archive/refs/tags/v0.2.0.tar.gz
+zig fetch --save https://github.com/yusa-imit/strata/archive/refs/tags/v0.3.0.tar.gz
 ```
 
-v0.2.0 ships the Zig 0.16.0 toolchain migration and the Tiger Style `tidy` baseline (see
-`CHANGELOG.md`); every module in the table above is still `Planned` — v0.2.0 provides no
-storage-kernel functionality yet.
+v0.3.0 is the first release with storage-kernel functionality: checksums and integer codecs,
+file I/O with a caller-chosen fsync policy, and a crash-injection harness (see `CHANGELOG.md`).
+Modules marked `Planned` above ship nothing yet.
 
 ```zig
 // build.zig

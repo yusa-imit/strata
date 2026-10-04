@@ -8,16 +8,16 @@
 
 ## 현재 상태
 
-- **Phase**: Bootstrap 완료 → Phase 1 착수
-- **버전**: 0.1.0 (미릴리즈)
+- **Phase**: Phase 1 완료(1C mmap 제외, plan 003로 이월) → Phase 2 계획 전
+- **버전**: 0.3.0
 - **CI**: 초기 워크플로우 등록
 
 ## Phase 1 — Codec & File
 
-- [ ] 1A `codec/{varint,fixed,crc32c,xxhash}.zig`
-- [ ] 1B `file/file.zig` — sync/preallocate/lock
+- [x] 1A `codec/{varint,fixed,crc32c,xxhash}.zig`
+- [x] 1B `file/file.zig` — sync/preallocate/lock
 - [ ] 1C `file/mmap.zig`
-- [ ] 1D `testing/crash.zig` — torn-write generator
+- [x] 1D `testing/crash.zig` — torn-write generator
 
 ## Phase 2 — Page & Cache
 
