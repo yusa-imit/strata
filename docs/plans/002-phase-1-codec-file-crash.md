@@ -75,7 +75,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       baseline yet; codec is the only measurable layer this milestone. Measure crc32c GB/s (hw
       and sw), xxhash64 GB/s, varint ops/s. Verify: `zig build bench` exits 0 in ReleaseFast,
       prints all four figures, recorded in `docs/plans/000-inherited.md`'s table.
-- [ ] **Docs, module status, release v0.3.0** (`docs/`, `README.md`, `build.zig.zon`). Only after
+- [x] **Docs, module status, release v0.3.0** (`docs/`, `README.md`, `build.zig.zon`). Only after
       every box above ticks. Drop `NotImplemented` from `src/codec.zig`/`src/file.zig`, re-export
       real declarations; flip README's codec/file/testing rows `Planned` → `Landed`; tick
       1A/1B/1D in `docs/plans/000-inherited.md`; re-audit STATE.md's Tiger Style table now that

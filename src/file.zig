@@ -8,17 +8,11 @@
 //!   - `file/mmap.zig` (planned)
 //!
 //! Status: `direct` is still rejected (`error.UnsupportedDirectIo`) and `file/mmap.zig` is
-//! planned. `Error` keeps `NotImplemented` for the unlanded surface.
+//! planned (plan 003). `file.File` owns its own typed error sets, so this module declares none.
 
 const std = @import("std");
 
 pub const file = @import("file/file.zig");
-
-/// Module-level error set. Extend as functionality lands; keep names descriptive
-/// (`error.ChecksumMismatch`, not `error.Invalid`).
-pub const Error = error{
-    NotImplemented,
-};
 
 test "file: module compiles" {
     std.testing.refAllDecls(@This());

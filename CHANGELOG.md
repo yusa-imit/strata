@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-05
+
 ### Added
 
 - `codec.fixed`: bounds-checked little-endian `u16`/`u32`/`u64` `read`/`write` over caller
@@ -50,6 +52,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
+- Dropped the `NotImplemented` placeholder error from `codec`, `file` and `testing`: each landed
+  module's real surface carries its own typed errors. The seven Phase 2+ stubs keep it.
+  `strata.version` now reports 0.3.0 (it had stayed at 0.1.0 through v0.2.0).
 - `tools/tidy.zig` split into `tools/tidy/*.zig` modules, each under the 800-line limit, and
   `tools` joins tidy's `scan_roots`, so the lint now lints itself with no exemption (plan 002,
   item 1). `zig build test` now also runs tidy's own unit tests.
