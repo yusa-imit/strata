@@ -1,12 +1,17 @@
+//! Build graph for strata: library module, CLI, unit tests, tidy, bench and docs steps.
+//!
+//! Steps:
+//!   zig build            - build library + CLI
+//!   zig build test       - run all unit tests and the tidy checks
+//!   zig build bench      - run benchmarks (ReleaseFast recommended)
+//!   zig build docs       - generate API docs into zig-out/docs
+//!
+//! Allocation: the build graph allocates only through the build runner's arena. No strata
+//! code runs at build time.
+
 const std = @import("std");
 
-/// Build graph for strata — Layers beneath the data — WAL, pages, and a key-value engine for Zig
-///
-/// Steps:
-///   zig build            — build library + CLI
-///   zig build test       — run all unit tests
-///   zig build bench      — run benchmarks (ReleaseFast recommended)
-///   zig build docs       — generate API docs into zig-out/docs
+/// Declares every build step; see the module header for the list.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
