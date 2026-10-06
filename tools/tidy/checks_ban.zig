@@ -6,6 +6,7 @@
 //! (`scanner.freeFindings`), and the static `ban_rules` table is the only shared state.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const Finding = scanner.Finding;
@@ -24,6 +25,8 @@ const BanRule = struct { id: BanId, needle: []const u8, replacement: []const u8 
 
 /// One rule for a removed `std.Thread.<name>` sync type, replaced by `Io.<use>`.
 fn threadRule(comptime name: []const u8, comptime use: []const u8) BanRule {
+    comptime assert(name.len > 0);
+    comptime assert(use.len > 0);
     return .{
         .id = .thread_sync_primitive,
         .needle = "Thread." ++ name,
@@ -83,18 +86,22 @@ const ban_rules = [_]BanRule{
 };
 
 fn isMainZig(path: []const u8) bool {
-    std.debug.assert(path.len > 0);
-    return std.mem.eql(u8, path, "src/main.zig");
+    assert(path.len > 0);
+    const is_main = std.mem.eql(u8, path, "src/main.zig");
+    if (is_main) assert(std.mem.endsWith(u8, path, "main.zig"));
+    return is_main;
 }
 
 fn underDir(path: []const u8, dir: []const u8) bool {
-    std.debug.assert(dir.len > 0);
+    assert(dir.len > 0);
+    assert(dir[dir.len - 1] != '/'); // the separator is matched here, not carried by `dir`
     return std.mem.startsWith(u8, path, dir) and
         path.len > dir.len and path[dir.len] == '/';
 }
 
 fn banApplies(id: BanId, path: []const u8) bool {
-    std.debug.assert(path.len > 0);
+    assert(path.len > 0);
+    assert(path[path.len - 1] != '/'); // a file path, never a directory
     return switch (id) {
         .catch_unreachable => true,
         .debug_print => !(isMainZig(path) or underDir(path, "bench")),
@@ -109,7 +116,8 @@ fn banApplies(id: BanId, path: []const u8) bool {
 }
 
 fn hasProofComment(lines: []const []const u8, idx: usize) bool {
-    std.debug.assert(idx < lines.len);
+    assert(idx < lines.len);
+    assert(lines.len > 0);
     if (std.mem.find(u8, lines[idx], "// proof:") != null) return true;
     return idx > 0 and std.mem.find(u8, lines[idx - 1], "// proof:") != null;
 }
@@ -119,8 +127,9 @@ fn hasProofComment(lines: []const []const u8, idx: usize) bool {
 /// the `ArrayList(` type on the same line, so an unrelated `.{}` init earlier
 /// on the line (or the word `ArrayList` in a trailing comment) does not match.
 fn hasBareArrayListInit(line: []const u8) bool {
-    std.debug.assert(line.len < 1_000_000); // sanity: never an absurd line
+    assert(line.len < 1_000_000); // sanity: never an absurd line
     const type_idx = std.mem.find(u8, line, "ArrayList(") orelse return false;
+    assert(type_idx < line.len);
     return std.mem.find(u8, line[type_idx..], "= .{}") != null;
 }
 
@@ -134,13 +143,13 @@ fn hasBareArrayListInit(line: []const u8) bool {
 /// `std.Thread.*` sync primitive, and the removed `fs` cwd accessor. Every
 /// finding carries a non-null `.replacement`.
 pub fn checkBanList(
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     lines: []const []const u8,
 ) ![]Finding {
-    std.debug.assert(path.len > 0);
+    assert(path.len > 0);
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     for (lines, 0..) |line, idx| {
         for (ban_rules) |rule| {
@@ -149,8 +158,8 @@ pub fn checkBanList(
             if (rule.id == .array_list_bare_init and !hasBareArrayListInit(line)) continue;
             if (rule.id == .catch_unreachable and hasProofComment(lines, idx)) continue;
 
-            const msg = try std.fmt.allocPrint(allocator, "banned pattern `{s}`", .{rule.needle});
-            try out.append(allocator, .{
+            const msg = try std.fmt.allocPrint(gpa, "banned pattern `{s}`", .{rule.needle});
+            try out.append(gpa, .{
                 .path = path,
                 .line = idx + 1,
                 .rule = "ban-list",
@@ -160,16 +169,17 @@ pub fn checkBanList(
         }
     }
 
-    const result = try out.toOwnedSlice(allocator);
-    std.debug.assert(result.len <= lines.len * ban_rules.len);
+    const result = try out.toOwnedSlice(gpa);
+    assert(result.len <= lines.len * ban_rules.len);
     return result;
 }
 
 /// Returns true when `line` contains the word `usize` at a token boundary
 /// (not as a substring of a longer identifier such as `bitsize`).
 fn hasBareUsize(line: []const u8) bool {
-    std.debug.assert(line.len < 1_000_000); // sanity: never an absurd line
+    assert(line.len < 1_000_000); // sanity: never an absurd line
     const needle = "usize";
+    comptime assert(needle.len > 0);
     var start: usize = 0;
     while (std.mem.findPos(u8, line, start, needle)) |i| {
         const before_ok = i == 0 or !scanner.isIdentChar(line[i - 1]);
@@ -188,14 +198,14 @@ fn hasBareUsize(line: []const u8) bool {
 /// `measureFunctionLines` does for functions. On-disk formats are
 /// fixed-width, so `usize` inside such a scope must become `u32`/`u64`.
 pub fn checkWireFormatUsize(
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     lines: []const []const u8,
 ) ![]Finding {
-    std.debug.assert(path.len > 0);
-    std.debug.assert(lines.len < 1_000_000); // sanity: never a runaway file
+    assert(path.len > 0);
+    assert(lines.len < 1_000_000); // sanity: never a runaway file
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     var idx: usize = 0;
     while (idx < lines.len) : (idx += 1) {
@@ -205,16 +215,16 @@ pub fn checkWireFormatUsize(
 
         const span = scanner.measureFunctionLines(lines, open_idx) orelse continue;
         const end_idx = open_idx + span - 1;
-        std.debug.assert(end_idx < lines.len);
+        assert(end_idx < lines.len);
 
         var j = open_idx + 1;
         while (j < end_idx) : (j += 1) {
             if (!hasBareUsize(lines[j])) continue;
-            const msg = try allocator.dupe(
+            const msg = try gpa.dupe(
                 u8,
                 "`usize` in a wire-format struct varies by target width",
             );
-            try out.append(allocator, .{
+            try out.append(gpa, .{
                 .path = path,
                 .line = j + 1,
                 .rule = "wire-format-usize",
@@ -224,8 +234,8 @@ pub fn checkWireFormatUsize(
         }
     }
 
-    const result = try out.toOwnedSlice(allocator);
-    std.debug.assert(result.len <= lines.len);
+    const result = try out.toOwnedSlice(gpa);
+    assert(result.len <= lines.len);
     return result;
 }
 
