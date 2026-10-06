@@ -5,12 +5,19 @@
 //! `deinit`; the check functions return owned findings slices freed via `scanner.freeFindings`.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const Finding = scanner.Finding;
 
 const fn_len_clean_max: usize = 70;
 const fn_len_redzone_max: usize = 72;
+
+comptime {
+    // The red zone must be a non-empty band above the clean limit, or the baseline rescues nothing.
+    assert(fn_len_clean_max > 0);
+    assert(fn_len_redzone_max > fn_len_clean_max);
+}
 
 /// The actual, currently-measured span of one scanned function, recorded so
 /// `reconcileBaseline` can later compare it against the baseline.
@@ -24,23 +31,35 @@ pub const Baseline = struct {
     entries: std.StringHashMap(usize),
 
     pub fn init(allocator: Allocator) Baseline {
-        return .{ .entries = std.StringHashMap(usize).init(allocator) };
+        const self: Baseline = .{ .entries = std.StringHashMap(usize).init(allocator) };
+        assert(self.entries.count() == 0);
+        return self;
     }
 
+    /// Frees every owned key; `allocator` must be the one the entries were parsed with.
     pub fn deinit(self: *Baseline, allocator: Allocator) void {
+        assert(self.entries.count() < 1_000_000);
         var it = self.entries.keyIterator();
-        while (it.next()) |k| allocator.free(k.*);
+        while (it.next()) |k| {
+            assert(k.len > 0);
+            allocator.free(k.*);
+        }
         self.entries.deinit();
+        self.* = undefined;
     }
 
     pub fn get(self: Baseline, key: []const u8) ?usize {
-        return self.entries.get(key);
+        assert(key.len > 0);
+        const found = self.entries.get(key);
+        // A hit implies a non-empty baseline; `parse` is the only writer.
+        if (found != null) assert(self.entries.count() > 0);
+        return found;
     }
 
     /// Parses `path:fn_name:lines` lines. Blank lines and lines starting
     /// with `#` are ignored.
     pub fn parse(allocator: Allocator, content: []const u8) !Baseline {
-        std.debug.assert(content.len < 100 * 1024 * 1024); // sanity: never a runaway file
+        assert(content.len < 100 * 1024 * 1024); // sanity: never a runaway file
         var self = Baseline.init(allocator);
         errdefer self.deinit(allocator);
 
@@ -51,17 +70,19 @@ pub const Baseline = struct {
             try self.parseLine(allocator, line);
         }
 
-        std.debug.assert(self.entries.count() < 1_000_000); // sanity: never a runaway baseline
+        assert(self.entries.count() < 1_000_000); // sanity: never a runaway baseline
         return self;
     }
 
     fn parseLine(self: *Baseline, allocator: Allocator, line: []const u8) !void {
-        std.debug.assert(line.len > 0);
+        assert(line.len > 0);
         const last_colon = std.mem.findScalarLast(u8, line, ':') orelse return;
         const lines_str = line[last_colon + 1 ..];
         const key_part = line[0..last_colon];
         const lines_n = std.fmt.parseInt(usize, lines_str, 10) catch return;
-        std.debug.assert(key_part.len < line.len);
+        assert(key_part.len < line.len);
+        // A line like `:71` names no function; the baseline is user data, so skip, do not store.
+        if (key_part.len == 0) return;
 
         const key = try allocator.dupe(u8, key_part);
         const gop = try self.entries.getOrPut(key);
@@ -78,8 +99,8 @@ fn appendFunctionLengthFinding(
     name: []const u8,
     len: usize,
 ) !void {
-    std.debug.assert(name.len > 0);
-    std.debug.assert(len > fn_len_clean_max);
+    assert(name.len > 0);
+    assert(len > fn_len_clean_max);
     const msg = try std.fmt.allocPrint(
         allocator,
         "fn `{s}` is {d} lines (limit {d})",
@@ -107,7 +128,7 @@ pub fn checkFunctionLength(
     baseline: Baseline,
     actual_out: *std.StringHashMap(ActualLen),
 ) ![]Finding {
-    std.debug.assert(path.len > 0);
+    assert(path.len > 0);
     var out: std.ArrayList(Finding) = .empty;
     errdefer out.deinit(allocator);
 
@@ -129,7 +150,7 @@ pub fn checkFunctionLength(
     }
 
     const result = try out.toOwnedSlice(allocator);
-    std.debug.assert(result.len <= lines.len);
+    assert(result.len <= lines.len);
     return result;
 }
 
@@ -141,8 +162,8 @@ fn appendStaleFinding(
     line: usize,
     msg: []const u8,
 ) !void {
-    std.debug.assert(path.len > 0);
-    std.debug.assert(msg.len > 0);
+    assert(path.len > 0);
+    assert(msg.len > 0);
     try out.append(allocator, .{
         .path = path,
         .line = line,
@@ -159,8 +180,9 @@ fn reconcileOne(
     key: []const u8,
     actual: std.StringHashMap(ActualLen),
 ) !void {
-    std.debug.assert(key.len > 0);
+    assert(key.len > 0);
     const path = if (std.mem.findScalarLast(u8, key, ':')) |i| key[0..i] else key;
+    assert(path.len <= key.len);
 
     const found = actual.get(key) orelse {
         const msg = try std.fmt.allocPrint(
@@ -198,7 +220,7 @@ pub fn reconcileBaseline(
     baseline: Baseline,
     actual: std.StringHashMap(ActualLen),
 ) ![]Finding {
-    std.debug.assert(baseline.entries.count() < 1_000_000); // sanity: never a runaway baseline
+    assert(baseline.entries.count() < 1_000_000); // sanity: never a runaway baseline
     var out: std.ArrayList(Finding) = .empty;
     errdefer out.deinit(allocator);
 
@@ -208,13 +230,17 @@ pub fn reconcileBaseline(
     }
 
     const result = try out.toOwnedSlice(allocator);
-    std.debug.assert(result.len <= baseline.entries.count());
+    assert(result.len <= baseline.entries.count());
     return result;
 }
 
 fn freeActualMap(allocator: Allocator, map: *std.StringHashMap(ActualLen)) void {
+    assert(map.count() < 1_000_000);
     var it = map.keyIterator();
-    while (it.next()) |k| allocator.free(k.*);
+    while (it.next()) |k| {
+        assert(k.len > 0);
+        allocator.free(k.*);
+    }
     map.deinit();
 }
 
@@ -233,6 +259,15 @@ test "Baseline.parse skips blank lines and #-prefixed comment lines" {
     var baseline = try Baseline.parse(gpa, "\n# a comment\nsrc/a.zig:foo:71\n\n# another\n");
     defer baseline.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), baseline.entries.count());
+    try std.testing.expectEqual(@as(?usize, 71), baseline.get("src/a.zig:foo"));
+}
+
+test "Baseline.parse drops an entry with an empty key instead of storing it" {
+    const gpa = std.testing.allocator;
+    var baseline = try Baseline.parse(gpa, ":71\nsrc/a.zig:foo:71\n");
+    defer baseline.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 1), baseline.entries.count());
+    try std.testing.expectEqual(@as(?usize, null), baseline.entries.get(""));
     try std.testing.expectEqual(@as(?usize, 71), baseline.get("src/a.zig:foo"));
 }
 
