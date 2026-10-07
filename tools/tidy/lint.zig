@@ -73,6 +73,10 @@ pub fn lintFile(
     defer gpa.free(wire_findings);
     for (wire_findings) |f| try findings.append(gpa, f);
 
+    const io_findings = try checks_ban.checkIoFields(gpa, path, lines);
+    defer gpa.free(io_findings);
+    for (io_findings) |f| try findings.append(gpa, f);
+
     std.debug.assert(lines.len < 1_000_000); // sanity: matches formatFindings' bound
 }
 
@@ -198,6 +202,26 @@ test "lintFile surfaces findings from more than one new check on a mixed fixture
     }
     try std.testing.expect(saw_ban);
     try std.testing.expect(saw_wire);
+}
+
+test "lintFile surfaces an Io field outside the allow list" {
+    const gpa = std.testing.allocator;
+    const content =
+        "//! doc\n" ++
+        "pub const Pool = struct {\n" ++
+        "    io: std.Io,\n" ++
+        "};\n";
+
+    var findings: std.ArrayList(Finding) = .empty;
+    defer freeFindingsList(gpa, &findings);
+
+    try lintFile(gpa, "src/cache/buffer_pool.zig", content, &findings);
+
+    var io_field_count: usize = 0;
+    for (findings.items) |f| {
+        if (std.mem.eql(u8, f.rule, "io-field")) io_field_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), io_field_count);
 }
 
 test "lintFile surfaces zero findings from the new checks on a clean fixture" {
