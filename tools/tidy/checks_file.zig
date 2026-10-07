@@ -12,23 +12,23 @@ const max_line_len: usize = 100;
 
 /// Check 1: every line must be at most 100 Unicode code points (not bytes).
 pub fn checkLineLength(
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     lines: []const []const u8,
 ) ![]Finding {
     std.debug.assert(path.len > 0);
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     for (lines, 0..) |line, idx| {
         const n = std.unicode.utf8CountCodepoints(line) catch line.len;
         if (n > max_line_len) {
             const msg = try std.fmt.allocPrint(
-                allocator,
+                gpa,
                 "line is {d} columns (limit {d})",
                 .{ n, max_line_len },
             );
-            try out.append(allocator, .{
+            try out.append(gpa, .{
                 .path = path,
                 .line = idx + 1,
                 .rule = "line-length",
@@ -37,7 +37,7 @@ pub fn checkLineLength(
         }
     }
 
-    const result = try out.toOwnedSlice(allocator);
+    const result = try out.toOwnedSlice(gpa);
     std.debug.assert(result.len <= lines.len);
     return result;
 }
@@ -45,24 +45,24 @@ pub fn checkLineLength(
 /// Check 2: the first line of every `.zig` file under `src/` must start with a
 /// `//!` doc comment. Files not under `src/` are exempt (no findings).
 pub fn checkDocHeader(
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     lines: []const []const u8,
 ) ![]Finding {
     std.debug.assert(path.len > 0);
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     if (!std.mem.startsWith(u8, path, "src/")) {
-        const result = try out.toOwnedSlice(allocator);
+        const result = try out.toOwnedSlice(gpa);
         std.debug.assert(result.len == 0);
         return result;
     }
 
     const first = if (lines.len > 0) lines[0] else "";
     if (!std.mem.startsWith(u8, first, "//!")) {
-        const msg = try allocator.dupe(u8, "file under src/ must start with a `//!` doc comment");
-        try out.append(allocator, .{
+        const msg = try gpa.dupe(u8, "file under src/ must start with a `//!` doc comment");
+        try out.append(gpa, .{
             .path = path,
             .line = 1,
             .rule = "doc-header",
@@ -70,7 +70,7 @@ pub fn checkDocHeader(
         });
     }
 
-    const result = try out.toOwnedSlice(allocator);
+    const result = try out.toOwnedSlice(gpa);
     std.debug.assert(result.len <= 1);
     return result;
 }
@@ -82,21 +82,21 @@ const max_file_lines: usize = 800;
 /// checks table imposes kingdom-wide. Unlike `checkFunctionLength`, no
 /// baseline rescues an existing offender; a file over the limit shrinks.
 pub fn checkFileLength(
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     lines: []const []const u8,
 ) ![]Finding {
     std.debug.assert(path.len > 0);
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     if (lines.len > max_file_lines) {
         const msg = try std.fmt.allocPrint(
-            allocator,
+            gpa,
             "file is {d} lines (limit {d})",
             .{ lines.len, max_file_lines },
         );
-        try out.append(allocator, .{
+        try out.append(gpa, .{
             .path = path,
             .line = lines.len,
             .rule = "file-length",
@@ -104,7 +104,7 @@ pub fn checkFileLength(
         });
     }
 
-    const result = try out.toOwnedSlice(allocator);
+    const result = try out.toOwnedSlice(gpa);
     std.debug.assert(result.len <= 1);
     return result;
 }

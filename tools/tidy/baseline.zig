@@ -30,19 +30,19 @@ pub const ActualLen = struct { line: usize, len: usize };
 pub const Baseline = struct {
     entries: std.StringHashMap(usize),
 
-    pub fn init(allocator: Allocator) Baseline {
-        const self: Baseline = .{ .entries = std.StringHashMap(usize).init(allocator) };
+    pub fn init(gpa: Allocator) Baseline {
+        const self: Baseline = .{ .entries = std.StringHashMap(usize).init(gpa) };
         assert(self.entries.count() == 0);
         return self;
     }
 
-    /// Frees every owned key; `allocator` must be the one the entries were parsed with.
-    pub fn deinit(self: *Baseline, allocator: Allocator) void {
+    /// Frees every owned key; `gpa` must be the one the entries were parsed with.
+    pub fn deinit(self: *Baseline, gpa: Allocator) void {
         assert(self.entries.count() < 1_000_000);
         var it = self.entries.keyIterator();
         while (it.next()) |k| {
             assert(k.len > 0);
-            allocator.free(k.*);
+            gpa.free(k.*);
         }
         self.entries.deinit();
         self.* = undefined;
@@ -58,23 +58,23 @@ pub const Baseline = struct {
 
     /// Parses `path:fn_name:lines` lines. Blank lines and lines starting
     /// with `#` are ignored.
-    pub fn parse(allocator: Allocator, content: []const u8) !Baseline {
+    pub fn parse(gpa: Allocator, content: []const u8) !Baseline {
         assert(content.len < 100 * 1024 * 1024); // sanity: never a runaway file
-        var self = Baseline.init(allocator);
-        errdefer self.deinit(allocator);
+        var self = Baseline.init(gpa);
+        errdefer self.deinit(gpa);
 
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
-            try self.parseLine(allocator, line);
+            try self.parseLine(gpa, line);
         }
 
         assert(self.entries.count() < 1_000_000); // sanity: never a runaway baseline
         return self;
     }
 
-    fn parseLine(self: *Baseline, allocator: Allocator, line: []const u8) !void {
+    fn parseLine(self: *Baseline, gpa: Allocator, line: []const u8) !void {
         assert(line.len > 0);
         const last_colon = std.mem.findScalarLast(u8, line, ':') orelse return;
         const lines_str = line[last_colon + 1 ..];
@@ -84,16 +84,16 @@ pub const Baseline = struct {
         // A line like `:71` names no function; the baseline is user data, so skip, do not store.
         if (key_part.len == 0) return;
 
-        const key = try allocator.dupe(u8, key_part);
+        const key = try gpa.dupe(u8, key_part);
         const gop = try self.entries.getOrPut(key);
-        if (gop.found_existing) allocator.free(key);
+        if (gop.found_existing) gpa.free(key);
         gop.value_ptr.* = lines_n;
     }
 };
 
 fn appendFunctionLengthFinding(
     out: *std.ArrayList(Finding),
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     line: usize,
     name: []const u8,
@@ -102,11 +102,11 @@ fn appendFunctionLengthFinding(
     assert(name.len > 0);
     assert(len > fn_len_clean_max);
     const msg = try std.fmt.allocPrint(
-        allocator,
+        gpa,
         "fn `{s}` is {d} lines (limit {d})",
         .{ name, len, fn_len_clean_max },
     );
-    try out.append(allocator, .{
+    try out.append(gpa, .{
         .path = path,
         .line = line,
         .rule = "function-length",
@@ -122,7 +122,7 @@ fn appendFunctionLengthFinding(
 /// actual span into `actual_out`, keyed `"path:fn_name"`, regardless of
 /// whether it passed or failed.
 pub fn checkFunctionLength(
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     lines: []const []const u8,
     baseline: Baseline,
@@ -130,26 +130,26 @@ pub fn checkFunctionLength(
 ) ![]Finding {
     assert(path.len > 0);
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     var idx: usize = 0;
     while (idx < lines.len) : (idx += 1) {
         const name = scanner.extractFnName(lines[idx]) orelse continue;
         const len = scanner.measureFunctionLines(lines, idx) orelse continue;
 
-        const key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ path, name });
+        const key = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ path, name });
         const gop = try actual_out.getOrPut(key);
-        if (gop.found_existing) allocator.free(key);
+        if (gop.found_existing) gpa.free(key);
         gop.value_ptr.* = .{ .line = idx + 1, .len = len };
 
         const in_redzone = len > fn_len_clean_max and len <= fn_len_redzone_max;
         const over_ceiling = len > fn_len_redzone_max;
         if (over_ceiling or (in_redzone and baseline.get(key) == null)) {
-            try appendFunctionLengthFinding(&out, allocator, path, idx + 1, name, len);
+            try appendFunctionLengthFinding(&out, gpa, path, idx + 1, name, len);
         }
     }
 
-    const result = try out.toOwnedSlice(allocator);
+    const result = try out.toOwnedSlice(gpa);
     assert(result.len <= lines.len);
     return result;
 }
@@ -157,14 +157,14 @@ pub fn checkFunctionLength(
 /// Appends one `stale-baseline` finding for `path` at `line` with the owned `msg`.
 fn appendStaleFinding(
     out: *std.ArrayList(Finding),
-    allocator: Allocator,
+    gpa: Allocator,
     path: []const u8,
     line: usize,
     msg: []const u8,
 ) !void {
     assert(path.len > 0);
     assert(msg.len > 0);
-    try out.append(allocator, .{
+    try out.append(gpa, .{
         .path = path,
         .line = line,
         .rule = "stale-baseline",
@@ -176,7 +176,7 @@ fn appendStaleFinding(
 /// `reconcileBaseline`).
 fn reconcileOne(
     out: *std.ArrayList(Finding),
-    allocator: Allocator,
+    gpa: Allocator,
     key: []const u8,
     actual: std.StringHashMap(ActualLen),
 ) !void {
@@ -186,27 +186,27 @@ fn reconcileOne(
 
     const found = actual.get(key) orelse {
         const msg = try std.fmt.allocPrint(
-            allocator,
+            gpa,
             "baseline entry `{s}` matches no function",
             .{key},
         );
-        return appendStaleFinding(out, allocator, path, 1, msg);
+        return appendStaleFinding(out, gpa, path, 1, msg);
     };
 
     if (found.len <= fn_len_clean_max) {
         const msg = try std.fmt.allocPrint(
-            allocator,
+            gpa,
             "`{s}` shrank to {d} lines; remove it from tidy_baseline.txt",
             .{ key, found.len },
         );
-        try appendStaleFinding(out, allocator, path, found.line, msg);
+        try appendStaleFinding(out, gpa, path, found.line, msg);
     } else if (found.len > fn_len_redzone_max) {
         const msg = try std.fmt.allocPrint(
-            allocator,
+            gpa,
             "`{s}` is {d} lines; the baseline cannot rescue the hard ceiling",
             .{ key, found.len },
         );
-        try appendStaleFinding(out, allocator, path, found.line, msg);
+        try appendStaleFinding(out, gpa, path, found.line, msg);
     }
 }
 
@@ -216,30 +216,30 @@ fn reconcileOne(
 /// finding. An entry whose function is still legitimately in the 71-72
 /// range is silent.
 pub fn reconcileBaseline(
-    allocator: Allocator,
+    gpa: Allocator,
     baseline: Baseline,
     actual: std.StringHashMap(ActualLen),
 ) ![]Finding {
     assert(baseline.entries.count() < 1_000_000); // sanity: never a runaway baseline
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     var it = baseline.entries.iterator();
     while (it.next()) |entry| {
-        try reconcileOne(&out, allocator, entry.key_ptr.*, actual);
+        try reconcileOne(&out, gpa, entry.key_ptr.*, actual);
     }
 
-    const result = try out.toOwnedSlice(allocator);
+    const result = try out.toOwnedSlice(gpa);
     assert(result.len <= baseline.entries.count());
     return result;
 }
 
-fn freeActualMap(allocator: Allocator, map: *std.StringHashMap(ActualLen)) void {
+fn freeActualMap(gpa: Allocator, map: *std.StringHashMap(ActualLen)) void {
     assert(map.count() < 1_000_000);
     var it = map.keyIterator();
     while (it.next()) |k| {
         assert(k.len > 0);
-        allocator.free(k.*);
+        gpa.free(k.*);
     }
     map.deinit();
 }
