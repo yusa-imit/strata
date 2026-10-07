@@ -20,6 +20,7 @@ const BanId = enum {
     std_net,
     thread_sync_primitive,
     fs_cwd,
+    io_runtime,
 };
 const BanRule = struct { id: BanId, needle: []const u8, replacement: []const u8 };
 
@@ -31,6 +32,16 @@ fn threadRule(comptime name: []const u8, comptime use: []const u8) BanRule {
         .id = .thread_sync_primitive,
         .needle = "Thread." ++ name,
         .replacement = "use `Io." ++ use ++ "` (std.Thread." ++ name ++ " was removed in 0.16.0)",
+    };
+}
+
+/// One rule for an `Io` runtime constructor that a library must never reach for (ADR-0001).
+fn ioRule(comptime needle: []const u8) BanRule {
+    comptime assert(needle.len > 0);
+    return .{
+        .id = .io_runtime,
+        .needle = needle,
+        .replacement = "libraries never construct an `Io`; take it from the caller (ADR-0001)",
     };
 }
 
@@ -83,6 +94,9 @@ const ban_rules = [_]BanRule{
         .replacement = "use `Io.Dir.cwd()`, passing `io` to the next call (std.fs." ++
             "cwd() was removed in 0.16.0)",
     },
+    ioRule("Io." ++ "Threaded"),
+    ioRule("Io." ++ "Evented"),
+    ioRule("global_single_" ++ "threaded"),
 };
 
 fn isMainZig(path: []const u8) bool {
@@ -106,6 +120,7 @@ fn banApplies(id: BanId, path: []const u8) bool {
         .catch_unreachable => true,
         .debug_print => !(isMainZig(path) or underDir(path, "bench")),
         .time_call => std.mem.startsWith(u8, path, "src/") and !isMainZig(path),
+        .io_runtime => std.mem.startsWith(u8, path, "src/") and !isMainZig(path),
         .array_list_bare_init,
         .mem_index_of,
         .std_net,
@@ -133,14 +148,15 @@ fn hasBareArrayListInit(line: []const u8) bool {
     return std.mem.find(u8, line[type_idx..], "= .{}") != null;
 }
 
-/// Check: flags eight distinct banned spellings (`BanId` values; the
+/// Check: flags nine distinct banned spellings (`BanId` values; the
 /// `thread_sync_primitive` id spans seven `ban_rules` entries, one per
-/// removed `std.Thread.*` sync type) — an unreachable catch without a `//
-/// proof:` comment on the same or previous line, debug printing outside
+/// removed `std.Thread.*` sync type, and `io_runtime` spans three) — an unreachable catch
+/// without a `// proof:` comment on the same or previous line, debug printing outside
 /// `src/main.zig`/`bench/`, `std.time.` under `src/` outside `src/main.zig`,
 /// a bare `ArrayList` `.{}` init (not `.empty`), the legacy `mem` index-of
 /// family, the removed `std` networking namespace, every removed
-/// `std.Thread.*` sync primitive, and the removed `fs` cwd accessor. Every
+/// `std.Thread.*` sync primitive, the removed `fs` cwd accessor, and under `src/` the `Io`
+/// runtime constructors (`Io.Threaded`, `Io.Evented`, `global_single_threaded`). Every
 /// finding carries a non-null `.replacement`.
 pub fn checkBanList(
     gpa: Allocator,
@@ -171,6 +187,85 @@ pub fn checkBanList(
 
     const result = try out.toOwnedSlice(gpa);
     assert(result.len <= lines.len * ban_rules.len);
+    return result;
+}
+
+/// Files under `src/` allowed to hold an `Io` as a struct field (ADR-0001): the KV engine owns a
+/// long-lived handle, and an `Io` wrapper must keep the inner `Io` it forwards to.
+const io_field_allowed = [_][]const u8{ "src/kv/db.zig", "src/testing/fault_io.zig" };
+
+/// True when `code` (a comment-stripped line) declares a struct field of type `Io` or `std.Io`,
+/// with or without a default: `name: Io,`, `name: std.Io,`, `name: Io = ...`. A qualified type
+/// such as `Io.File` and a local (`const x: Io`, whose name part holds a space) do not match.
+fn isIoFieldDecl(code: []const u8) bool {
+    assert(code.len < 1_000_000); // sanity: never an absurd line
+    const trimmed = std.mem.trim(u8, code, " \t");
+    const colon = std.mem.find(u8, trimmed, ": ") orelse return false;
+    if (colon == 0) return false;
+    for (trimmed[0..colon]) |c| {
+        if (!scanner.isIdentChar(c)) return false;
+    }
+    const rest = trimmed[colon + 2 ..];
+    const type_names = [_][]const u8{ "std.Io", "Io" };
+    for (type_names) |type_name| {
+        if (!std.mem.startsWith(u8, rest, type_name)) continue;
+        const tail = rest[type_name.len..];
+        if (tail.len == 0) continue;
+        if (tail[0] == ',' or std.mem.startsWith(u8, tail, " =")) return true;
+    }
+    return false;
+}
+
+/// Net `(` minus `)` on `code`, so the caller can tell a field line (depth 0) from a line inside
+/// a multi-line parameter list (depth > 0).
+fn parenDelta(code: []const u8) i32 {
+    assert(code.len < 1_000_000); // sanity: never an absurd line
+    var delta: i32 = 0;
+    for (code) |c| {
+        if (c == '(') delta += 1;
+        if (c == ')') delta -= 1;
+    }
+    return delta;
+}
+
+/// Check (ADR-0001 verification 3): under `src/`, an `Io` struct field may appear only in the
+/// files of `io_field_allowed`. Parameters are not fields: lines inside an open parenthesis are
+/// skipped, as are comments. Other files take `io` per call.
+pub fn checkIoFields(
+    gpa: Allocator,
+    path: []const u8,
+    lines: []const []const u8,
+) ![]Finding {
+    assert(path.len > 0);
+    assert(lines.len < 1_000_000); // sanity: never a runaway file
+    var out: std.ArrayList(Finding) = .empty;
+    errdefer out.deinit(gpa);
+
+    var applies = std.mem.startsWith(u8, path, "src/");
+    for (io_field_allowed) |allowed| {
+        if (std.mem.eql(u8, path, allowed)) applies = false;
+    }
+
+    var depth: i32 = 0;
+    for (lines, 0..) |line, idx| {
+        if (!applies) break;
+        const code = scanner.stripLineComment(line);
+        if (depth <= 0 and isIoFieldDecl(code)) {
+            try out.append(gpa, .{
+                .path = path,
+                .line = idx + 1,
+                .rule = "io-field",
+                .message = try gpa.dupe(u8, "`Io` stored as a struct field outside the allow list"),
+                .replacement = "take `io: Io` per call (ADR-0001); only src/kv/db.zig and " ++
+                    "src/testing/fault_io.zig may hold one",
+            });
+        }
+        depth = @max(0, depth + parenDelta(code));
+    }
+
+    const result = try out.toOwnedSlice(gpa);
+    assert(result.len <= lines.len);
+    if (!applies) assert(result.len == 0);
     return result;
 }
 
@@ -486,6 +581,107 @@ test "checkBanList: every finding from the new library-sweep rules carries a rep
         try std.testing.expectEqualStrings("ban-list", f.rule);
         try std.testing.expect(f.replacement != null);
     }
+}
+
+// -- ADR-0001 Io guards ------------------------------------------------------------
+
+const io_threaded = "std.Io." ++ "Threaded";
+const io_evented = "std.Io." ++ "Evented";
+const io_global = "global_single_" ++ "threaded";
+
+test "checkBanList flags constructing an Io runtime under src/" {
+    const gpa = std.testing.allocator;
+    const needles = [_][]const u8{ io_threaded, io_evented, io_global };
+    inline for (needles) |needle| {
+        const line = "    var rt = " ++ needle ++ ".init(gpa);";
+        const findings = try checkBanList(gpa, "src/page/manager.zig", &.{line});
+        defer scanner.freeFindings(gpa, findings);
+        try std.testing.expectEqual(@as(usize, 1), findings.len);
+        try std.testing.expectEqualStrings("ban-list", findings[0].rule);
+        try std.testing.expect(findings[0].replacement != null);
+    }
+}
+
+test "checkBanList allows an Io runtime spelling outside src/" {
+    const gpa = std.testing.allocator;
+    const line = "    var rt = " ++ io_threaded ++ ".init(gpa);";
+    const findings = try checkBanList(gpa, "tools/tidy.zig", &.{line});
+    defer scanner.freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "checkIoFields flags an Io struct field outside the allow list" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "pub const Pool = struct {",
+        "    io: std.Io,",
+        "    cursor: u32,",
+        "};",
+    };
+    const findings = try checkIoFields(gpa, "src/cache/buffer_pool.zig", &lines);
+    defer scanner.freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("io-field", findings[0].rule);
+    try std.testing.expectEqual(@as(usize, 2), findings[0].line);
+    try std.testing.expect(findings[0].replacement != null);
+}
+
+test "checkIoFields flags a defaulted bare Io field" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{ "const W = struct {", "    inner: Io = undefined," };
+    const findings = try checkIoFields(gpa, "src/wal/writer.zig", &lines);
+    defer scanner.freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "checkIoFields allows the two allow-listed files" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{ "const W = struct {", "    inner: Io," };
+    const paths = [_][]const u8{ "src/kv/db.zig", "src/testing/fault_io.zig" };
+    for (paths) |path| {
+        const findings = try checkIoFields(gpa, path, &lines);
+        defer scanner.freeFindings(gpa, findings);
+        try std.testing.expectEqual(@as(usize, 0), findings.len);
+    }
+}
+
+test "checkIoFields ignores a multi-line parameter list" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "pub fn open(",
+        "    self: *Manager,",
+        "    io: Io,",
+        "    path: []const u8,",
+        ") !void {",
+        "    _ = self;",
+        "}",
+    };
+    const findings = try checkIoFields(gpa, "src/page/manager.zig", &lines);
+    defer scanner.freeFindings(gpa, findings);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "checkIoFields ignores comments, locals, Io-qualified types and files outside src/" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "const S = struct {",
+        "    // io: Io,",
+        "    file: Io.File,",
+        "    dir: std.Io.Dir,",
+        "};",
+        "fn f(io: Io) void {",
+        "    const held: Io = io;",
+        "    _ = held;",
+        "}",
+    };
+    const in_src = try checkIoFields(gpa, "src/page/manager.zig", &lines);
+    defer scanner.freeFindings(gpa, in_src);
+    try std.testing.expectEqual(@as(usize, 0), in_src.len);
+
+    const field = [_][]const u8{ "const S = struct {", "    io: Io," };
+    const outside = try checkIoFields(gpa, "tools/tidy/walk.zig", &field);
+    defer scanner.freeFindings(gpa, outside);
+    try std.testing.expectEqual(@as(usize, 0), outside.len);
 }
 
 // -- checkWireFormatUsize --------------------------------------------------------
