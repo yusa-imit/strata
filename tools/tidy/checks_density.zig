@@ -66,19 +66,19 @@ pub fn measureAssertionDensity(path: []const u8, lines: []const []const u8) Asse
 /// Check: a `src/` file with at least one function-with-a-body must average
 /// at least `assertion_density_min` assertions per function; a file with no
 /// such functions (a stub) is silent — there is nothing yet to assert over.
-pub fn checkAssertionDensity(allocator: Allocator, density: AssertionDensity) ![]Finding {
+pub fn checkAssertionDensity(gpa: Allocator, density: AssertionDensity) ![]Finding {
     std.debug.assert(density.path.len > 0);
     var out: std.ArrayList(Finding) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
     const floor = density.functions * assertion_density_min;
     if (density.functions > 0 and density.assertions < floor) {
         const msg = try std.fmt.allocPrint(
-            allocator,
+            gpa,
             "{d} assertion(s) across {d} function(s) is below the floor of {d} per function",
             .{ density.assertions, density.functions, assertion_density_min },
         );
-        try out.append(allocator, .{
+        try out.append(gpa, .{
             .path = density.path,
             .line = 1,
             .rule = "assertion-density",
@@ -86,7 +86,7 @@ pub fn checkAssertionDensity(allocator: Allocator, density: AssertionDensity) ![
         });
     }
 
-    const result = try out.toOwnedSlice(allocator);
+    const result = try out.toOwnedSlice(gpa);
     std.debug.assert(result.len <= 1);
     return result;
 }

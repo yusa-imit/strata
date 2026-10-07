@@ -164,9 +164,9 @@ pub fn lintAllFiles(
     std.debug.assert(findings.items.len < 1_000_000);
 }
 
-fn freeFindingsList(allocator: Allocator, findings: *std.ArrayList(Finding)) void {
-    for (findings.items) |f| allocator.free(f.message);
-    findings.deinit(allocator);
+fn freeFindingsList(gpa: Allocator, findings: *std.ArrayList(Finding)) void {
+    for (findings.items) |f| gpa.free(f.message);
+    findings.deinit(gpa);
 }
 
 // -- lintFile integration (multi-rule fixture through the real wiring) -----------

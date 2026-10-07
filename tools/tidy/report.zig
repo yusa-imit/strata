@@ -13,37 +13,37 @@ const AssertionDensity = @import("checks_density.zig").AssertionDensity;
 /// function-with-a-body, in input order: `tidy: density path: A assertion(s)
 /// / F function(s)`. Files with zero such functions are omitted; printed
 /// unconditionally by `main`, independent of pass/fail, so density stays
-/// visible as Phase 1 code lands. Caller frees the result with `allocator`.
-pub fn formatDensityReport(allocator: Allocator, densities: []const AssertionDensity) ![]u8 {
+/// visible as Phase 1 code lands. Caller frees the result with `gpa`.
+pub fn formatDensityReport(gpa: Allocator, densities: []const AssertionDensity) ![]u8 {
     std.debug.assert(densities.len < 1_000_000); // sanity: never a runaway file list
     var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    errdefer buf.deinit(gpa);
 
     for (densities) |d| {
         if (d.functions == 0) continue;
-        try buf.print(allocator, "tidy: density {s}: {d} assertion(s) / {d} function(s)\n", .{
+        try buf.print(gpa, "tidy: density {s}: {d} assertion(s) / {d} function(s)\n", .{
             d.path, d.assertions, d.functions,
         });
     }
 
-    const result = try buf.toOwnedSlice(allocator);
+    const result = try buf.toOwnedSlice(gpa);
     std.debug.assert(result.len == 0 or densities.len > 0);
     return result;
 }
 
 /// Renders every finding as `path:line: rule: message\n`, then a summary line
-/// `tidy: N finding(s)\n`. Caller frees the result with `allocator`.
-pub fn formatFindings(allocator: Allocator, findings: []const Finding) ![]u8 {
+/// `tidy: N finding(s)\n`. Caller frees the result with `gpa`.
+pub fn formatFindings(gpa: Allocator, findings: []const Finding) ![]u8 {
     std.debug.assert(findings.len < 1_000_000); // sanity: never a runaway report
     var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    errdefer buf.deinit(gpa);
 
     for (findings) |f| {
-        try buf.print(allocator, "{s}:{d}: {s}: {s}\n", .{ f.path, f.line, f.rule, f.message });
+        try buf.print(gpa, "{s}:{d}: {s}: {s}\n", .{ f.path, f.line, f.rule, f.message });
     }
-    try buf.print(allocator, "tidy: {d} finding(s)\n", .{findings.len});
+    try buf.print(gpa, "tidy: {d} finding(s)\n", .{findings.len});
 
-    const out = try buf.toOwnedSlice(allocator);
+    const out = try buf.toOwnedSlice(gpa);
     std.debug.assert(out.len > 0);
     return out;
 }

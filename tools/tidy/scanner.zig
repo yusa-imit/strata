@@ -22,26 +22,26 @@ pub const Finding = struct {
 };
 
 /// Frees a findings slice returned by a check: each `message`, then the slice itself.
-/// Precondition: every message was allocated with `allocator` (all checks do so).
-pub fn freeFindings(allocator: Allocator, findings: []Finding) void {
+/// Precondition: every message was allocated with `gpa` (all checks do so).
+pub fn freeFindings(gpa: Allocator, findings: []Finding) void {
     std.debug.assert(findings.len < 1_000_000); // sanity: never a runaway report
-    for (findings) |f| allocator.free(f.message);
-    allocator.free(findings);
+    for (findings) |f| gpa.free(f.message);
+    gpa.free(findings);
 }
 
 /// Splits `content` into lines (without trailing `\n` or `\r`), as slices into
-/// `content`. Caller frees the returned slice with `allocator`.
-pub fn splitLines(allocator: Allocator, content: []const u8) ![][]const u8 {
+/// `content`. Caller frees the returned slice with `gpa`.
+pub fn splitLines(gpa: Allocator, content: []const u8) ![][]const u8 {
     std.debug.assert(@intFromPtr(content.ptr) != 0 or content.len == 0);
     var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
 
-    if (content.len == 0) return out.toOwnedSlice(allocator);
+    if (content.len == 0) return out.toOwnedSlice(gpa);
 
     var it = std.mem.splitScalar(u8, content, '\n');
     while (it.next()) |raw| {
         const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
-        try out.append(allocator, line);
+        try out.append(gpa, line);
     }
     // `splitScalar` yields a trailing empty segment after a final '\n'; drop it so
     // content ending in a newline does not report a phantom empty last line.
@@ -51,7 +51,7 @@ pub fn splitLines(allocator: Allocator, content: []const u8) ![][]const u8 {
         _ = out.pop();
     }
 
-    const result = try out.toOwnedSlice(allocator);
+    const result = try out.toOwnedSlice(gpa);
     std.debug.assert(result.len == 0 or content.len > 0);
     return result;
 }
