@@ -34,7 +34,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       freelist_head, wal_lsn); `page.Id` width; power-of-two sizes 512–65536; how a never-written
       (zero) page decodes; freelist narrowed to a trunk-page list (bitmap deferred, reason given).
       Verify: ADR merged; `docs/PRD.md` §4.3 links it.
-- [ ] **`page/header.zig` — page and file-header codecs** (`src/page/`). Pure, no `io`
+- [x] **`page/header.zig` — page and file-header codecs** (`src/page/`). Pure, no `io`
       (ADR-0001). Encode stamps CRC32C via `codec.crc32c`; decode checks magic, version, type,
       checksum. `error.ChecksumMismatch` for a bad CRC, `error.Corrupted` for bad
       magic/version/type/page_size (REALM.md). Verify: round trip at 512/4096/65536; every

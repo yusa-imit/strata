@@ -1,19 +1,15 @@
 //! strata.page — Page header/format, page manager, freelist, file header.
 //!
-//! Planned files (see docs/PRD.md):
-//!   - `page/header.zig`
-//!   - `page/manager.zig`
-//!   - `page/freelist.zig`
+//! Landed: `page/header.zig` (ADR-0002 page format v1: 24-byte page header, page-id-seeded
+//! CRC32C, page-0 file header codec).
+//! Planned (see docs/PRD.md): `page/manager.zig`, `page/freelist.zig`.
 //!
-//! Status: stub. Public declarations are added as PRD phases land.
+//! Status: partial. Public declarations are added as PRD phases land.
 
 const std = @import("std");
 
-/// Module-level error set. Extend as functionality lands; keep names descriptive
-/// (`error.ChecksumMismatch`, not `error.Invalid`).
-pub const Error = error{
-    NotImplemented,
-};
+pub const header = @import("page/header.zig");
+pub const Id = header.Id;
 
 test "page: module compiles" {
     std.testing.refAllDecls(@This());
