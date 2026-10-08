@@ -22,12 +22,12 @@ tempted to cache an `Io`, so that guard goes first.
 
 No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
 
-- [ ] **tidy: ADR-0001 `Io` guards** (`tools/tidy/checks_ban.zig`). Safety before features: ban
+- [x] **tidy: ADR-0001 `Io` guards** (`tools/tidy/checks_ban.zig`). Safety before features: ban
       `Io.Threaded`, `Io.Evented`, `global_single_threaded` under `src/`; allow an `Io`-typed
       struct field only in `src/kv/db.zig` and `src/testing/fault_io.zig` (an `Io` wrapper must
       hold its inner `Io`). Needles spelled with `++` so tidy does not flag itself. Verify: one
       red fixture per rule; `zig build tidy` exits 0 on the tree.
-- [ ] **ADR-0002 — page format v1** (`docs/adr/0002-page-format.md`). The first on-disk format
+- [x] **ADR-0002 — page format v1** (`docs/adr/0002-page-format.md`). The first on-disk format
       is decided before code (REALM.md: magic + version). Fixes: §4.3 header widths and order;
       CRC32C over the whole page with the field zeroed, seeded with the page id so a misdirected
       write fails; page 0 file header (magic `STRA`, format version, page_size, page_count,

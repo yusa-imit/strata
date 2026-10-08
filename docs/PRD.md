@@ -118,9 +118,9 @@ pub const Mmap = struct {
 ```
 
 ### 4.3 `page`
-- 페이지 헤더: `magic(4) | page_type(1) | flags(1) | version(2) | checksum(4) | lsn(8) | payload...`
+- 페이지 헤더 (24B, [ADR-0002](adr/0002-page-format.md)): `magic(4) | page_type(1) | flags(1) | version(2) | checksum(4) | reserved(4) | lsn(8) | payload...`
 - 크기 512B–64KB (comptime 또는 open 시 결정), 기본 4KB
-- `PageManager`: allocate/free/read/write, 프리리스트 (연결 리스트 + 비트맵 하이브리드), 파일 헤더(magic `STRA`, page_size, page_count, freelist_head, wal_lsn)
+- `PageManager`: allocate/free/read/write, 프리리스트 (트렁크 페이지 리스트만, 비트맵은 보류 — ADR-0002), 파일 헤더(magic `STRA`, page_size, page_count, freelist_head, wal_lsn)
 - `io` 캐시 없음: `PageManager`는 `file.File`을 소유하고 블로킹 메서드
   (`read`/`write`/`allocate`/`free`/`sync`)마다 `io: Io`를 받아 그대로 아래로 넘긴다.
   헤더 인코딩/체크섬은 순수 함수라 `io`를 받지 않는다 (ADR-0001).
