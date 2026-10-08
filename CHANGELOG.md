@@ -7,6 +7,14 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- ADR-0002 fixes on-disk page format v1: 24-byte page header, CRC32C seeded with the page id,
+  `u32` page ids, page-0 file header, `Unwritten` decode for zero pages, and a trunk-page
+  freelist (plan 003, item 2).
+- `tidy` bans `Io.Threaded`, `Io.Evented` and `global_single_threaded` under `src/` and
+  restricts `Io` struct fields (ADR-0001; plan 003, item 1).
+
 ## [0.3.0] - 2026-10-05
 
 ### Added
