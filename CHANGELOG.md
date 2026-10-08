@@ -9,6 +9,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `page.header`: page header and page-0 file header codecs with the page-id-seeded CRC32C,
+  `Unwritten`/`Corrupted`/`ChecksumMismatch` decode errors and `peek_page_size` for open
+  (plan 003, item 3).
 - ADR-0002 fixes on-disk page format v1: 24-byte page header, CRC32C seeded with the page id,
   `u32` page ids, page-0 file header, `Unwritten` decode for zero pages, and a trunk-page
   freelist (plan 003, item 2).
