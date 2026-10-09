@@ -9,6 +9,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `page.manager`: `PageManager` `create`/`open`/`read`/`write` over a `file.File` with an
+  exclusive lock, ADR-0002 §5 open sequence and typed `Corrupted`/`ChecksumMismatch`/
+  `Unwritten`/`TornWrite` errors; allocate/free/sync follow in item 6 (plan 003, item 5).
 - `page.freelist`: trunk-page freelist codec (`format_trunk`, `decode_trunk`, `free`,
   `allocate`, `trunk_capacity`); pure push/pop over the head trunk, spill to a new trunk when
   full, `Corrupted` for bad counts, dead slots and self-links (plan 003, item 4).
