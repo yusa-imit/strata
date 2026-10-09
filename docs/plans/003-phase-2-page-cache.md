@@ -40,7 +40,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       magic/version/type/page_size (REALM.md). Verify: round trip at 512/4096/65536; every
       single-bit flip of a 512 B page fails; a page decoded under another id fails; page_size 3000
       → `Corrupted`.
-- [ ] **`page/freelist.zig` — trunk-page freelist** (`src/page/`). Pure push/pop over trunk-page
+- [x] **`page/freelist.zig` — trunk-page freelist** (`src/page/`). Pure push/pop over trunk-page
       bytes; the manager does the I/O. Ids per trunk derive from page_size and are asserted.
       Verify: seeded model test vs. a bounded array over 10k ops; spill to a new trunk and drain
       back; pop on empty → `null`; a count field past capacity → `Corrupted`.

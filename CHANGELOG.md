@@ -9,6 +9,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `page.freelist`: trunk-page freelist codec (`format_trunk`, `decode_trunk`, `free`,
+  `allocate`, `trunk_capacity`); pure push/pop over the head trunk, spill to a new trunk when
+  full, `Corrupted` for bad counts, dead slots and self-links (plan 003, item 4).
 - `page.header`: page header and page-0 file header codecs with the page-id-seeded CRC32C,
   `Unwritten`/`Corrupted`/`ChecksumMismatch` decode errors and `peek_page_size` for open
   (plan 003, item 3).
