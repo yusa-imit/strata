@@ -44,7 +44,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       bytes; the manager does the I/O. Ids per trunk derive from page_size and are asserted.
       Verify: seeded model test vs. a bounded array over 10k ops; spill to a new trunk and drain
       back; pop on empty → `null`; a count field past capacity → `Corrupted`.
-- [ ] **`page/manager.zig` — create, open, read, write** (`src/page/`). `PageManager` owns a
+- [x] **`page/manager.zig` — create, open, read, write** (`src/page/`). `PageManager` owns a
       `file.File` and takes `io` per blocking call (ADR-0001). `create` writes page 0; `open`
       validates it against `Options.page_size` and takes an exclusive `tryLock`. No new methods
       on `file.File` (788/800 lines). Verify: `tmpDir` create→close→open round trip; second open
