@@ -9,6 +9,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `cache.buffer_pool`: CLOCK `BufferPool` over a `PageManager` (`init`/`deinit`/`fetch`/`stats`),
+  read-only `PageGuard` (`bytes`/`id`/`release`), `PoolExhausted` when every frame is pinned;
+  all buffers allocated in `init` (plan 003, item 7).
 - `page.manager`: `allocate` (pop the freelist or grow the file up to `page_count_max`, then
   `NoSpaceLeft`), `free` (push, spilling into a new trunk) and `sync`; ids read from disk are
   range-checked and a bad head trunk is `Corrupted`/`ChecksumMismatch` (plan 003, item 6).

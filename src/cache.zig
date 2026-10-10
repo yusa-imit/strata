@@ -1,18 +1,19 @@
 //! strata.cache — Buffer pool (CLOCK), pin/unpin guards, dirty tracking, stats.
 //!
-//! Planned files (see docs/PRD.md):
-//!   - `cache/buffer_pool.zig`
-//!   - `cache/guard.zig`
+//! Landed: `cache/buffer_pool.zig` (`BufferPool` CLOCK fetch and pin over a `PageManager`,
+//! minimal read-only `PageGuard`, `Stats`).
+//! Planned: dirty tracking, `fetchForUpdate`, write-back and `flushAll` (plan 003 item 8).
 //!
-//! Status: stub. Public declarations are added as PRD phases land.
+//! Status: partial. Public declarations are added as PRD phases land.
 
 const std = @import("std");
 
-/// Module-level error set. Extend as functionality lands; keep names descriptive
-/// (`error.ChecksumMismatch`, not `error.Invalid`).
-pub const Error = error{
-    NotImplemented,
-};
+pub const buffer_pool = @import("cache/buffer_pool.zig");
+pub const BufferPool = buffer_pool.BufferPool;
+pub const PageGuard = buffer_pool.PageGuard;
+pub const Options = buffer_pool.Options;
+pub const Stats = buffer_pool.Stats;
+pub const FetchError = buffer_pool.FetchError;
 
 test "cache: module compiles" {
     std.testing.refAllDecls(@This());
