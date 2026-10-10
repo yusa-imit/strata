@@ -135,7 +135,8 @@ fn contains(page: []const u8, count: u32, freed: Id) bool {
 /// Preconditions: `(head == null) == (head_page == null)`; `head_page` is the head trunk's
 /// bytes; `freed` is not page 0, not the head and not already listed in the head trunk;
 /// `freed_page` has the same length as the page size. Freeing a page that is already listed
-/// in a non-head trunk is invisible here; the manager rejects it at its boundary.
+/// in a non-head trunk is invisible here and to the manager, which asserts only what the head
+/// trunk shows; the caller owns it.
 /// Errors: the head trunk fails `decode_trunk`.
 pub fn free(
     head: ?Id,
