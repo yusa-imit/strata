@@ -54,7 +54,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       2), then `error.NoSpaceLeft`; `free` pushes; `sync` delegates to `File.sync` per policy.
       Verify: seeded model test (allocate/free/write/read vs. a map) with reopen between rounds;
       no id handed out twice; `page_count_max` enforced.
-- [ ] **`cache/buffer_pool.zig` — CLOCK fetch and pin** (`src/cache/`). §4.4 shape: frames
+- [x] **`cache/buffer_pool.zig` — CLOCK fetch and pin** (`src/cache/`). §4.4 shape: frames
       (page-aligned), page table and CLOCK hand all allocated in `init`, none after (Tiger Style
       3). `fetch` pins on hit; on miss evicts the first unpinned frame with a clear reference
       bit; all pinned → `error.PoolExhausted`, never a wait. Minimal `PageGuard`
