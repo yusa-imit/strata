@@ -49,7 +49,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       validates it against `Options.page_size` and takes an exclusive `tryLock`. No new methods
       on `file.File` (788/800 lines). Verify: `tmpDir` create→close→open round trip; second open
       → `WouldBlock`; size mismatch → `Corrupted`; byte flipped on disk → `ChecksumMismatch`.
-- [ ] **`page/manager.zig` — allocate, free, sync, reopen** (`src/page/`). `allocate` pops the
+- [x] **`page/manager.zig` — allocate, free, sync, reopen** (`src/page/`). `allocate` pops the
       freelist or grows the file up to `Options.page_count_max` (a limit on growth, Tiger Style
       2), then `error.NoSpaceLeft`; `free` pushes; `sync` delegates to `File.sync` per policy.
       Verify: seeded model test (allocate/free/write/read vs. a map) with reopen between rounds;

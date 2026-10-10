@@ -1,14 +1,21 @@
-//! Page manager (ADR-0002 §5): owns one `file.File` of fixed-size, checksummed pages and
-//! moves whole pages between a caller buffer and the file. Item 5 scope: `create`, `open`,
-//! `read`, `write`; page allocation, the freelist and growth arrive with plan 003 item 6.
+//! Page manager (ADR-0002 §5, §7): owns one `file.File` of fixed-size, checksummed pages, moves
+//! whole pages between a caller buffer and the file, and hands out page ids through the trunk
+//! freelist: `allocate` pops (or grows the file, bounded by `Options.page_count_max`), `free`
+//! pushes, `sync` makes completed writes durable per the file's `SyncPolicy`.
 //!
 //! Invariants: page 0 holds the file header and is owned by the manager (callers address pages
 //! `1 ..< page_count`); `page_size` is a valid power of two and equals the file header's; the
 //! file is at least `page_count * page_size` bytes and exclusively locked from `create`/`open`
 //! until `close`; every page write stamps the id-seeded CRC32C, every read verifies it.
-//! Allocation: none. `create` and `open` use a `page_size_max` stack scratch for page 0, so
-//! no method allocates and none stores an allocator. The file handle is a leaf value and `io`
-//! is passed per call (ADR-0001). `read`/`write` never sync; durability is the caller's call.
+//! Allocation: none. `create`, `open`, `allocate` and `free` use `page_size_max` stack scratch
+//! buffers, so no method allocates and none stores an allocator. The file handle is a leaf value
+//! and `io` is passed per call (ADR-0001). `read`/`write` never sync; durability is the
+//! caller's call.
+//! Freelist updates are issued trunk first, then page 0 (file growth precedes page 0); a crash
+//! between them then leaks a page rather than corrupting the list, but only if the OS persisted
+//! the writes in that order, which `.none` and unsynced policies do not promise. Ordering across
+//! a crash is the WAL's job (plan 004); callers needing it call `sync` between operations.
+//! In-memory state changes only after every write of an operation succeeded.
 //! Errors: bad bytes on disk are typed (`Corrupted`, `ChecksumMismatch`, `Unwritten`,
 //! `TornWrite`); wrong ids, buffer lengths or options are caller contract violations (asserted).
 
@@ -17,6 +24,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const file = @import("../file/file.zig");
 const header = @import("header.zig");
+const freelist = @import("freelist.zig");
 const Id = header.Id;
 
 pub const Options = struct {
@@ -33,6 +41,12 @@ pub const OpenError = file.OpenError || file.ReadError || file.TryLockError ||
     file.LengthError || error{ Corrupted, ChecksumMismatch };
 pub const ReadError = file.ReadError || header.DecodeError || error{TornWrite};
 pub const WriteError = file.WriteError;
+pub const AllocateError = file.ReadError || file.WriteError || file.PreallocateError ||
+    error{ Corrupted, ChecksumMismatch, TornWrite };
+pub const FreeError = file.ReadError || file.WriteError ||
+    error{ Corrupted, ChecksumMismatch, TornWrite };
+pub const SyncError = file.SyncError;
+const TrunkReadError = file.ReadError || error{Corrupted};
 
 pub const PageManager = struct {
     file: file.File,
@@ -167,12 +181,152 @@ pub const PageManager = struct {
         try self.file.writeAtAll(io, buf, self.page_offset(id));
     }
 
+    /// Returns an id no live page uses: the most recently freed page, or a new page at the end
+    /// of the file. A reused page still holds its old bytes (a trunk image at most) until the
+    /// caller writes it; a grown page reads as `Unwritten`. Growth past `page_count_max` is
+    /// `NoSpaceLeft`; a freelist that names a page outside the file, or whose head trunk is
+    /// unwritten or malformed, is `Corrupted`. On error the manager is unchanged.
+    pub fn allocate(self: *PageManager, io: Io) AllocateError!Id {
+        assert(self.page_count >= 1);
+        assert(header.page_size_valid(self.page_size));
+        var head_buf = [_]u8{0} ** header.page_size_max;
+        const head_page = self.head_slice(&head_buf);
+        if (head_page) |page| try self.read_trunk_raw(io, self.freelist_head.?, page);
+        const popped = freelist.allocate(self.freelist_head, head_page, self.wal_lsn) catch |err| {
+            return trunk_error(err);
+        };
+
+        const id = popped.id orelse return self.allocate_grow(io, &head_buf);
+        if (@intFromEnum(id) >= self.page_count) return error.Corrupted;
+        if (popped.head) |next| {
+            if (@intFromEnum(next) >= self.page_count) return error.Corrupted;
+        }
+        if (popped.head_dirty) try self.write_raw(io, self.freelist_head.?, head_page.?);
+        if (popped.head != self.freelist_head) {
+            try self.write_file_header(io, &head_buf, self.page_count, popped.head);
+        }
+        self.freelist_head = popped.head;
+        assert(@intFromEnum(id) >= 1);
+        assert(@intFromEnum(id) < self.page_count);
+        return id;
+    }
+
+    /// Returns page `id` to the freelist. The page's contents are dead from here on. Preconditions:
+    /// `0 < id < page_count`; the page is live (not already free: a double free of the head or
+    /// of a page in the head trunk is asserted, one deeper in the list is not detectable here).
+    /// Never needs new space. Errors: the head trunk is unwritten or malformed (`Corrupted`,
+    /// `ChecksumMismatch`). On error the manager is unchanged.
+    pub fn free(self: *PageManager, io: Io, id: Id) FreeError!void {
+        assert(@intFromEnum(id) >= 1);
+        assert(@intFromEnum(id) < self.page_count);
+        var head_buf = [_]u8{0} ** header.page_size_max;
+        var freed_buf = [_]u8{0} ** header.page_size_max;
+        const head_page = self.head_slice(&head_buf);
+        if (head_page) |page| try self.read_trunk_raw(io, self.freelist_head.?, page);
+        const freed_page = freed_buf[0..self.page_size];
+        const released = freelist.free(
+            self.freelist_head,
+            head_page,
+            id,
+            freed_page,
+            self.wal_lsn,
+        ) catch |err| return trunk_error(err);
+
+        switch (released.written) {
+            .head_page => try self.write_raw(io, self.freelist_head.?, head_page.?),
+            .freed_page => try self.write_raw(io, id, freed_page),
+        }
+        if (released.head != self.freelist_head) {
+            try self.write_file_header(io, &freed_buf, self.page_count, released.head);
+        }
+        self.freelist_head = released.head;
+        assert(self.freelist_head != null);
+    }
+
+    /// Makes every completed write durable per the file's `SyncPolicy` (a no-op for `.none`).
+    pub fn sync(self: *PageManager, io: Io) SyncError!void {
+        assert(self.page_count >= 1);
+        assert(header.page_size_valid(self.page_size));
+        try self.file.sync(io);
+    }
+
+    fn head_slice(self: *const PageManager, buf: *[header.page_size_max]u8) ?[]u8 {
+        assert(header.page_size_valid(self.page_size));
+        assert((self.freelist_head == null) or (self.page_count >= 2));
+        return if (self.freelist_head != null) buf[0..self.page_size] else null;
+    }
+
+    /// Grows the file by one page: reserve the space, then publish it in page 0.
+    fn allocate_grow(
+        self: *PageManager,
+        io: Io,
+        scratch: *[header.page_size_max]u8,
+    ) AllocateError!Id {
+        assert(self.freelist_head == null);
+        assert(self.page_count >= 1);
+        if (self.page_count >= self.page_count_max) return error.NoSpaceLeft;
+        const new_count = self.page_count + 1;
+        assert(new_count <= self.page_count_max);
+        try self.file.preallocate(io, @as(u64, new_count) * self.page_size);
+        try self.write_file_header(io, scratch, new_count, null);
+        const id: Id = @enumFromInt(self.page_count);
+        self.page_count = new_count;
+        assert(@intFromEnum(id) == self.page_count - 1);
+        return id;
+    }
+
+    /// Reads the head trunk's raw bytes; decoding is `freelist`'s, so the checksum is verified
+    /// once. A head outside the file or a short read is corruption of the list.
+    fn read_trunk_raw(self: *PageManager, io: Io, head: Id, page: []u8) TrunkReadError!void {
+        assert(page.len == self.page_size);
+        assert(@intFromEnum(head) >= 1);
+        if (@intFromEnum(head) >= self.page_count) return error.Corrupted;
+        self.file.readAtAll(io, page, self.page_offset(head)) catch |err| switch (err) {
+            error.UnexpectedEof => return error.Corrupted,
+            else => |other| return other,
+        };
+    }
+
+    fn write_raw(self: *PageManager, io: Io, id: Id, page: []const u8) file.WriteError!void {
+        assert(page.len == self.page_size);
+        assert(@intFromEnum(id) >= 1);
+        try self.file.writeAtAll(io, page, self.page_offset(id));
+    }
+
+    /// Writes page 0 using the first `page_size` bytes of `scratch` (overwritten entirely).
+    fn write_file_header(
+        self: *PageManager,
+        io: Io,
+        scratch: *[header.page_size_max]u8,
+        page_count: u32,
+        freelist_head: ?Id,
+    ) file.WriteError!void {
+        assert(page_count >= self.page_count);
+        assert(page_count <= self.page_count_max or page_count == self.page_count);
+        const page = scratch[0..self.page_size];
+        header.encode_file_header(page, .{
+            .page_size = self.page_size,
+            .page_count = page_count,
+            .freelist_head = freelist_head,
+            .wal_lsn = self.wal_lsn,
+        });
+        try self.file.writeAtAll(io, page, 0);
+    }
+
     fn page_offset(self: *const PageManager, id: Id) u64 {
         assert(@intFromEnum(id) < self.page_count);
         assert(header.page_size_valid(self.page_size));
         return @as(u64, self.page_size) * @intFromEnum(id);
     }
 };
+
+/// A head trunk that fails its decode: an unwritten page cannot be a trunk, so it is corrupt.
+fn trunk_error(err: header.DecodeError) error{ Corrupted, ChecksumMismatch } {
+    return switch (err) {
+        error.Unwritten, error.Corrupted => error.Corrupted,
+        error.ChecksumMismatch => error.ChecksumMismatch,
+    };
+}
 
 /// Open steps 1-3: read the 512-byte prefix, check the page size it claims, then read and
 /// decode all of page 0. A short file is `Corrupted` (not a strata file), never `UnexpectedEof`.
@@ -203,4 +357,5 @@ fn open_file_header(io: Io, handle: file.File, page_size: u32) OpenError!header.
 
 test {
     _ = @import("manager_test.zig"); // Contract tests live in their own files (800-line limit).
+    _ = @import("manager_alloc_test.zig");
 }
