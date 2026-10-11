@@ -48,7 +48,7 @@ fn free_raw(pm: *PageManager, raw: u32) !void {
 }
 
 test "allocate: a fresh file grows one page at a time and the new pages read as unwritten" {
-    for (fx.sizes_three) |size| {
+    for (fx.sizes_all) |size| {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
 

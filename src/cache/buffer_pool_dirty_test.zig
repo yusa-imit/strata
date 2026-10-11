@@ -2,7 +2,7 @@
 //! guards, write-back on eviction, `flushAll`, `discardAll`, failed write-back that keeps the
 //! frame resident and dirty (`FaultIo`), the no-allocation contract, and a seeded model of
 //! writes, flushes and evictions against a trivial reference map. Every scripted test runs at
-//! 512, 4096 and 65536 byte pages.
+//! all eight page sizes, 512 to 65536 bytes.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -92,7 +92,7 @@ test "header: peek reads type and lsn without verifying, poke_lsn changes only t
 }
 
 test "write-back: a dirty page evicted then refetched returns the new bytes" {
-    for (fx.sizes_three) |size| {
+    for (fx.sizes_all) |size| {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -167,7 +167,7 @@ test "guard: bytes_mut and markDirty dirty a shared frame once; readers see the 
 }
 
 test "flushAll: persists every dirty frame, pinned ones included, and survives reopen" {
-    for (fx.sizes_three) |size| {
+    for (fx.sizes_all) |size| {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -202,7 +202,7 @@ test "write-back failure: eviction error keeps the victim resident and dirty, re
         .{ .fault = .zero, .expected = error.NoSpaceLeft },
     };
     for (faults) |case| {
-        for (fx.sizes_three) |size| {
+        for (fx.sizes_all) |size| {
             var tmp = testing.tmpDir(.{});
             defer tmp.cleanup();
 
@@ -261,7 +261,7 @@ test "flushAll failure: frames before the fault are clean, the rest stay dirty" 
 }
 
 test "write-back: an illegal type byte is InvalidHeader and the frame stays dirty" {
-    for (fx.sizes_three) |size| {
+    for (fx.sizes_all) |size| {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -297,7 +297,7 @@ test "write-back: an illegal type byte is InvalidHeader and the frame stays dirt
 }
 
 test "discardAll: drops dirty data without writing, the next fetch sees the old bytes" {
-    for (fx.sizes_three) |size| {
+    for (fx.sizes_all) |size| {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
 

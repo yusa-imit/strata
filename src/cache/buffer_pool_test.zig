@@ -75,8 +75,8 @@ fn expect_stats(pool: *const BufferPool, hits: u64, misses: u64, evictions: u64)
     try testing.expectEqual(evictions, got.evictions);
 }
 
-test "fetch: scripted hits, misses and CLOCK evictions at three page sizes" {
-    for (fx.sizes_three) |size| {
+test "fetch: scripted hits, misses and CLOCK evictions at all eight page sizes" {
+    for (fx.sizes_all) |size| {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
 
