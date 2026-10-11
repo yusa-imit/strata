@@ -18,7 +18,7 @@ const PageGuard = buffer_pool.PageGuard;
 const PageManager = @import("../page/manager.zig").PageManager;
 
 /// Creates `name` with pages `1..=count`, page `n` filled with `pattern(n)` and lsn `n`.
-fn make_pages(pm: *PageManager, dir: Io.Dir, size: u32, count: u32) !void {
+pub fn make_pages(pm: *PageManager, dir: Io.Dir, size: u32, count: u32) !void {
     assert(header.page_size_valid(size));
     assert(count >= 1 and count < fx.page_count_max);
     try PageManager.create(pm, testing.io, dir, "pool.db", fx.opts(size));
@@ -32,14 +32,14 @@ fn make_pages(pm: *PageManager, dir: Io.Dir, size: u32, count: u32) !void {
     }
 }
 
-fn pool_options(pm: *const PageManager, frames_max: u32) buffer_pool.Options {
+pub fn pool_options(pm: *const PageManager, frames_max: u32) buffer_pool.Options {
     assert(frames_max >= 1);
     assert(header.page_size_valid(pm.page_size));
     return .{ .frames_max = frames_max, .page_size = pm.page_size };
 }
 
 /// Fetches `raw`, checks its bytes are the page written by `make_pages`, returns the guard.
-fn fetch_ok(pool: *BufferPool, io: Io, raw: u32) !PageGuard {
+pub fn fetch_ok(pool: *BufferPool, io: Io, raw: u32) !PageGuard {
     assert(raw >= 1);
     assert(raw < fx.page_count_max);
     var guard = try pool.fetch(io, fx.id_of(raw));
@@ -58,7 +58,7 @@ fn fetch_ok(pool: *BufferPool, io: Io, raw: u32) !PageGuard {
     return guard;
 }
 
-fn fetch_release(pool: *BufferPool, raw: u32) !void {
+pub fn fetch_release(pool: *BufferPool, raw: u32) !void {
     assert(raw >= 1);
     assert(pool.pinned_count() <= pool.frames_max);
     assert(raw < fx.page_count_max);
