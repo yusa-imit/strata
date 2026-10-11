@@ -9,6 +9,8 @@
 //!     and writes: short, zero, canceled)
 //!   - `testing/truncation_matrix_test.zig` (landed, test-only: every truncation and torn cut
 //!     of a checksummed record must decode to a typed error, never to a damaged payload)
+//!   - `testing/page_matrix_test.zig` (landed, test-only: the same sweep over the real page
+//!     codec, `PageManager.read` and `PageManager.open` at all eight page sizes)
 //!   - `testing/model.zig` (planned)
 //!
 //! Status: crash and fault_io have landed; model is added as its PRD phase lands. Neither
@@ -23,6 +25,7 @@ test {
     _ = @import("testing/crash_test.zig");
     _ = @import("testing/fault_io_test.zig");
     _ = @import("testing/truncation_matrix_test.zig");
+    _ = @import("testing/page_matrix_test.zig");
 }
 
 test "testing: module compiles" {

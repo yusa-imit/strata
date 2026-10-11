@@ -20,7 +20,6 @@ const PageManager = manager.PageManager;
 pub const page_count_max: u32 = 64;
 pub const consumer_type: header.Type = @enumFromInt(130);
 pub const sizes_all = [_]u32{ 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
-pub const sizes_three = [_]u32{ 512, 4096, 65536 };
 pub const policies = [_]file_mod.SyncPolicy{ .none, .fdatasync, .fsync, .full_fsync };
 
 // ---------------------------------------------------------------------------------------------

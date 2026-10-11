@@ -65,7 +65,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       `release`/`markDirty` take no `io` and cannot fail (§4.4 contract). Verify: dirty page
       evicted then refetched returns new bytes; `flushAll` + reopen persists; a `FaultIo` failing
       the eviction write surfaces the error and leaves the frame dirty, not lost.
-- [ ] **2C page-size matrix + torn-page sweep** (`src/page/`, `src/cache/`, `src/testing/`).
+- [x] **2C page-size matrix + torn-page sweep** (`src/page/`, `src/cache/`, `src/testing/`).
       Run the header, manager and pool suites at all 8 powers of two 512–65536, not one size
       (REALM.md). Feed the real page decoder to the comptime decoder slot of
       `src/testing/truncation_matrix_test.zig` (replacing its stand-in, per cycle 29). Verify:

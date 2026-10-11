@@ -27,7 +27,7 @@ const expect_disk_equals = fx.expect_disk_equals;
 const expect_page0_intact = fx.expect_page0_intact;
 const expect_flip_read = fx.expect_flip_read;
 const consumer_type = fx.consumer_type;
-const sizes_three = fx.sizes_three;
+const sizes_all = fx.sizes_all;
 
 // ---------------------------------------------------------------------------------------------
 // read and write
@@ -37,7 +37,7 @@ test "manager: a never-written page reads as Unwritten" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    for (sizes_three) |size| {
+    for (sizes_all) |size| {
         var name_buf: [24]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "unw-{d}.db", .{size});
         var pm: PageManager = undefined;
@@ -53,7 +53,7 @@ test "manager: write then read round-trips header and payload, other pages untou
     defer tmp.cleanup();
 
     const gpa = testing.allocator;
-    for (sizes_three, 0..) |size, i| {
+    for (sizes_all, 0..) |size, i| {
         var name_buf: [24]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "wr-{d}.db", .{size});
         var pm: PageManager = undefined;
@@ -209,7 +209,7 @@ test "manager: pages written before close are read back equal after reopen" {
     defer tmp.cleanup();
 
     const gpa = testing.allocator;
-    for (sizes_three, 0..) |size, i| {
+    for (sizes_all, 0..) |size, i| {
         var name_buf: [24]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "persist-{d}.db", .{size});
         const lsn_base: u64 = 9000 * (i + 1);
