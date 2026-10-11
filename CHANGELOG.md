@@ -9,6 +9,12 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `cache`: dirty tracking and write-back. `fetchForUpdate` returns a writable `PageGuard`
+  (`bytes_mut`, `markDirty`, `set_lsn`, none take `io` or can fail); dirty victims are written
+  back inside eviction before their table entry goes, and a failed write-back surfaces from
+  `fetch` with the frame still resident and dirty; `flushAll`, `discardAll`, `Stats.writebacks`;
+  `deinit` asserts zero dirty frames. `PageGuard` moves to `cache/guard.zig`. `page.header` gains
+  `peek` and `poke_lsn` for in-memory pages (plan 003, item 8).
 - `cache.buffer_pool`: CLOCK `BufferPool` over a `PageManager` (`init`/`deinit`/`fetch`/`stats`),
   read-only `PageGuard` (`bytes`/`id`/`release`), `PoolExhausted` when every frame is pinned;
   all buffers allocated in `init` (plan 003, item 7).

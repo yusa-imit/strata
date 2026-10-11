@@ -60,7 +60,7 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       bit; all pinned → `error.PoolExhausted`, never a wait. Minimal `PageGuard`
       (`bytes`/`release`). Per-frame metadata `comptime`-asserted < 64 B (PRD §5). Verify:
       scripted hit/miss/eviction counts via `stats`; `FailingAllocator` armed after `init`.
-- [ ] **`cache/guard.zig` + dirty write-back** (`src/cache/`). `fetchForUpdate`, `markDirty`,
+- [x] **`cache/guard.zig` + dirty write-back** (`src/cache/`). `fetchForUpdate`, `markDirty`,
       write-back on eviction, `flushAll`, `discardAll`; `deinit` asserts zero dirty frames.
       `release`/`markDirty` take no `io` and cannot fail (§4.4 contract). Verify: dirty page
       evicted then refetched returns new bytes; `flushAll` + reopen persists; a `FaultIo` failing

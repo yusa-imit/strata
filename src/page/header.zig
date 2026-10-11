@@ -7,9 +7,11 @@
 //! id, so an intact page read under another id never verifies; encoding is canonical (flags,
 //! reserved bytes and the file header tail are zero), so one logical state has one byte image.
 //! Allocation: none. Every function is pure over caller-owned slices, takes no `io` (ADR-0001),
-//! and never mutates its input unless it is an `encode*` function.
+//! and never mutates its input unless it is an `encode*` function or `poke_lsn`.
 //! Errors: bad bytes on disk are typed `DecodeError`s; a wrong slice length or an invalid value
-//! passed to an `encode*` function is a caller contract violation and is asserted.
+//! passed to an `encode*` function is a caller contract violation and is asserted. `peek` and
+//! `poke_lsn` read and write the header fields of an in-memory page without verifying it
+//! (magic, version and checksum are not checked); only the slice length is asserted.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -103,7 +105,7 @@ fn magic_is_zero(page: []const u8) bool {
 
 /// True when the type byte is legal at `id` (ADR section 1): `file_header` only at id 0 and
 /// nothing else there; `free_trunk` and consumer types (128..255) elsewhere.
-fn type_valid(id: Id, type_byte: u8) bool {
+pub fn type_valid(id: Id, type_byte: u8) bool {
     const file_header_byte: u8 = @intFromEnum(Type.file_header);
     const free_trunk_byte: u8 = @intFromEnum(Type.free_trunk);
     assert(file_header_byte != free_trunk_byte);
@@ -161,6 +163,25 @@ pub fn decode(page: []const u8, id: Id) DecodeError!Header {
     if (page[offset_flags] != 0) return error.Corrupted;
     if (get(u32, page, offset_reserved) != 0) return error.Corrupted;
     return .{ .page_type = @enumFromInt(type_byte), .lsn = get(u64, page, offset_lsn) };
+}
+
+/// Reads `page_type` and `lsn` from the header bytes without verifying anything: no magic,
+/// version, checksum or type check. For a page a caller is editing in memory (the buffer pool's
+/// dirty frames), where the checksum is stale until `PageManager.write` stamps it. Never use it
+/// on bytes read from disk; that is `decode`. Precondition: `page.len` is a valid page size.
+pub fn peek(page: []const u8) Header {
+    assert(page.len <= page_size_max);
+    assert(page_len_valid(page.len));
+    return .{ .page_type = @enumFromInt(page[offset_type]), .lsn = get(u64, page, offset_lsn) };
+}
+
+/// Overwrites only the lsn field of an in-memory page; the checksum goes stale until the next
+/// `encode` (the buffer pool's write-back). Precondition: `page.len` is a valid page size.
+pub fn poke_lsn(page: []u8, lsn: u64) void {
+    assert(page.len <= page_size_max);
+    assert(page_len_valid(page.len));
+    put(u64, page, offset_lsn, lsn);
+    assert(get(u64, page, offset_lsn) == lsn);
 }
 
 /// Writes a complete page-0 image: clears all of `page`, stores `file_header` in the payload,

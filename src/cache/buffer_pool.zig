@@ -12,10 +12,21 @@
 //! while the hand looks for a victim. Frame metadata is `comptime`-asserted under 64 bytes.
 //! The pool is a leaf over the manager: `io` is passed to `fetch` and never cached (ADR-0001).
 //! `release`, `stats` and `deinit` take no `io` and cannot block.
-//! Pages are read-only through the pool until dirty tracking lands (plan 003 item 8): `bytes`
-//! is a const view, and a page changed behind the pool's back through `PageManager.write` or
-//! freed through `PageManager.free` is not noticed while a frame still holds its old copy.
-//! A failed load leaves the frame empty and the pool consistent; the evicted page stays gone.
+//! Dirty pages (PRD §4.4): `fetchForUpdate` pins a page behind a writable guard; `bytes_mut`,
+//! `markDirty` and `set_lsn` mark the frame dirty (pure bookkeeping, no `io`, cannot fail). A
+//! dirty frame is written back by `PageManager.write` in exactly two places: victim eviction
+//! inside `fetch`/`fetchForUpdate`, before the page table entry is removed, and `flushAll`.
+//! `release` never writes. A failed write-back surfaces from the call that needed it and leaves
+//! the frame resident, dirty and unchanged, so the bytes are not lost and a later call retries.
+//! Who stamps what: the caller owns the page type byte and the lsn (`set_lsn`; WAL-before-data
+//! ordering is plan 004's job); `PageManager.write` stamps magic, version and the page-id-seeded
+//! checksum from `header.peek` of the frame at write-back time, so a frame's checksum is stale
+//! while it is dirty. The pool never calls `sync`; durability is the caller's call.
+//! `deinit` asserts zero pinned and zero dirty frames: `flushAll` (or `discardAll`) first.
+//! A page changed behind the pool's back through `PageManager.write` or freed through
+//! `PageManager.free` is not noticed while a frame still holds its old copy.
+//! A failed load leaves the frame empty and the pool consistent; the evicted page stays gone,
+//! after its write-back, if it was dirty, succeeded.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,6 +34,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const header = @import("../page/header.zig");
 const manager = @import("../page/manager.zig");
+const guard = @import("guard.zig");
 const Id = header.Id;
 const PageManager = manager.PageManager;
 
@@ -37,24 +49,42 @@ pub const Options = struct {
     page_size: u32,
 };
 
-pub const FetchError = manager.ReadError || error{PoolExhausted};
+/// A write error here comes only from writing back the victim frame (never from the page being
+/// fetched): the victim stays resident and dirty. `Canceled` and every other `WriteError`
+/// variant propagate unchanged, so a canceled flush is distinguishable from a full disk.
+/// `InvalidHeader` covers a dirty victim whose type byte was left illegal for its page id
+/// through `bytes_mut`: caught at write-back in every build mode, the frame stays dirty.
+pub const FetchError = manager.ReadError || WriteBackError || error{PoolExhausted};
+
+/// `flushAll` stops at the first failed write; that frame and every later dirty one stay dirty.
+pub const FlushError = WriteBackError;
+
+pub const WriteBackError = manager.WriteError || error{InvalidHeader};
+
+pub const PageGuard = guard.PageGuard;
 
 /// Counters since `init`. `hits + misses` is the number of `fetch` calls that passed their
 /// preconditions; a miss that fails to load still counts. `evictions` counts pages dropped to
-/// make room, whether or not the following load succeeded.
+/// make room, whether or not the following load succeeded (a victim whose write-back fails is
+/// not evicted). `writebacks` counts successful page writes, from eviction and `flushAll`.
 pub const Stats = struct {
     hits: u64,
     misses: u64,
     evictions: u64,
+    writebacks: u64,
 };
 
-const Frame = struct {
+pub const Frame = struct {
     /// Raw `page.Id`, 0 when the frame holds no page (page 0 is never fetched).
     page_id: u32,
     pin_count: u32,
     /// CLOCK reference bit: set on every load and hit, cleared as the hand passes.
     referenced: bool,
+    /// The frame differs from the page on disk; implies `page_id != 0`.
+    dirty: bool,
 };
+
+const frame_empty: Frame = .{ .page_id = 0, .pin_count = 0, .referenced = false, .dirty = false };
 
 comptime {
     assert(@sizeOf(Frame) < 64); // PRD §5: per-frame metadata stays inside one cache line.
@@ -77,6 +107,8 @@ pub const BufferPool = struct {
     hand: u32,
     /// Frames holding no page. Lets the victim search take an empty frame before evicting.
     empty_count: u32,
+    /// Frames with `dirty` set, kept in step by `mark_dirty` and `write_back`.
+    dirty_count: u32,
     counters: Stats,
 
     /// Allocates every buffer the pool will ever use and builds it in place at `target`. The
@@ -105,7 +137,7 @@ pub const BufferPool = struct {
         var table: PageTable = .empty;
         try table.ensureTotalCapacity(gpa, options.frames_max);
         @memset(slab, 0);
-        @memset(frames, .{ .page_id = 0, .pin_count = 0, .referenced = false });
+        @memset(frames, frame_empty);
         target.* = .{
             .pages = pages,
             .page_size = options.page_size,
@@ -115,16 +147,21 @@ pub const BufferPool = struct {
             .table = table,
             .hand = 0,
             .empty_count = options.frames_max,
-            .counters = .{ .hits = 0, .misses = 0, .evictions = 0 },
+            .dirty_count = 0,
+            .counters = .{ .hits = 0, .misses = 0, .evictions = 0, .writebacks = 0 },
         };
         assert(target.frames.len == options.frames_max);
         assert(target.slab.len == slab_len);
     }
 
     /// Frees the buffers `init` allocated; `gpa` must be the allocator given to `init`.
-    /// Precondition: no guard is outstanding (every fetched page was released).
+    /// Preconditions: no guard is outstanding and no frame is dirty. Dropping dirty pages is a
+    /// programmer error, asserted here: call `flushAll` to keep them or `discardAll` to drop
+    /// them on purpose. Plain asserts: the kingdom has no `stdx.assert_always` yet, so in
+    /// ReleaseFast a violation silently loses dirty data; build with ReleaseSafe (REALM.md).
     pub fn deinit(self: *BufferPool, gpa: Allocator) void {
         assert(self.pinned_count() == 0);
+        assert(self.dirty_count == 0);
         assert(self.frames.len == self.frames_max);
         self.table.deinit(gpa);
         gpa.free(self.frames);
@@ -132,25 +169,62 @@ pub const BufferPool = struct {
         self.* = undefined;
     }
 
-    /// Pins page `id` and returns a guard over its frame. A hit costs no I/O; a miss evicts the
-    /// first unpinned frame whose reference bit is clear (taking an empty frame first) and
-    /// reads the page into it. Every frame pinned is `PoolExhausted`, returned at once, never
-    /// waited on. A page that fails to load (`Unwritten`, `Corrupted`, `ChecksumMismatch`,
-    /// `TornWrite`, I/O errors) leaves its frame empty, and the page it displaced stays gone.
+    /// Pins page `id` and returns a read-only guard (`bytes`) over its frame. A hit costs no
+    /// I/O; a miss evicts the first unpinned frame whose reference bit is clear (taking an
+    /// empty frame first), writing it back first if it is dirty, and reads the page into it.
+    /// Every frame pinned is `PoolExhausted`, returned at once, never waited on. A failed
+    /// write-back returns its error with the victim still resident and dirty (`FetchError`). A
+    /// page that fails to load (`Unwritten`, `Corrupted`, `ChecksumMismatch`, `TornWrite`, I/O
+    /// errors) leaves its frame empty, and the clean page it displaced stays gone.
     /// Preconditions: `0 < id < page_count` of the manager (the same contract as
     /// `PageManager.read`; ids that come from disk must be range-checked by the caller, since
     /// the checks here are asserts); the caller releases the guard exactly once.
     pub fn fetch(self: *BufferPool, io: Io, id: Id) FetchError!PageGuard {
-        const raw = @intFromEnum(id);
-        assert(raw >= 1);
-        assert(raw < self.pages.page_count);
-        if (self.table.get(raw)) |index| return self.pin_hit(index);
+        assert(@intFromEnum(id) >= 1);
+        const pinned = try self.fetch_pinned(io, id, false);
+        assert(!pinned.updatable);
+        return pinned;
+    }
 
-        self.counters.misses += 1;
-        const index = try self.victim_find();
-        self.victim_evict(index);
-        _ = try self.pages.read(io, id, self.frame_bytes(index));
-        return self.pin_load(index, raw);
+    /// Like `fetch`, but the guard is writable: `bytes_mut`, `markDirty` and `set_lsn` mark the
+    /// frame dirty. Fetching alone dirties nothing. Same errors and preconditions as `fetch`.
+    pub fn fetchForUpdate(self: *BufferPool, io: Io, id: Id) FetchError!PageGuard {
+        assert(@intFromEnum(id) >= 1);
+        const pinned = try self.fetch_pinned(io, id, true);
+        assert(pinned.updatable);
+        return pinned;
+    }
+
+    /// Writes every dirty frame, pinned ones included, in frame order; each written frame
+    /// becomes clean. A pinned dirty frame is written as it is now, so callers flush when no
+    /// guard is mid-edit; a pinned page edited again through an old `bytes_mut` slice must call
+    /// `markDirty` again, because the flush cleared the flag. Stops at the first failed write:
+    /// that frame and every later dirty one stay dirty and a retry continues from there. Does
+    /// not `sync` the file. Cost: one page write per dirty frame, `frames_max` frame visits.
+    pub fn flushAll(self: *BufferPool, io: Io) FlushError!void {
+        assert(self.frames.len == self.frames_max);
+        assert(self.dirty_count <= self.frames_max);
+        for (0..self.frames_max) |index| {
+            if (!self.frames[index].dirty) continue;
+            try self.write_back(io, @intCast(index));
+        }
+        assert(self.dirty_count == 0);
+    }
+
+    /// Empties the pool without writing anything: every dirty change is lost, every frame is
+    /// free and every page is a miss again. Counters are kept. Precondition: no guard is
+    /// outstanding (their bytes would vanish; a plain assert, so ReleaseSafe is required to
+    /// catch a violation, as for `deinit`).
+    pub fn discardAll(self: *BufferPool) void {
+        assert(self.pinned_count() == 0);
+        assert(self.dirty_count <= self.frames_max);
+        @memset(self.frames, frame_empty);
+        self.table.clearRetainingCapacity();
+        self.empty_count = self.frames_max;
+        self.dirty_count = 0;
+        self.hand = 0;
+        assert(self.table.count() == 0);
+        self.check_invariants();
     }
 
     /// Frames with at least one pin. O(frames_max); for tests, `deinit` and monitoring.
@@ -177,10 +251,13 @@ pub const BufferPool = struct {
         assert(self.hand < self.frames_max);
         assert(self.page_size == self.pages.page_size);
         var empty: u32 = 0;
+        var dirty: u32 = 0;
         for (self.frames, 0..) |frame, index| {
+            if (frame.dirty) dirty += 1;
             if (frame.page_id == 0) {
                 assert(frame.pin_count == 0);
                 assert(!frame.referenced);
+                assert(!frame.dirty);
                 empty += 1;
             } else {
                 assert(frame.page_id < self.pages.page_count);
@@ -188,35 +265,81 @@ pub const BufferPool = struct {
             }
         }
         assert(empty == self.empty_count);
+        assert(dirty == self.dirty_count);
         assert(self.table.count() == self.frames_max - empty);
     }
 
-    fn frame_bytes(self: *BufferPool, index: u32) []u8 {
+    /// The bytes of frame `index`. Internal to the cache module: `PageGuard` hands them out.
+    pub fn frame_bytes(self: *BufferPool, index: u32) []u8 {
         assert(index < self.frames_max);
         assert(self.slab.len == @as(usize, self.frames_max) * self.page_size);
         const start = @as(usize, index) * self.page_size;
         return self.slab[start..][0..self.page_size];
     }
 
-    fn pin_hit(self: *BufferPool, index: u32) PageGuard {
+    /// Sets the dirty flag of a pinned frame; idempotent. Internal to the cache module.
+    pub fn mark_dirty(self: *BufferPool, index: u32) void {
+        const frame = &self.frames[index];
+        assert(frame.pin_count > 0);
+        assert(frame.page_id != 0);
+        if (frame.dirty) return;
+        frame.dirty = true;
+        self.dirty_count += 1;
+        assert(self.dirty_count <= self.frames_max);
+    }
+
+    fn fetch_pinned(self: *BufferPool, io: Io, id: Id, updatable: bool) FetchError!PageGuard {
+        const raw = @intFromEnum(id);
+        assert(raw >= 1);
+        assert(raw < self.pages.page_count);
+        if (self.table.get(raw)) |index| return self.pin_hit(index, updatable);
+
+        self.counters.misses += 1;
+        const index = try self.victim_find();
+        try self.victim_evict(io, index);
+        _ = try self.pages.read(io, id, self.frame_bytes(index));
+        return self.pin_load(index, raw, updatable);
+    }
+
+    /// Writes frame `index` through `PageManager.write` and marks it clean on success. On error
+    /// nothing changes (the write stamps the frame header in place, which keeps it dirty and
+    /// equivalent). A type byte illegal for the page id, which only a caller scribbling through
+    /// `bytes_mut` can cause, is `InvalidHeader`: user data must not reach disk in release builds
+    /// on the strength of an assert. Preconditions: the frame is dirty and holds a page.
+    fn write_back(self: *BufferPool, io: Io, index: u32) WriteBackError!void {
+        const frame = &self.frames[index];
+        assert(frame.dirty);
+        assert(frame.page_id != 0);
+        const bytes = self.frame_bytes(index);
+        const page_id: Id = @enumFromInt(frame.page_id);
+        const sealed = header.peek(bytes);
+        if (!header.type_valid(page_id, @intFromEnum(sealed.page_type))) return error.InvalidHeader;
+
+        try self.pages.write(io, page_id, bytes, sealed);
+        frame.dirty = false;
+        self.dirty_count -= 1;
+        self.counters.writebacks += 1;
+    }
+
+    fn pin_hit(self: *BufferPool, index: u32, updatable: bool) PageGuard {
         const frame = &self.frames[index];
         assert(frame.page_id != 0);
         assert(frame.pin_count < std.math.maxInt(u32));
         frame.pin_count += 1;
         frame.referenced = true;
         self.counters.hits += 1;
-        return .{ .pool = self, .frame_index = index, .released = false };
+        return .{ .pool = self, .frame_index = index, .updatable = updatable, .released = false };
     }
 
-    fn pin_load(self: *BufferPool, index: u32, raw: u32) PageGuard {
+    fn pin_load(self: *BufferPool, index: u32, raw: u32, updatable: bool) PageGuard {
         const frame = &self.frames[index];
         assert(frame.page_id == 0);
         assert(frame.pin_count == 0);
         assert(raw >= 1);
-        frame.* = .{ .page_id = raw, .pin_count = 1, .referenced = true };
+        frame.* = .{ .page_id = raw, .pin_count = 1, .referenced = true, .dirty = false };
         self.table.putAssumeCapacityNoClobber(raw, index);
         self.empty_count -= 1;
-        return .{ .pool = self, .frame_index = index, .released = false };
+        return .{ .pool = self, .frame_index = index, .updatable = updatable, .released = false };
     }
 
     /// Picks the frame to load into: an empty one if any, else the CLOCK victim. Two sweeps of
@@ -256,14 +379,19 @@ pub const BufferPool = struct {
         return null;
     }
 
-    /// Drops the page held by frame `index`, if any, so the frame can be overwritten.
-    fn victim_evict(self: *BufferPool, index: u32) void {
+    /// Drops the page held by frame `index`, if any, so the frame can be overwritten. A dirty
+    /// page is written back first, before its table entry goes; on a failed write the frame is
+    /// left exactly as it was.
+    fn victim_evict(self: *BufferPool, io: Io, index: u32) WriteBackError!void {
         const frame = &self.frames[index];
         assert(frame.pin_count == 0);
+        assert(frame.page_id != 0 or !frame.dirty);
         if (frame.page_id == 0) return;
+        if (frame.dirty) try self.write_back(io, index);
+
         const removed = self.table.remove(frame.page_id);
         assert(removed);
-        frame.* = .{ .page_id = 0, .pin_count = 0, .referenced = false };
+        frame.* = frame_empty;
         self.empty_count += 1;
         self.counters.evictions += 1;
         // The table deletes by tombstone; sweeping them once per `frames_max` evictions keeps
@@ -272,42 +400,7 @@ pub const BufferPool = struct {
     }
 };
 
-/// A pin on one frame. Obtained from `BufferPool.fetch`; `release` exactly once, usually
-/// `defer guard.release()`. The bytes are valid until `release`. Move-only by convention: a
-/// copy shares the pin, and releasing both copies is a contract violation (asserted in
-/// safe builds, an underflow of the pin count in unsafe ones).
-pub const PageGuard = struct {
-    pool: *BufferPool,
-    frame_index: u32,
-    released: bool,
-
-    /// The whole page, header included, as read from disk. Const: see the file header.
-    /// Precondition: not released.
-    pub fn bytes(self: *const PageGuard) []const u8 {
-        assert(!self.released);
-        assert(self.pool.frames[self.frame_index].pin_count > 0);
-        return self.pool.frame_bytes(self.frame_index);
-    }
-
-    /// The pinned page's id. Precondition: not released.
-    pub fn id(self: *const PageGuard) Id {
-        assert(!self.released);
-        const raw = self.pool.frames[self.frame_index].page_id;
-        assert(raw >= 1);
-        return @enumFromInt(raw);
-    }
-
-    /// Drops this pin; the frame becomes evictable once its last pin is gone. No `io`, cannot
-    /// fail. Precondition: not released already.
-    pub fn release(self: *PageGuard) void {
-        assert(!self.released);
-        const frame = &self.pool.frames[self.frame_index];
-        assert(frame.pin_count > 0);
-        frame.pin_count -= 1;
-        self.released = true;
-    }
-};
-
 test {
-    _ = @import("buffer_pool_test.zig"); // Contract tests live in their own file (800-line limit).
+    _ = @import("buffer_pool_test.zig"); // Contract tests live in their own files (800-line limit).
+    _ = @import("buffer_pool_dirty_test.zig");
 }
