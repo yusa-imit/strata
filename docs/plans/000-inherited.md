@@ -67,3 +67,5 @@
 | 2026-10-04 | xxhash64 (1 MiB buffer) | 26.237 GB/s | — | Apple aarch64, ReleaseFast |
 | 2026-10-04 | varint encode (mixed 1–10 B) | 198.4 M ops/s | — | Apple aarch64, ReleaseFast |
 | 2026-10-04 | varint decode (mixed 1–10 B) | 151.1 M ops/s | — | Apple aarch64, ReleaseFast |
+| 2026-10-12 | pool hit (fetch+release, 4 KiB) | 197.1 M ops/s | — | Apple aarch64, ReleaseFast; floor for PRD §5 B+Tree get 5M ops/s |
+| 2026-10-12 | pool miss + clean evict (4 KiB) | 1.26 M ops/s | — | Apple aarch64, ReleaseFast; pread from OS page cache, 256 frames over 1024 pages |

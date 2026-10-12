@@ -9,6 +9,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `bench`: `pool_hit` and `pool_miss_evict` (fetch + release at 4 KiB over a scratch file;
+  about 197 M ops/s on a hit, 1.26 M ops/s on a miss with clean eviction, Apple aarch64) in
+  `bench/pool.zig` (plan 003, item 10).
 - `cache`: dirty tracking and write-back. `fetchForUpdate` returns a writable `PageGuard`
   (`bytes_mut`, `markDirty`, `set_lsn`, none take `io` or can fail); dirty victims are written
   back inside eviction before their table entry goes, and a failed write-back surfaces from
