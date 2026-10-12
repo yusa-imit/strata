@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-13
+
 ### Added
 
 - `bench`: `pool_hit` and `pool_miss_evict` (fetch + release at 4 KiB over a scratch file;

@@ -12,9 +12,9 @@ strata는 플랫폼 파일 I/O 추상화(fsync 정책, mmap, 락), 체크섬이 
 
 ## Status
 
-**Phase 1 landed (v0.3.0)** — `codec`, `file` (without mmap) and the `testing` crash harness
-are real, tested code. `page`, `cache`, `wal`, `btree`, `lsm`, `kv` and `snapshot` are still
-stubs (a doc comment and an `Error` set). 안정 릴리즈 전까지 API는 변경될 수 있다.
+**Phases 1 and 2 landed (v0.4.0)** — `codec`, `file` (without mmap), `page`, `cache` and the
+`testing` crash harness are real, tested code. `wal`, `btree`, `lsm`, `kv` and `snapshot` are
+still stubs (a doc comment and an `Error` set). 안정 릴리즈 전까지 API는 변경될 수 있다.
 
 ## Modules
 
@@ -22,8 +22,8 @@ stubs (a doc comment and an `Error` set). 안정 릴리즈 전까지 API는 변�
 |---|---|---|
 | `strata.codec` | varint (LEB128/zigzag), fixed-width LE, CRC32C (hw-accelerated), xxhash64. | Landed |
 | `strata.file` | Platform file I/O: sync policies (fdatasync/fsync/F_FULLFSYNC), O_DIRECT, preallocate, locks, mmap. | Landed (mmap planned) |
-| `strata.page` | Page header/format, page manager, freelist, file header. | Planned |
-| `strata.cache` | Buffer pool (CLOCK), pin/unpin guards, dirty tracking, stats. | Planned |
+| `strata.page` | Page header/format, page manager, freelist, file header. | Landed |
+| `strata.cache` | Buffer pool (CLOCK), pin/unpin guards, dirty tracking, stats. | Landed |
 | `strata.wal` | Segmented write-ahead log: frames, group-commit writer, reader, checkpoint, recovery. | Planned |
 | `strata.btree` | Page-based B+Tree: slotted nodes, split/merge, overflow pages, range cursors, bulk load. | Planned |
 | `strata.lsm` | LSM tree: skiplist memtable, SSTable (blocks, index, bloom), compaction, manifest. | Planned |
@@ -34,11 +34,12 @@ stubs (a doc comment and an `Error` set). 안정 릴리즈 전까지 API는 변�
 ## Install
 
 ```bash
-zig fetch --save https://github.com/yusa-imit/strata/archive/refs/tags/v0.3.0.tar.gz
+zig fetch --save https://github.com/yusa-imit/strata/archive/refs/tags/v0.4.0.tar.gz
 ```
 
-v0.3.0 is the first release with storage-kernel functionality: checksums and integer codecs,
-file I/O with a caller-chosen fsync policy, and a crash-injection harness (see `CHANGELOG.md`).
+v0.4.0 adds the checksummed page layer (ADR-0002 page format v1, freelist, `PageManager`) and
+the CLOCK buffer pool with dirty write-back on top of the v0.3.0 codecs, file I/O with a
+caller-chosen fsync policy, and crash-injection harness (see `CHANGELOG.md`).
 Modules marked `Planned` above ship nothing yet.
 
 ```zig
