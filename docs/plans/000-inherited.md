@@ -21,9 +21,9 @@
 
 ## Phase 2 — Page & Cache
 
-- [ ] 2A `page/{header,manager,freelist}.zig`
-- [ ] 2B `cache/buffer_pool.zig` (CLOCK), `cache/guard.zig`
-- [ ] 2C page-size matrix tests
+- [x] 2A `page/{header,manager,freelist}.zig`
+- [x] 2B `cache/buffer_pool.zig` (CLOCK), `cache/guard.zig`
+- [x] 2C page-size matrix tests
 
 ## Phase 3 — WAL & Recovery
 
