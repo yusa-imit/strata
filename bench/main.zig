@@ -1,20 +1,27 @@
 //! strata benchmark harness. Run: `zig build bench -- [filter]` (the step builds ReleaseFast).
 //!
 //! Baseline: the codec layer — CRC32C (software, and hardware when the target CPU has the
-//! instruction), xxhash64, and varint encode/decode. Each benchmark prints one line,
-//! `name  GB/s  ops/s  ns/op`, so results can be pasted into docs/plans/000-inherited.md.
-//! An "op" is one kernel call: one buffer pass for the hashes, one value for varint.
+//! instruction), xxhash64, and varint encode/decode — and the CLOCK buffer pool (`pool.zig`).
+//! Each benchmark prints one line, `name  GB/s  ops/s  ns/op`, so results can be pasted into
+//! docs/plans/000-inherited.md. An "op" is one kernel call: one buffer pass for the hashes, one
+//! value for varint, one fetch + release of a 4 KiB page for the pool.
 //!
 //! Sketch: the hashes stream a 1 MiB buffer (fits L2, so this measures the kernel, not DRAM)
-//! 256 times; varint walks 64 Ki values 256 times. Wall time per benchmark is well under a
-//! second on a 2020s laptop. Inputs come from a seeded PRNG, so a run is reproducible from the
-//! seed; only the clock is non-deterministic, and it is read once around each kernel.
+//! 256 times; varint walks 64 Ki values 256 times. `pool_hit` re-fetches 256 resident pages;
+//! `pool_miss_evict` walks 1024 pages through a 256-frame pool so each fetch reads the page
+//! from a scratch file (in the OS page cache) and evicts a clean frame (see `pool.zig`). Wall
+//! time per benchmark is about a second or less on a 2020s laptop. Inputs come from a seeded
+//! PRNG, so a run is reproducible from the seed; only the clock is non-deterministic, and it
+//! is read once around each kernel.
 //! Allocation: the fixture is allocated once in `main` and freed there; kernels do not allocate.
+//! The pool benchmarks need a file: `main` creates `strata-bench-<random>.db` in the cwd and
+//! removes it on exit.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const strata = @import("strata");
 const codec = strata.codec;
+const pool_bench = @import("pool.zig");
 
 /// Everything a run needs, spelled out so no knob hides in a default (Tiger Style 1.15).
 const Options = struct {
@@ -25,6 +32,7 @@ const Options = struct {
     value_count: u32,
     /// Times each kernel repeats over its input.
     pass_count: u32,
+    pool: pool_bench.Options,
 };
 
 const options_baseline: Options = .{
@@ -32,16 +40,24 @@ const options_baseline: Options = .{
     .buffer_size = 1 << 20,
     .value_count = 1 << 16,
     .pass_count = 256,
+    .pool = .{
+        .page_size = 4096,
+        .frames_max = 256,
+        .miss_page_count = 1024,
+        .hit_pass_count = 262144,
+        .miss_pass_count = 1024,
+    },
 };
 
-const RunError = codec.varint.EncodeError || codec.varint.DecodeError || error{
+const RunError = codec.varint.EncodeError || codec.varint.DecodeError ||
+    strata.cache.FetchError || error{
     /// The decoded stream did not end where the encoder said it did.
     StreamLengthMismatch,
 };
 
 /// What one kernel did; `sink` consumes the computed values so the optimizer cannot drop them
 /// (for varint encode it is the byte count, the only value that kernel computes).
-const Result = struct {
+pub const Result = struct {
     operation_count: u64,
     byte_count: u64,
     sink: u64,
@@ -52,8 +68,10 @@ const Bench = struct {
     run: *const fn (*Fixture) RunError!Result,
 };
 
-/// Seeded inputs shared by all kernels. Owns its three slices; `fixture_deinit` frees them.
+/// Seeded inputs shared by all kernels. Owns its three slices and the pool fixture (which owns
+/// a scratch file); `fixture_deinit` frees them. Built in place: it must not move.
 const Fixture = struct {
+    pool: pool_bench.Fixture,
     pass_count: u32,
     bytes: []u8,
     values: []u64,
@@ -69,6 +87,8 @@ const benches_always = [_]Bench{
     .{ .name = "xxhash64", .run = xxhash64_run },
     .{ .name = "varint_encode", .run = varint_encode_run },
     .{ .name = "varint_decode", .run = varint_decode_run },
+    .{ .name = "pool_hit", .run = pool_hit_run },
+    .{ .name = "pool_miss_evict", .run = pool_miss_evict_run },
 };
 
 const benches_hardware = [_]Bench{
@@ -87,8 +107,10 @@ pub fn main(init: std.process.Init) !void {
     const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
     const filter: ?[]const u8 = if (raw_args.len > 1) raw_args[1] else null;
 
+    var name_buffer: [pool_bench.name_len_max]u8 = undefined;
+    const pool_name = try pool_file_name(io, &name_buffer);
     var fixture: Fixture = undefined;
-    try fixture_init(&fixture, gpa, options_baseline);
+    try fixture_init(&fixture, gpa, io, std.Io.Dir.cwd(), pool_name, options_baseline);
     defer fixture_deinit(&fixture, gpa);
 
     var buffer: [1024]u8 = undefined;
@@ -152,7 +174,27 @@ fn report_write(out: *std.Io.Writer, name: []const u8, result: Result, elapsed_n
     });
 }
 
-fn fixture_init(fixture: *Fixture, gpa: std.mem.Allocator, options: Options) !void {
+/// A random scratch file name, unique per run: `strata-bench-<16 hex digits>.db`.
+fn pool_file_name(io: std.Io, buffer: []u8) ![]u8 {
+    assert(buffer.len >= pool_bench.name_len_max);
+    assert(pool_bench.name_len_max >= "strata-bench-".len + 16 + ".db".len);
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    const name = try std.fmt.bufPrint(buffer, "strata-bench-{x:0>16}.db", .{
+        std.mem.readInt(u64, &random, .little),
+    });
+    assert(name.len == "strata-bench-".len + 16 + ".db".len);
+    return name;
+}
+
+fn fixture_init(
+    fixture: *Fixture,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    pool_sub_path: []const u8,
+    options: Options,
+) !void {
     assert(options.buffer_size >= 1);
     assert(options.value_count >= 4); // Room for the pinned boundary values.
     assert(options.value_count <= std.math.maxInt(u32) / codec.varint.encoded_size_max);
@@ -190,6 +232,7 @@ fn fixture_init(fixture: *Fixture, gpa: std.mem.Allocator, options: Options) !vo
     assert(encoded_len >= options.value_count);
 
     fixture.* = .{
+        .pool = undefined, // Built in place below: the pools point at the manager inside it.
         .pass_count = options.pass_count,
         .bytes = bytes,
         .values = values,
@@ -197,11 +240,13 @@ fn fixture_init(fixture: *Fixture, gpa: std.mem.Allocator, options: Options) !vo
         .encoded_len = encoded_len,
         .scratch = scratch,
     };
+    try pool_bench.fixture_init(&fixture.pool, gpa, io, dir, pool_sub_path, options.pool);
 }
 
 fn fixture_deinit(fixture: *Fixture, gpa: std.mem.Allocator) void {
     assert(fixture.scratch.len == fixture.encoded.len);
     assert(fixture.encoded_len <= fixture.encoded.len);
+    pool_bench.fixture_deinit(&fixture.pool, gpa);
     gpa.free(fixture.scratch);
     gpa.free(fixture.encoded);
     gpa.free(fixture.values);
@@ -299,14 +344,46 @@ fn varint_decode_run(fixture: *Fixture) RunError!Result {
     };
 }
 
+/// One fetch + release per page of the resident working set; every fetch hits (`pool.zig`).
+fn pool_hit_run(fixture: *Fixture) RunError!Result {
+    assert(fixture.pass_count >= 1);
+    assert(fixture.pool.options.hit_pass_count >= 1);
+    return pool_bench.hit_run(&fixture.pool);
+}
+
+/// One fetch + release per page of a working set larger than the pool; every fetch misses and
+/// evicts a clean frame (`pool.zig`).
+fn pool_miss_evict_run(fixture: *Fixture) RunError!Result {
+    assert(fixture.pass_count >= 1);
+    assert(fixture.pool.options.miss_pass_count >= 1);
+    return pool_bench.miss_run(&fixture.pool);
+}
+
 // -- tests ---------------------------------------------------------------------------------
+
+test {
+    _ = pool_bench; // The pool kernels' tests live in pool.zig; reference it so they run.
+}
 
 const options_test: Options = .{
     .seed = 7,
     .buffer_size = 4099,
     .value_count = 257,
     .pass_count = 3,
+    .pool = pool_bench.options_test,
 };
+
+fn test_fixture_init(
+    fixture: *Fixture,
+    tmp: *std.testing.TmpDir,
+    pool_sub_path: []const u8,
+    options: Options,
+) !void {
+    assert(pool_sub_path.len >= 1);
+    assert(options.pass_count >= 1);
+    const gpa = std.testing.allocator;
+    try fixture_init(fixture, gpa, std.testing.io, tmp.dir, pool_sub_path, options);
+}
 
 fn test_leb128_len(value: u64) u64 {
     var rest = value >> 7;
@@ -323,16 +400,21 @@ fn test_leb128_len(value: u64) u64 {
 
 test "fixture is reproducible from its seed and differs across seeds" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var first: Fixture = undefined;
-    try fixture_init(&first, gpa, options_test);
+    try test_fixture_init(&first, &tmp, "first.db", options_test);
     defer fixture_deinit(&first, gpa);
+
     var second: Fixture = undefined;
-    try fixture_init(&second, gpa, options_test);
+    try test_fixture_init(&second, &tmp, "second.db", options_test);
     defer fixture_deinit(&second, gpa);
+
     var other: Fixture = undefined;
     var options_other = options_test;
     options_other.seed = 8;
-    try fixture_init(&other, gpa, options_other);
+    try test_fixture_init(&other, &tmp, "other.db", options_other);
     defer fixture_deinit(&other, gpa);
 
     try std.testing.expectEqualSlices(u8, first.bytes, second.bytes);
@@ -344,8 +426,11 @@ test "fixture is reproducible from its seed and differs across seeds" {
 
 test "fixture encoded stream decodes back to the values at every size" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var fixture: Fixture = undefined;
-    try fixture_init(&fixture, gpa, options_test);
+    try test_fixture_init(&fixture, &tmp, "pool.db", options_test);
     defer fixture_deinit(&fixture, gpa);
 
     var offset: u32 = 0;
@@ -369,8 +454,11 @@ test "fixture encoded stream decodes back to the values at every size" {
 
 test "hash kernels report the work and checksum what an independent hash computes" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var fixture: Fixture = undefined;
-    try fixture_init(&fixture, gpa, options_test);
+    try test_fixture_init(&fixture, &tmp, "pool.db", options_test);
     defer fixture_deinit(&fixture, gpa);
 
     var crc_expected: u64 = 0;
@@ -398,8 +486,11 @@ test "hash kernels report the work and checksum what an independent hash compute
 
 test "varint kernels count the bytes and values they move" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var fixture: Fixture = undefined;
-    try fixture_init(&fixture, gpa, options_test);
+    try test_fixture_init(&fixture, &tmp, "pool.db", options_test);
     defer fixture_deinit(&fixture, gpa);
 
     const passes: u64 = options_test.pass_count;
@@ -433,8 +524,11 @@ test "varint kernels count the bytes and values they move" {
 
 test "varint kernels return the typed error the codec found" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var fixture: Fixture = undefined;
-    try fixture_init(&fixture, gpa, options_test);
+    try test_fixture_init(&fixture, &tmp, "pool.db", options_test);
     defer fixture_deinit(&fixture, gpa);
 
     const scratch_full = fixture.scratch;
@@ -459,8 +553,11 @@ test "varint kernels return the typed error the codec found" {
 
 test "every registered benchmark runs on a small fixture and names are unique" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     var fixture: Fixture = undefined;
-    try fixture_init(&fixture, gpa, options_test);
+    try test_fixture_init(&fixture, &tmp, "pool.db", options_test);
     defer fixture_deinit(&fixture, gpa);
 
     for (benches, 0..) |bench, index| {
@@ -472,6 +569,18 @@ test "every registered benchmark runs on a small fixture and names are unique" {
         }
     }
     try std.testing.expect(benches.len >= benches_always.len);
+}
+
+test "pool file names are well formed, fit the fixture and differ between calls" {
+    var first_buffer: [pool_bench.name_len_max]u8 = undefined;
+    var second_buffer: [pool_bench.name_len_max]u8 = undefined;
+    const first = try pool_file_name(std.testing.io, &first_buffer);
+    const second = try pool_file_name(std.testing.io, &second_buffer);
+
+    try std.testing.expect(std.mem.startsWith(u8, first, "strata-bench-"));
+    try std.testing.expect(std.mem.endsWith(u8, first, ".db"));
+    try std.testing.expect(first.len <= pool_bench.name_len_max);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
 test "filter selects by substring and empty or absent filters select all" {
