@@ -70,10 +70,10 @@ No item is blocked — `.dependencies = .{}`, strata waits on no producer tag.
       (REALM.md). Feed the real page decoder to the comptime decoder slot of
       `src/testing/truncation_matrix_test.zig` (replacing its stand-in, per cycle 29). Verify:
       matrix green at 8 sizes; every torn or truncated page image → typed error.
-- [ ] **Pool bench** (`bench/main.zig`). PRD §5's 5M ops/s pool-hit point get needs a floor
+- [x] **Pool bench** (`bench/main.zig`). PRD §5's 5M ops/s pool-hit point get needs a floor
       before the B+Tree sits on it. Measure fetch+release ops/s on hit and on miss-with-eviction
       at 4 KiB. Verify: `zig build bench` prints both; figures added to `000-inherited.md`'s table.
-- [ ] **Docs, module status, release v0.4.0** (`docs/`, `README.md`, `build.zig.zon`). After
+- [x] **Docs, module status, release v0.4.0** (`docs/`, `README.md`, `build.zig.zon`). After
       every box above. Drop `NotImplemented` from `src/page.zig`/`src/cache.zig`, re-export real
       declarations; README page/cache rows `Planned` → `Landed`; tick 2A–2C in
       `docs/plans/000-inherited.md`; `CHANGELOG.md` + `.version = "0.4.0"` in one PR, then tag.
