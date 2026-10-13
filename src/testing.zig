@@ -8,7 +8,7 @@
 //!   - `testing/fault_io.zig` (landed: fault-injecting `std.Io` wrapper for positional reads
 //!     and writes: short, zero, canceled)
 //!   - `testing/truncation_matrix_test.zig` (landed, test-only: every truncation and torn cut
-//!     of a checksummed record must decode to a typed error, never to a damaged payload)
+//!     of a real `wal.frame` must decode to a typed error, never to a damaged payload)
 //!   - `testing/page_matrix_test.zig` (landed, test-only: the same sweep over the real page
 //!     codec, `PageManager.read` and `PageManager.open` at all eight page sizes)
 //!   - `testing/model.zig` (planned)

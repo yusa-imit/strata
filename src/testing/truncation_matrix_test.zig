@@ -1,97 +1,81 @@
-//! Truncation matrix over a checksummed record (plan 002, "Truncation matrix").
+//! Truncation matrix over a checksummed WAL frame (plan 002 "Truncation matrix", plan 004 item 2).
 //!
-//! Proves the crash harness catches corruption: a `codec`-checksummed record is written through
+//! Proves the crash harness catches corruption: a real `wal.frame` (ADR-0003) is written through
 //! a `CrashSink`, and at every truncation point `0..=len`, once as a clean `.truncate` cut and
 //! once as a `.torn` cut, the surviving image must either decode to exactly the original
-//! payload (only when the whole record persisted) or fail with a typed `TornWrite` or
-//! `ChecksumMismatch`. Silent acceptance of a damaged prefix is `error.AcceptedCorruptPrefix`;
-//! a panic is a test failure by construction.
+//! payload (only when the whole frame persisted) or fail with a typed `TornWrite`,
+//! `ChecksumMismatch` or `Corrupted` (a torn length field can read as over-long). Silent
+//! acceptance of a damaged prefix is `error.AcceptedCorruptPrefix`; a panic is a test failure by
+//! construction.
 //!
-//! The record frame is test-only: `[u32 LE payload_len][payload][u32 LE crc32c of the first two
-//! fields]`. The matrix takes its decoder at comptime so the same sweep also proves it can fail:
-//! a decoder that skips the checksum must make the sweep return `AcceptedCorruptPrefix`.
+//! The matrix takes its decoder at comptime so the same sweep also proves it can fail: a decoder
+//! that skips the checksum (`decode_unchecked`, the "no-CRC mutant") must make the sweep return
+//! `AcceptedCorruptPrefix`.
 //!
-//! Allocation: each sweep allocates a record and a payload buffer, plus two record-sized sink
-//! buffers inside `run_matrix`, and frees all of them before returning. Limits: records up to
+//! Allocation: each sweep allocates a frame and a payload buffer, plus two frame-sized sink
+//! buffers inside `run_matrix`, and frees all of them before returning. Limits: frames up to
 //! `record_size_max` bytes, so a sweep is at most 65 537 points.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 const codec = @import("../codec.zig");
+const frame = @import("../wal/frame.zig");
 const crash = @import("crash.zig");
 
 const CrashSink = crash.CrashSink;
 const Cut = crash.Cut;
 const TruncationPoints = crash.TruncationPoints;
 
-const RecordError = error{ TornWrite, ChecksumMismatch };
+const RecordError = frame.DecodeError;
 const Decode = fn (image: []const u8) RecordError![]const u8;
 
-/// Bytes of framing around a payload: the length prefix and the checksum trailer.
-const overhead: u32 = 8;
+/// Bytes of framing around a payload: the 17-byte frame header.
+const overhead: u32 = frame.frame_header_size;
 const record_size_max: u32 = 65536;
+/// Every swept frame sits at this LSN; the decoder is told to expect it.
+const frame_lsn: frame.Lsn = 1;
 
 /// Outcome counts of one sweep; every cut lands in exactly one bucket.
 const Tally = struct {
     torn_write: u32 = 0,
     checksum_mismatch: u32 = 0,
+    corrupted: u32 = 0,
     accepted: u32 = 0,
 };
 
 /// Sink storage and image scratch, both exactly one record long.
 const Buffers = struct { storage: []u8, scratch: []u8 };
 
-/// Writes `[len][payload][crc]` into `out` and returns the record; `out` must be exactly
+/// Writes a `record` frame at `frame_lsn` into `out` and returns it; `out` must be exactly
 /// `payload.len + overhead` bytes.
 fn encode_record(out: []u8, payload: []const u8) []u8 {
     assert(payload.len <= record_size_max - overhead);
     assert(out.len == payload.len + overhead);
-    const payload_len: u32 = @intCast(payload.len);
-    codec.fixed.write(u32, out, payload_len) catch |err| switch (err) {
-        error.BufferTooSmall => unreachable, // `out` holds at least `overhead` bytes.
-    };
-    @memcpy(out[4..][0..payload.len], payload);
-    const crc = codec.crc32c.checksum(out[0 .. 4 + payload.len]);
-    codec.fixed.write(u32, out[4 + payload.len ..], crc) catch |err| switch (err) {
-        error.BufferTooSmall => unreachable, // The trailer is the last four bytes of `out`.
-    };
+    const used = frame.encode(out, frame_lsn, .record, payload);
+    assert(used == out.len);
     return out;
 }
 
-/// Frame checks shared by both decoders: whole-frame length consistency, no checksum.
-fn frame_payload(image: []const u8) RecordError![]const u8 {
+fn decode_checked(image: []const u8) RecordError![]const u8 {
+    assert(image.len <= record_size_max);
+    const decoded = try frame.decode(image, frame_lsn);
+    assert(decoded.frame_type == .record);
+    return decoded.payload;
+}
+
+/// Deliberately broken: trusts the length field and skips the checksum and every later check.
+fn decode_unchecked(image: []const u8) RecordError![]const u8 {
     assert(image.len <= record_size_max);
     if (image.len < overhead) return error.TornWrite;
     const payload_len = codec.fixed.read(u32, image) catch |err| switch (err) {
         error.BufferTooSmall => return error.TornWrite,
     };
+    if (payload_len > frame.payload_bytes_max) return error.Corrupted;
     const frame_len: u64 = @as(u64, payload_len) + overhead;
     if (frame_len > image.len) return error.TornWrite;
-    // More bytes present than the length prefix claims: the prefix itself is damaged.
-    if (frame_len < image.len) return error.ChecksumMismatch;
-    assert(frame_len == image.len);
-    return image[4..][0..payload_len];
-}
-
-fn decode_checked(image: []const u8) RecordError![]const u8 {
-    const payload = try frame_payload(image);
-    assert(image.len == payload.len + overhead);
-    const stored = codec.fixed.read(u32, image[4 + payload.len ..]) catch |err| switch (err) {
-        error.BufferTooSmall => return error.TornWrite,
-    };
-    if (stored != codec.crc32c.checksum(image[0 .. 4 + payload.len])) {
-        return error.ChecksumMismatch;
-    }
-    assert(payload.len <= record_size_max - overhead);
-    return payload;
-}
-
-/// Deliberately broken: trusts the length prefix and skips the checksum.
-fn decode_unchecked(image: []const u8) RecordError![]const u8 {
-    const payload = try frame_payload(image);
-    assert(image.len == payload.len + overhead);
-    return payload;
+    assert(frame_len <= image.len);
+    return image[overhead..][0..payload_len];
 }
 
 /// Position-dependent, never-zero payload bytes.
@@ -134,13 +118,14 @@ fn check_cut(
     if (decode(image)) |payload| {
         if (point < record.len) return error.AcceptedCorruptPrefix;
         try testing.expectEqualSlices(u8, record, image);
-        try testing.expectEqualSlices(u8, record[4 .. record.len - 4], payload);
+        try testing.expectEqualSlices(u8, record[overhead..], payload);
         tally.accepted += 1;
     } else |err| {
         if (point >= record.len) return error.RejectedIntactRecord;
         switch (err) {
             error.TornWrite => tally.torn_write += 1,
             error.ChecksumMismatch => tally.checksum_mismatch += 1,
+            error.Corrupted => tally.corrupted += 1,
         }
     }
 }
@@ -186,7 +171,7 @@ fn sweep_checked(size: u32, seed: u64) !Tally {
 }
 
 test "record: valid data round-trips and each flipped byte is rejected" {
-    var record: [40]u8 = undefined;
+    var record: [overhead + 32]u8 = undefined;
     var payload: [32]u8 = undefined;
     fill_payload(&payload, 7);
     _ = encode_record(&record, &payload);
@@ -195,7 +180,7 @@ test "record: valid data round-trips and each flipped byte is rejected" {
     for (0..record.len) |index| {
         record[index] ^= 0x01;
         defer record[index] ^= 0x01;
-        // A flipped length byte may read as a torn or over-long frame; never accepted.
+        // A flipped length byte may read as torn, over-long or a checksum failure; never ok.
         if (index < 4) {
             try testing.expect(std.meta.isError(decode_checked(&record)));
         } else {
@@ -204,34 +189,39 @@ test "record: valid data round-trips and each flipped byte is rejected" {
     }
 }
 
-test "record: a maximal length prefix is torn, not an overflow" {
-    var image: [16]u8 = undefined;
+test "record: a maximal length prefix is corrupt or torn, not an overflow" {
+    var image: [overhead]u8 = undefined;
     @memset(&image, 0xFF);
-    try testing.expectError(error.TornWrite, decode_checked(&image));
-    try testing.expectError(error.TornWrite, decode_unchecked(&image));
+    // A full header whose len is 0xFFFFFFFF is over `payload_bytes_max`, not a torn tail.
+    try testing.expectError(error.Corrupted, decode_checked(&image));
+    try testing.expectError(error.Corrupted, decode_unchecked(&image));
+    try testing.expectError(error.TornWrite, decode_checked(image[0 .. overhead - 1]));
+    try testing.expectError(error.TornWrite, decode_unchecked(image[0 .. overhead - 1]));
 }
 
-test "record: empty, short and over-long images are typed errors" {
-    var record: [8]u8 = undefined;
+test "record: empty, short and trailing-byte images behave" {
+    var record: [overhead]u8 = undefined;
     _ = encode_record(&record, &.{});
     try testing.expectEqual(@as(usize, 0), (try decode_checked(&record)).len);
 
     try testing.expectError(error.TornWrite, decode_checked(&.{}));
-    try testing.expectError(error.TornWrite, decode_checked(record[0..7]));
-    var long: [9]u8 = undefined;
-    @memcpy(long[0..8], &record);
-    long[8] = 0;
-    try testing.expectError(error.ChecksumMismatch, decode_checked(&long));
+    try testing.expectError(error.TornWrite, decode_checked(record[0 .. overhead - 1]));
+    // A frame decoder consumes exactly one frame; bytes after it belong to the next one.
+    var long: [overhead + 1]u8 = undefined;
+    @memcpy(long[0..overhead], &record);
+    long[overhead] = 0;
+    try testing.expectEqual(@as(usize, 0), (try decode_checked(&long)).len);
 }
 
 test "matrix: every prefix of records around sector sizes is rejected" {
-    // 8 is the empty payload; 511/512/513 straddle one sector; 1025 spans three.
-    const sizes = [_]u32{ 8, 9, 511, 512, 513, 1025, 4095, 4096, 4097, 32768 };
+    // 17 is the empty payload; 511/512/513 straddle one sector; 1025 spans three.
+    const sizes = [_]u32{ 17, 18, 511, 512, 513, 1025, 4095, 4096, 4097, 32768 };
     for (sizes) |size| {
         const tally = try sweep_checked(size, 0x5eed_0001);
         try testing.expectEqual(@as(u32, 2), tally.accepted);
-        try testing.expectEqual(2 * size, tally.torn_write + tally.checksum_mismatch);
-        // Every clean truncation keeps the full length prefix, so it is always torn.
+        const rejected = tally.torn_write + tally.checksum_mismatch + tally.corrupted;
+        try testing.expectEqual(2 * size, rejected);
+        // Every clean truncation is a proper prefix of one frame, so it is always torn.
         try testing.expect(tally.torn_write >= size);
         // Truncating to nothing is torn. A torn cut inside the final sector leaves a full-length
         // image with garbage, a checksum failure; but when the record is one byte past a sector
@@ -245,14 +235,16 @@ test "matrix: other seeds change the garbage but never the verdict" {
     for ([_]u64{ 1, 2, 0xdead_beef, std.math.maxInt(u64) }) |seed| {
         const tally = try sweep_checked(600, seed);
         try testing.expectEqual(@as(u32, 2), tally.accepted);
-        try testing.expectEqual(@as(u32, 1200), tally.torn_write + tally.checksum_mismatch);
+        const rejected = tally.torn_write + tally.checksum_mismatch + tally.corrupted;
+        try testing.expectEqual(@as(u32, 1200), rejected);
     }
 }
 
 test "matrix: a 64 KiB record is rejected at every prefix" {
     const tally = try sweep_checked(record_size_max, 0x5eed_0002);
     try testing.expectEqual(@as(u32, 2), tally.accepted);
-    try testing.expectEqual(2 * record_size_max, tally.torn_write + tally.checksum_mismatch);
+    const rejected = tally.torn_write + tally.checksum_mismatch + tally.corrupted;
+    try testing.expectEqual(2 * record_size_max, rejected);
     try testing.expect(tally.checksum_mismatch >= 1);
 }
 
@@ -263,7 +255,7 @@ fn decode_always_torn(image: []const u8) RecordError![]const u8 {
 }
 
 test "matrix: a decoder that rejects the intact record fails the sweep" {
-    var record: [16]u8 = undefined;
+    var record: [overhead + 8]u8 = undefined;
     _ = encode_record(&record, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
     try testing.expectError(
         error.RejectedIntactRecord,
@@ -273,10 +265,11 @@ test "matrix: a decoder that rejects the intact record fails the sweep" {
 
 test "matrix: a decoder that skips the checksum fails the sweep" {
     var record: [512]u8 = undefined;
-    var payload: [504]u8 = undefined;
+    var payload: [512 - overhead]u8 = undefined;
     fill_payload(&payload, 3);
     _ = encode_record(&record, &payload);
-    // A torn cut inside the last sector leaves a full-length image with garbage bytes.
+    // A torn cut inside the last sector leaves a full-length image with garbage bytes, which the
+    // mutant (steps 1 to 3 only) accepts while the real decoder's checksum rejects it.
     try testing.expectError(
         error.AcceptedCorruptPrefix,
         run_matrix(testing.allocator, decode_unchecked, &record, 0x5eed_0003),

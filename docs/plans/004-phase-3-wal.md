@@ -29,7 +29,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       `Reader.next()` null only for EOF (cycle 8); idempotent redo (`frame.lsn > page.lsn`);
       `SyncPolicy` caller-chosen; `io` per call; no allocation after `init`. Verify: ADR merged;
       PRD §4.5 links it.
-- [ ] **`wal/frame.zig` — frame codec** (`src/wal/`). Pure, no `io`. Typed decode errors:
+- [x] **`wal/frame.zig` — frame codec** (`src/wal/`). Pure, no `io`. Typed decode errors:
       `TornWrite` (short image), `ChecksumMismatch`, `Corrupted` (bad type, `len` over
       `frame_bytes_max`). Replaces the stand-in decoder of `truncation_matrix_test.zig`, as its
       doc asks. Verify: golden hex frame; every bit flip of a 64 B frame fails; decode under
