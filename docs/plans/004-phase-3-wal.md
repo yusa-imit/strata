@@ -20,7 +20,7 @@ disk; and torn data pages have no repair path (ADR-0002 §6 left full-page image
 No item is blocked — `.dependencies = .{}`, strata waits on no producer tag. Order follows the
 data: format, then the read path (`Writer.init` reuses it to find the tail), then the write path.
 
-- [ ] **ADR-0003 — WAL format v1** (`docs/adr/0003-wal-format.md`). Format before bytes
+- [x] **ADR-0003 — WAL format v1** (`docs/adr/0003-wal-format.md`). Format before bytes
       (REALM.md). Fixes: `wal-NNNNNN.log` naming; segment header (magic, `format_version`, index,
       first LSN, CRC32C); frame `len | crc | lsn | type | payload` widths, CRC32C over every byte
       seeded with the LSN so a stale frame fails; LSN scheme (monotonic `u64`, 0 = none); frame

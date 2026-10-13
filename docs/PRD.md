@@ -160,7 +160,7 @@ pub const PageGuard = struct {
 ```
 
 ### 4.5 `wal`
-- 세그먼트 파일 (`wal-000001.log`), 프레임: `len | crc | lsn | type | payload`
+- 세그먼트 파일 (`wal-00000001.log`, 8자리 16진 인덱스), 프레임: `len | crc | lsn | type | payload` — 바이트 단위 포맷은 [ADR-0003](adr/0003-wal-format.md)
 - `Writer`: 그룹 커밋 (배치 윈도우 N µs 또는 M 바이트), fsync 정책 위임
 - `Reader`: 순차 재생, 손상 프레임에서 안전 중단 (torn write 감지)
 - `Checkpoint`: 더티 페이지 flush → 세그먼트 회수
