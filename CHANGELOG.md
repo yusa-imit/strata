@@ -12,6 +12,10 @@ All notable changes to this project are documented in this file. The format foll
 - `docs`: ADR-0003, WAL format v1 (24-byte segment header, 17-byte frames with a CRC32C seeded
   by LSN, byte-position LSNs, torn-tail rule, golden bytes); PRD §4.5 links it and uses
   eight-hex-digit segment names (plan 004, item 1).
+- `wal`: `wal.frame`, the WAL frame codec (17-byte header, CRC32C seeded with the expected
+  LSN, `record`/`page_image`/`checkpoint` types, typed `TornWrite`/`ChecksumMismatch`/
+  `Corrupted`; golden bytes pinned from ADR-0003 section 11). The truncation matrix now sweeps
+  real WAL frames instead of a test-only stand-in (plan 004, item 2).
 
 ## [0.4.0] - 2026-10-13
 

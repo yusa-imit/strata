@@ -336,7 +336,8 @@ off  bytes                     field
 
 Negative pins:
 - The same header under index 2 checksums to `0xBF3E9465` → `ChecksumMismatch`.
-- Frame 1 decoded at `lsn_expected = 2` checksums to `0x86C71EBB` → `ChecksumMismatch`.
+- Frame 1's bytes decoded at `lsn_expected = 2` checksum to `0x2E5419B8` → `ChecksumMismatch`.
+  (The same record *written* at LSN 2, stored `lsn` 2, has crc `0x86C71EBB`.)
 
 ### 12. Versioning
 
