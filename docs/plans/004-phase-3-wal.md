@@ -34,7 +34,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       `frame_bytes_max`). Replaces the stand-in decoder of `truncation_matrix_test.zig`, as its
       doc asks. Verify: golden hex frame; every bit flip of a 64 B frame fails; decode under
       another LSN fails; matrix green with the real decoder, its no-CRC mutant still caught.
-- [ ] **`wal/segment.zig` — segment files** (`src/wal/`). One segment over `file.File` (no new
+- [x] **`wal/segment.zig` — segment files** (`src/wal/`). One segment over `file.File` (no new
       `File` methods: 788/800 lines): header codec, positional append, exclusive `tryLock`,
       index bounded by `Options.segments_max`; no `builtin.os.tag` (REALM.md). Verify: `tmpDir`
       create→close→open; foreign file → `Corrupted`; header bit flip → `ChecksumMismatch`;

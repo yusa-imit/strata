@@ -16,6 +16,11 @@ All notable changes to this project are documented in this file. The format foll
   LSN, `record`/`page_image`/`checkpoint` types, typed `TornWrite`/`ChecksumMismatch`/
   `Corrupted`; golden bytes pinned from ADR-0003 section 11). The truncation matrix now sweeps
   real WAL frames instead of a test-only stand-in (plan 004, item 2).
+- `wal`: `wal.segment`, WAL segment files (`wal-` + 8 hex digits + `.log` names, 24-byte
+  header with an index-seeded CRC32C, exclusive `create`, locked `open` with typed
+  `Unwritten`/`TornWrite`/`ChecksumMismatch`/`Corrupted`, positional `append`, and the typed
+  `SegmentLimit`/`SegmentIndexExhausted` limits; golden header pinned from ADR-0003 section 11;
+  the directory sync stays an open item, ADR-0003 question 4) (plan 004, item 3).
 
 ## [0.4.0] - 2026-10-13
 
