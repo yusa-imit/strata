@@ -21,6 +21,11 @@ All notable changes to this project are documented in this file. The format foll
   `Unwritten`/`TornWrite`/`ChecksumMismatch`/`Corrupted`, positional `append`, and the typed
   `SegmentLimit`/`SegmentIndexExhausted` limits; golden header pinned from ADR-0003 section 11;
   the directory sync stays an open item, ADR-0003 question 4) (plan 004, item 3).
+- `wal`: `wal.reader`, sequential WAL read across segments (`Reader.open` lists and validates
+  the directory, bounded by `segments_max`, with index and first-LSN continuity; `next` crosses
+  segments and returns frames in order, `null` only at a clean end; ADR-0003 section 8 torn-tail
+  rule with its bounded look-ahead, `TornWrite` only in the newest segment; one `gpa`
+  allocation in `open`, none after) (plan 004, item 4).
 
 ## [0.4.0] - 2026-10-13
 

@@ -87,7 +87,7 @@ pub const Header = struct { index: u32, first_lsn: Lsn };
 
 pub const HeaderError = error{ Unwritten, TornWrite, ChecksumMismatch, Corrupted };
 pub const LimitError = error{ SegmentLimit, SegmentIndexExhausted };
-const ReadExactError = Io.File.ReadPositionalError || error{TornWrite};
+pub const ReadExactError = Io.File.ReadPositionalError || error{TornWrite};
 const ReadHeaderError = file.LengthError || ReadExactError || HeaderError;
 pub const CreateError = file.OpenError || file.TryLockError || file.WriteError ||
     file.SyncError;
@@ -247,7 +247,7 @@ fn read_exact(io: Io, handle: file.File, buf: []u8, offset: u64) ReadExactError!
 /// True when every byte of `[from, len)` is zero, read in chunks (ADR-0003 section 8, step 1:
 /// "the whole file is zero"). Bounded by `scan_chunk_count_max` since `len` is at most
 /// `segment_bytes_limit`.
-fn zero_from(io: Io, handle: file.File, from: u64, len: u64) ReadExactError!bool {
+pub fn zero_from(io: Io, handle: file.File, from: u64, len: u64) ReadExactError!bool {
     assert(from <= len);
     assert(len <= segment_bytes_limit);
     var chunk: [scan_chunk_size]u8 = @splat(0);
