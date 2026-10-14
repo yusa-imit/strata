@@ -375,8 +375,8 @@ pub const format_version: u16 = 1;
 pub const magic: [4]u8 = "STWL".*;
 pub const Header = struct { index: u32, first_lsn: Lsn };
 pub const HeaderError = error{ Unwritten, TornWrite, ChecksumMismatch, Corrupted };
-pub fn name(index: u32) [16]u8;
-pub fn parse_name(file_name: []const u8) ?u32; // null: not ours; 0 is Corrupted at open
+pub fn format_name(index: u32, out: *[16]u8) void;
+pub fn parse_name(file_name: []const u8) error{Corrupted}!?u32; // null: not ours; index 0: Corrupted
 pub fn encode_header(out: *[segment_header_size]u8, header: Header) void;
 pub fn decode_header(bytes: []const u8, index: u32) HeaderError!Header;
 ```
@@ -428,7 +428,7 @@ table above without a `format_version` bump is rejected on review.
   - Replace the stand-in decoder in `truncation_matrix_test.zig`, with a `corrupted` tally
     bucket: torn cuts may now land in any of the three errors.
 - **3 `segment.zig`:**
-  - `name`/`parse_name` (rejects uppercase and 7- or 9-digit names).
+  - `format_name`/`parse_name` (rejects uppercase and 7- or 9-digit names).
   - The golden header from §11.
   - Index 2 → `ChecksumMismatch`; all-zero → `Unwritten`; a short non-zero file → `TornWrite`.
   - Create order from §2.
