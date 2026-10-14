@@ -39,7 +39,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       index bounded by `Options.segments_max`; no `builtin.os.tag` (REALM.md). Verify: `tmpDir`
       create→close→open; foreign file → `Corrupted`; header bit flip → `ChecksumMismatch`;
       second open → `WouldBlock`; index over the limit → typed error, not an assert.
-- [ ] **`wal/reader.zig` — sequential read** (`src/wal/`). `open` lists segments (bounded) and
+- [x] **`wal/reader.zig` — sequential read** (`src/wal/`). `open` lists segments (bounded) and
       checks index and first-LSN continuity; `next` crosses segments; frame buffer sized by
       `frame_bytes_max` at `open`. Verify: hand-built segments read back in order; index or LSN
       gap → `Corrupted`; every `CrashSink` cut of a 3-frame segment yields a frame prefix, then

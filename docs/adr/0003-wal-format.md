@@ -351,7 +351,7 @@ Negative pins:
 - Migration is usually trivial because a WAL is transient: checkpoint under the old version, then
   reclaim every segment. No tooling exists, because there is no earlier format.
 
-### 13. API shape (`src/wal/frame.zig`, `src/wal/segment.zig`; pure, no `io`)
+### 13. API shape (`src/wal/frame.zig`, `src/wal/segment.zig`, `src/wal/reader.zig`)
 
 ```zig
 pub const Lsn = u64; // 0 = none
@@ -379,7 +379,25 @@ pub fn format_name(index: u32, out: *[16]u8) void;
 pub fn parse_name(file_name: []const u8) error{Corrupted}!?u32; // null: not ours; index 0: Corrupted
 pub fn encode_header(out: *[segment_header_size]u8, header: Header) void;
 pub fn decode_header(bytes: []const u8, index: u32) HeaderError!Header;
+
+// reader.zig: takes `io` per call (ADR-0001); one allocation in `open`, none after.
+pub const Position = struct { segment_index: u32, offset: u64, lsn: Lsn }; // empty log: all 0
+pub const Reader = struct {
+    pub fn open(target: *Reader, io: Io, gpa: Allocator, dir: Io.Dir, options: segment.Options)
+        OpenError!void; // Corrupted, ChecksumMismatch, SegmentLimit, WouldBlock, I/O; never TornWrite
+    pub fn next(self: *Reader, io: Io) NextError!?frame.Frame; // null = clean EOF only
+    pub fn position(self: *const Reader) Position; // where the next frame goes / the tail is
+    pub fn deinit(self: *Reader, io: Io, gpa: Allocator) void;
+    pub fn check_invariants(self: *const Reader) void;
+};
 ```
+
+`Reader.open` has no `from_lsn` yet: it reads from the oldest live segment, with indices contiguous
+from there. The seek of section 8 (`from_lsn`, never `TornWrite` at the seek target) belongs to
+`Recovery.replay` (item 7), which needs `position()` to learn where the log ended. A non-newest
+segment whose header `first_lsn` does not grow, or lies beyond the previous file's bytes, is
+`Corrupted` at `open`; the exact `first_lsn == end LSN of the previous frames` rule is checked
+when `next` crosses the boundary, because a zero tail hides the end until then.
 
 ### Rejected alternatives
 
