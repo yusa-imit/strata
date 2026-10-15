@@ -25,7 +25,17 @@ All notable changes to this project are documented in this file. The format foll
   the directory, bounded by `segments_max`, with index and first-LSN continuity; `next` crosses
   segments and returns frames in order, `null` only at a clean end; ADR-0003 section 8 torn-tail
   rule with its bounded look-ahead, `TornWrite` only in the newest segment; one `gpa`
-  allocation in `open`, none after) (plan 004, item 4).
+  allocation in `open`, none after); the next segment is opened (and locked) before the
+  previous one is closed, and a failure closes the current segment (plan 004, item 4).
+- `wal`: `wal.writer`, the WAL appender (`Writer.init` finds the tail through `Reader`,
+  creates segment 1 in an empty directory, rewrites an `Unwritten` newest segment and refuses
+  a torn tail with `RecoveryRequired`; `append` frames one record at a time and rotates at
+  `segment_bytes_max`, `sync` moves the inclusive, prefix-closed `durable_lsn` only after the
+  file sync succeeded; a failed write or sync latches the writer (`Failed`) until reopened;
+  typed `PayloadTooLarge`, `InvalidFrame`, `LsnExhausted`, `SegmentLimit`,
+  `SegmentIndexExhausted`; one `gpa` allocation in `init`, none after). `file/platform.zig`
+  gains `sync_dir`, called after every segment create (ADR-0003 open question 4), and
+  `testing.fault_io` can fail syncs (`Plan.sync_fail_after`) (plan 004, item 5).
 
 ## [0.4.0] - 2026-10-13
 

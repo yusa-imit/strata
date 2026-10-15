@@ -80,7 +80,7 @@ fn put(comptime T: type, bytes: []u8, offset: u32, value: T) void {
 /// True when `payload` is legal for `type_byte` in a frame at `lsn` (ADR-0003 section 6):
 /// record and consumer types (128..255) take any payload; `page_image` is a page id then a
 /// valid page size; `checkpoint` is a `redo_lsn` in `[1, lsn]`; 0 and 4..127 never.
-fn payload_valid(type_byte: u8, lsn: Lsn, payload: []const u8) bool {
+pub fn payload_valid(type_byte: u8, lsn: Lsn, payload: []const u8) bool {
     assert(payload.len <= payload_bytes_max);
     assert(lsn < lsn_limit);
     const record: u8 = @intFromEnum(Type.record);

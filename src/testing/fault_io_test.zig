@@ -464,3 +464,49 @@ test "fault_io: a 64 KiB transfer with short caps round-trips at an unaligned of
     try testing.expectEqualSlices(u8, data, back);
     fio.check_invariants();
 }
+
+test "fault_io: sync_fail_after fails every sync from that call on and counts each one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fio: FaultIo = undefined;
+    var plan = none_plan;
+    plan.sync_fail_after = 1;
+    FaultIo.init(&fio, testing.io, plan);
+    try testing.expectEqual(@as(u32, 0), fio.sync_calls);
+    const io = fio.io();
+    const f = try File.open(io, tmp.dir, "sync.bin", .{ .create = true, .sync_policy = .fsync });
+    defer f.close(io);
+
+    try f.sync(io); // call 0 passes through
+    try testing.expectEqual(@as(u32, 1), fio.sync_calls);
+    try testing.expectError(error.InputOutput, f.sync(io)); // call 1 and on fail
+    try testing.expectError(error.InputOutput, f.sync(io));
+    try testing.expectEqual(@as(u32, 3), fio.sync_calls);
+    try testing.expectEqual(@as(u32, 0), fio.write_calls); // writes and reads are untouched
+    fio.check_invariants();
+}
+
+test "fault_io: the default plan never fails a sync, and a policy of none never syncs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fio: FaultIo = undefined;
+    FaultIo.init(&fio, testing.io, none_plan);
+    const io = fio.io();
+    const f = try File.open(io, tmp.dir, "ok.bin", .{ .create = true, .sync_policy = .fsync });
+    defer f.close(io);
+
+    for (0..3) |_| try f.sync(io);
+    try testing.expectEqual(@as(u32, 3), fio.sync_calls);
+    var quiet: FaultIo = undefined;
+    var plan = none_plan;
+    plan.sync_fail_after = 0;
+    FaultIo.init(&quiet, testing.io, plan);
+    const g = try File.open(quiet.io(), tmp.dir, "none.bin", .{
+        .create = true,
+        .sync_policy = .none,
+    });
+    defer g.close(quiet.io());
+
+    try g.sync(quiet.io()); // `.none` returns before it touches the `Io`
+    try testing.expectEqual(@as(u32, 0), quiet.sync_calls);
+}

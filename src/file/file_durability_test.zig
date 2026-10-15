@@ -17,7 +17,9 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const testing = std.testing;
 const fixtures = @import("file_fixtures.zig");
+const fault_io = @import("../testing/fault_io.zig");
 const file_mod = @import("file.zig");
+const platform = @import("platform.zig");
 const File = file_mod.File;
 const SyncPolicy = file_mod.SyncPolicy;
 
@@ -671,4 +673,30 @@ test "lock: lock state does not disturb reads and writes through either handle" 
     try b.readAtAll(io, &back, 0);
     try testing.expectEqualSlices(u8, "locked-data", &back);
     try expect_length(b, 11);
+}
+
+test "sync_dir: flushes a directory after creates and deletes, and reports a failed sync" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    const made = try create_rw(tmp.dir, "entry.bin");
+    made.close(io);
+
+    try platform.sync_dir(io, tmp.dir);
+    try tmp.dir.deleteFile(io, "entry.bin");
+    try platform.sync_dir(io, tmp.dir);
+    try platform.sync_dir(io, tmp.dir); // idempotent on an unchanged directory
+
+    if (builtin.os.tag == .windows) return; // A no-op there: nothing reaches the `Io`.
+    var fio: fault_io.FaultIo = undefined;
+    const plan: fault_io.Plan = .{
+        .write = .none,
+        .read = .none,
+        .after_calls = 0,
+        .sync_fail_after = 1,
+    };
+    fault_io.FaultIo.init(&fio, io, plan);
+    try platform.sync_dir(fio.io(), tmp.dir); // sync call 0 passes through
+    try testing.expectError(error.InputOutput, platform.sync_dir(fio.io(), tmp.dir));
+    try testing.expectEqual(@as(u32, 2), fio.sync_calls);
 }

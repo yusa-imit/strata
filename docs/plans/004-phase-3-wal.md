@@ -44,7 +44,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       `frame_bytes_max` at `open`. Verify: hand-built segments read back in order; index or LSN
       gap → `Corrupted`; every `CrashSink` cut of a 3-frame segment yields a frame prefix, then
       null or a typed error, never a damaged frame.
-- [ ] **`wal/writer.zig` — append, sync, rotate** (`src/wal/`). One caller, no batching yet.
+- [x] **`wal/writer.zig` — append, sync, rotate** (`src/wal/`). One caller, no batching yet.
       `init` finds the tail via the reader and refuses a torn one (`error.RecoveryRequired`:
       truncation is recovery's job); batch buffer allocated in `init`; `sync` per `SyncPolicy`;
       rotate at `segment_bytes_max`. Verify: reopen continues the LSN; `FaultIo` failing sync

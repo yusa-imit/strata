@@ -4,7 +4,8 @@
 //! Files (see docs/PRD.md):
 //!   - `file/file.zig` (landed: open, positional read/write, length, setLength, sync policies,
 //!     preallocate, advisory locks)
-//!   - `file/platform.zig` (landed: the only OS-branching file; sync/reserve primitives)
+//!   - `file/platform.zig` (landed: the only OS-branching file; sync, directory sync and
+//!     reserve primitives)
 //!   - `file/mmap.zig` (planned)
 //!
 //! Status: `direct` is still rejected (`error.UnsupportedDirectIo`) and `file/mmap.zig` is
