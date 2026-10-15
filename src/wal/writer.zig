@@ -9,8 +9,10 @@
 //! `last_lsn` is the LSN of the last frame appended or found at `init` (0 for none) and
 //! `durable_lsn <= last_lsn` the LSN of the last frame known durable, inclusive and prefix
 //! closed (section 9): it moves only after a `File.sync` of the segment returned, or after a
-//! rotation synced the segment it left; frames found by `init` count as durable, since they
-//! were read back. `next_lsn < 2^63` always (`error.LsnExhausted` otherwise).
+//! rotation synced the segment it left, or after `init` synced the newest segment it opened
+//! (unless the policy is `.none`): a frame read back may never have been synced, so `init` of a
+//! non-empty log syncs once before it counts the frames it found as durable.
+//! `next_lsn < 2^63` always (`error.LsnExhausted` otherwise).
 //! Rotation (section 9): before an `n` byte frame, if the segment already holds a frame and
 //! `offset + n > segment_bytes_max`, the writer syncs the segment, creates `index + 1` with
 //! `first_lsn = next_lsn`, syncs the new file and then the directory, and only then writes the
@@ -225,9 +227,11 @@ pub const Writer = struct {
     /// Finds the end of the log in `dir` (opened with iteration) and takes its newest segment,
     /// creating segment 1 in an empty directory. `RecoveryRequired` for a torn tail;
     /// `WouldBlock` when another handle holds a segment; `SegmentLimit`, `Corrupted`,
-    /// `ChecksumMismatch` and I/O errors from the reader. On error nothing stays open or
-    /// allocated. Preconditions: `options` is coherent (`segments_max >= 1`, `segment_bytes_max`
-    /// above the segment header and at most `segment_bytes_limit - frame_bytes_max`).
+    /// `ChecksumMismatch` and I/O errors from the reader, and the sync error when the tail of a
+    /// non-empty log cannot be made durable (not retried, section 9). On error nothing stays
+    /// open or allocated. Preconditions: `options` is coherent (`segments_max >= 1`,
+    /// `segment_bytes_max` above the segment header and at most
+    /// `segment_bytes_limit - frame_bytes_max`).
     pub fn init(
         target: *Writer,
         io: Io,
@@ -242,6 +246,11 @@ pub const Writer = struct {
 
         const tail = try find_tail(io, gpa, dir, segment_options(options));
         const opened = try open_tail(io, dir, tail, options);
+        errdefer opened.current.close(io);
+
+        // Frames read back may never have reached the disk (a crash after the write, before the
+        // sync): durable means a sync returned after the write (section 9), so make it true.
+        if (tail.last_lsn > 0 and options.sync_policy != .none) try opened.current.sync(io);
         const frame_bytes = opened.offset - segment.segment_header_size;
         target.* = .{
             .dir = dir,
@@ -354,7 +363,9 @@ pub const Writer = struct {
         assert(self.live_count >= 1);
         assert(self.live_count <= self.options.segments_max);
         assert(self.offset >= segment.segment_header_size);
-        assert(self.offset <= self.options.segment_bytes_max + frame.frame_bytes_max);
+        // No upper bound on `offset`: a log reopened with a smaller `segment_bytes_max` than its
+        // newest segment is not an error, `append` rotates before the next frame.
+        assert(self.offset <= segment.segment_bytes_limit);
         assert(self.next_lsn >= frame.lsn_first);
         assert(self.next_lsn < frame.lsn_limit);
         const frame_bytes = self.offset - segment.segment_header_size;

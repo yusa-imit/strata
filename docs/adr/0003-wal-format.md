@@ -402,7 +402,9 @@ segment_bytes_max }` and exposes `init(target, io, gpa, dir, options)`, `append(
 `next_lsn`, `last_lsn` and `durable_lsn` (inclusive: the LSN of the last durable frame). `init`
 reads the log through `Reader`: `TornWrite` becomes `error.RecoveryRequired`, a newest segment
 that is `Unwritten` is deleted and created again at the end LSN of its predecessor, and one with
-a partial non-zero header is `RecoveryRequired`. `append` returns `PayloadTooLarge`,
+a partial non-zero header is `RecoveryRequired`. Frames read back may never have been synced, so
+`init` of a non-empty log syncs the newest segment once (not under `.none`) before `durable_lsn`
+becomes the last LSN read; a failing sync fails `init`. `append` returns `PayloadTooLarge`,
 `InvalidFrame`, `LsnExhausted` (a frame may not end at `2^63`), `SegmentLimit` or
 `SegmentIndexExhausted` without side effects, and latches the writer (`Failed`) on any I/O
 error after validation, as section 9 requires for a failed sync. A non-newest

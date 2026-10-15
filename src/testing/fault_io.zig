@@ -11,7 +11,7 @@
 //!     handle) it fails with `error.InputOutput` without reaching the inner `Io`; earlier
 //!     calls, and every call when it is null, forward.
 //!   - forwarders to the inner `Io` with the inner userdata: `dirCreateFile`, `dirOpenFile`,
-//!     `fileClose`, `fileLength`, `fileSetLength`, `fileStat`, `fileLock`,
+//!     `dirRead` (listing), `fileClose`, `fileLength`, `fileSetLength`, `fileStat`, `fileLock`,
 //!     `fileTryLock`, `fileUnlock`, `checkCancel`: everything `strata.file.File` uses.
 //! Any other `Io` operation through the wrapper is not supported: use the inner `Io` directly.
 //!
@@ -79,6 +79,7 @@ pub const FaultIo = struct {
         target.vtable.fileReadPositional = read_positional;
         target.vtable.dirCreateFile = forward_dir_create_file;
         target.vtable.dirOpenFile = forward_dir_open_file;
+        target.vtable.dirRead = forward_dir_read;
         target.vtable.fileClose = forward_file_close;
         target.vtable.fileSync = sync_file;
         target.vtable.fileLength = forward_file_length;
@@ -139,6 +140,18 @@ fn forward_dir_open_file(
     const self = self_of(userdata);
     assert(sub_path.len > 0);
     return self.inner.vtable.dirOpenFile(self.inner.userdata, dir, sub_path, options);
+}
+
+/// Directory listing (`Dir.iterate`) passes through, so a `Writer.init` can run on a `FaultIo`.
+fn forward_dir_read(
+    userdata: ?*anyopaque,
+    reader: *Dir.Reader,
+    buffer: []Dir.Entry,
+) Dir.Reader.Error!usize {
+    const self = self_of(userdata);
+    assert(buffer.len > 0);
+    assert(self.inner.vtable.dirRead != forward_dir_read);
+    return self.inner.vtable.dirRead(self.inner.userdata, reader, buffer);
 }
 
 fn forward_file_close(userdata: ?*anyopaque, files: []const File) void {

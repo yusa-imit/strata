@@ -1,8 +1,8 @@
 //! Contract tests for `Writer` under faults (ADR-0003 sections 5 and 9): a failing sync never
 //! advances `durable_lsn` and latches the writer, failed and short writes, a fault at each of the
 //! three syncs of a rotation, no allocation after `init`, and the end of the LSN space. The
-//! writer's own `init` always runs on `std.testing.io` (it lists the directory, which `FaultIo`
-//! does not forward); only the calls under test go through the `FaultIo`. Behaviour is in
+//! writer's own `init` runs on `std.testing.io` unless the test is about `init` itself (the sync
+//! of a reopened tail); only the calls under test go through the `FaultIo`. Behaviour is in
 //! `writer_test.zig`; shared helpers are in `writer_fixtures.zig`.
 
 const std = @import("std");
@@ -66,6 +66,49 @@ test "writer: a failing sync leaves durable_lsn unchanged and latches the writer
     try fx.expect_position(&w, 1, header_size + 46, 47);
     try testing.expectEqual(@as(Lsn, 23), w.durable_lsn);
     try testing.expectEqual(@as(Lsn, 47), try fx.append_ok(&w, pa));
+}
+
+test "writer: init of a non-empty log syncs its tail once before it calls frames durable" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    {
+        var w: Writer = undefined;
+        try fx.open_ok(&w, tmp.dir, fx.options(4, 1 << 20, .fsync));
+        defer w.deinit(testing.io, testing.allocator);
+
+        _ = try fx.append_ok(&w, pa); // Written, never synced.
+    }
+    var failing: fault_io.FaultIo = undefined;
+    fault_io.FaultIo.init(&failing, testing.io, sync_plan(0));
+    var refused: Writer = undefined;
+    const got = Writer.init(&refused, failing.io(), testing.allocator, tmp.dir, fx.options(
+        4,
+        1 << 20,
+        .fsync,
+    ));
+    try testing.expectError(error.InputOutput, got); // Nothing stays open or allocated.
+    try testing.expectEqual(@as(u32, 1), failing.sync_calls);
+
+    var counting: fault_io.FaultIo = undefined;
+    fault_io.FaultIo.init(&counting, testing.io, sync_plan(null));
+    {
+        var w: Writer = undefined;
+        const durable = fx.options(4, 1 << 20, .fsync);
+        try Writer.init(&w, counting.io(), testing.allocator, tmp.dir, durable);
+        defer w.deinit(testing.io, testing.allocator);
+
+        w.check_invariants();
+        try testing.expectEqual(@as(u32, 1), counting.sync_calls);
+        try testing.expectEqual(@as(Lsn, 1), w.durable_lsn);
+    }
+    var none: fault_io.FaultIo = undefined; // `.none` never syncs, so it never faults.
+    fault_io.FaultIo.init(&none, testing.io, sync_plan(0));
+    var quiet: Writer = undefined;
+    try Writer.init(&quiet, none.io(), testing.allocator, tmp.dir, fx.opts(4, 1 << 20));
+    defer quiet.deinit(testing.io, testing.allocator);
+
+    try testing.expectEqual(@as(u32, 0), none.sync_calls);
+    try testing.expectEqual(@as(Lsn, 1), quiet.durable_lsn);
 }
 
 test "writer: a failed or canceled write latches without moving the position" {

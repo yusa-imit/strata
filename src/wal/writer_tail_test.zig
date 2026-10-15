@@ -274,3 +274,29 @@ test "writer: a zero tail too short for the next frame extends the file" {
     try sfx.expect_length(f, len + 24);
     try fx.expect_log(tmp.dir, 2, &.{ 1, 23 }, &.{ pa, pb });
 }
+
+test "writer: reopening with a smaller segment_bytes_max than the newest segment rotates" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var lsns: [11]Lsn = undefined;
+    {
+        var w: Writer = undefined;
+        try fx.open_ok(&w, tmp.dir, fx.opts(4, 4096));
+        defer w.deinit(testing.io, testing.allocator);
+
+        for (0..10) |i| lsns[i] = try fx.append_ok(&w, fx.payload_of(i, 100));
+    }
+    {
+        var w: Writer = undefined;
+        try fx.open_ok(&w, tmp.dir, fx.opts(4, header_size + 117)); // Segment 1 is far past this.
+        defer w.deinit(testing.io, testing.allocator);
+
+        try fx.expect_position(&w, 1, header_size + 10 * 117, 1 + 10 * 117);
+        lsns[10] = try fx.append_ok(&w, fx.payload_of(10, 100));
+        try fx.expect_position(&w, 2, header_size + 117, 1 + 11 * 117);
+        try testing.expectEqual(@as(Lsn, 1 + 10 * 117), lsns[10]);
+    }
+    var records: [11][]const u8 = undefined;
+    for (&records, 0..) |*record, i| record.* = fx.payload_of(i, 100);
+    try fx.expect_log(tmp.dir, 4, &lsns, &records);
+}
