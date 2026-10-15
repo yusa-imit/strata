@@ -21,12 +21,18 @@
 //! `deinit` takes the same `gpa` back. `io` is passed per call (ADR-0001).
 //! Cost sketch: `open` is one directory scan plus one open, lock, stat and 24 byte read per
 //! segment, the segments closed again but the first, so it is linear in `segments_max` and does
-//! not read frames. `next` is one read of at most `frame_bytes_max` bytes and one CRC per frame.
-//! Only a failure in the newest segment runs the look-ahead, at most once: a pass over the rest
-//! of that segment, at most `segment_bytes_limit` bytes, whose CRC runs only on LSN matches.
+//! not read frames. `next` is two reads and one CRC per frame: the 17 byte header, then the rest
+//! of the frame, so a regular frame costs exactly its own bytes. Only an irregular header (all
+//! zero, `len` beyond `payload_bytes_max` or past the segment end, or cut short) reads up to
+//! `frame_bytes_max` bytes in the second read, so the zero-tail and torn-tail checks see the
+//! whole window. Only a failure in the newest segment runs the look-ahead, at most once: a pass
+//! over the rest of that segment, at most `segment_bytes_limit` bytes, whose CRC runs only on
+//! LSN matches.
 //! Locking: the reader holds the exclusive lock (`Segment.open`) of the segment it reads, from
-//! `open` until the end of the log, an error or `deinit`, so a second reader or a writer on the
-//! same directory fails with `WouldBlock` meanwhile.
+//! `open` until the end of the log, an error (which releases it at once) or `deinit`, so a
+//! second reader or a writer on that segment fails with `WouldBlock` meanwhile. The lock is per
+//! segment: crossing a boundary locks the next segment before it releases the previous one, so
+//! there is no gap, but the segments after the current one are not locked until reached.
 //! Borrowing: a returned `Frame.payload` points into the reader's buffer and is valid only until
 //! the next call of `next`. Not thread-safe.
 //! Not here: seeking to a checkpoint's `from_lsn` and truncating a torn tail belong to recovery
@@ -263,7 +269,7 @@ pub const Reader = struct {
         assert(self.state != .failed);
         assert(self.live_count <= self.file_count);
         if (self.state == .finished) return null;
-        errdefer self.state = .failed;
+        errdefer self.fail(io);
 
         for (0..self.live_count) |_| {
             if (try self.read_frame(io)) |decoded| return decoded;
@@ -272,6 +278,16 @@ pub const Reader = struct {
         // Proof: each pass either returns or moves to the next of `live_count` segments, and
         // the last segment cannot be crossed, so the loop returns before its last pass ends.
         unreachable;
+    }
+
+    /// Ends the reader after an error: releases the open segment (and its lock) at once, so
+    /// a recovery that truncates or a writer that opens the directory is not blocked by it.
+    fn fail(self: *Reader, io: Io) void {
+        assert(self.state == .reading);
+        assert(self.current != null);
+        self.current.?.close(io);
+        self.current = null;
+        self.state = .failed;
     }
 
     /// Where the cursor is; see `Position`.
@@ -303,7 +319,10 @@ pub const Reader = struct {
                 assert(self.lsn >= frame.lsn_first);
             },
             .finished => assert(self.current == null),
-            .failed => {},
+            .failed => {
+                assert(self.current == null); // `fail` released the lock.
+                assert(self.pos < self.live_count);
+            },
         }
     }
 
@@ -314,10 +333,12 @@ pub const Reader = struct {
         return self.pos + 1 == self.file_count;
     }
 
-    /// Opens live segment `pos` and puts the cursor on its first frame.
+    /// Opens live segment `pos` and puts the cursor on its first frame. If a segment is already
+    /// current it is closed only after the new one is open and locked, so the reader never
+    /// lets go of the log between two segments; on error the old one stays current and open.
     fn enter(self: *Reader, io: Io, pos: u32) EnterError!void {
         assert(pos < self.live_count);
-        assert(self.current == null);
+        assert((self.current == null) == (self.length == 0)); // Fresh from `open`, or crossing.
         const entry = self.entries[pos];
         const seg = segment.Segment.open(io, self.dir, entry.index, self.options) catch |err| {
             switch (err) {
@@ -332,11 +353,14 @@ pub const Reader = struct {
         const length = try seg.length(io);
         if (length < segment.segment_header_size) return error.Corrupted;
         if (length > segment.segment_bytes_limit) return error.Corrupted;
+        const previous = self.current;
         self.current = seg;
         self.pos = pos;
         self.offset = segment.segment_header_size;
         self.length = length;
         self.lsn = entry.first_lsn;
+        if (previous) |old| old.close(io);
+        assert(self.current != null);
     }
 
     /// Leaves the segment that is at its end: moves to the next one (true) after checking that
@@ -352,9 +376,7 @@ pub const Reader = struct {
         }
         const upcoming = self.entries[self.pos + 1];
         if (upcoming.first_lsn != self.lsn) return error.Corrupted;
-        self.current.?.close(io);
-        self.current = null;
-        try self.enter(io, self.pos + 1);
+        try self.enter(io, self.pos + 1); // Locks the next segment, then releases this one.
         return true;
     }
 
@@ -366,10 +388,13 @@ pub const Reader = struct {
         const remaining = self.length - self.offset;
         if (remaining == 0) return null;
 
-        const want: u32 = @intCast(@min(remaining, frame.frame_bytes_max));
+        const head_size: u32 = @intCast(@min(remaining, frame.frame_header_size));
+        try read_exact(io, seg, self.buf[0..head_size], self.offset);
+        const head = self.buf[0..head_size];
+        const want = self.frame_window(head, remaining);
+        assert(want >= head_size);
         const image = self.buf[0..want];
-        try read_exact(io, seg, image, self.offset);
-        const head = image[0..@min(want, frame.frame_header_size)];
+        try read_exact(io, seg, self.buf[head_size..want], self.offset + head_size);
         if (std.mem.allEqual(u8, head, 0) and try self.zero_rest(io, seg)) return null;
         if (self.lsn >= frame.lsn_limit) return error.Corrupted; // `decode` asserts the range.
 
@@ -382,6 +407,26 @@ pub const Reader = struct {
         self.offset += total;
         self.lsn += total;
         return decoded;
+    }
+
+    /// How many bytes to read for the frame whose first bytes (up to a header) are `head`, with
+    /// `remaining` bytes left in the segment: exactly the frame when the header is regular (a
+    /// whole header that is not all zero, with a `len` that is legal and fits in the segment),
+    /// otherwise the whole window `min(remaining, frame_bytes_max)`, so that the zero-tail and
+    /// torn-tail checks see what they always saw.
+    fn frame_window(self: *const Reader, head: []const u8, remaining: u64) u32 {
+        assert(head.len <= frame.frame_header_size);
+        assert(head.len == @min(remaining, frame.frame_header_size));
+        assert(self.offset + remaining == self.length);
+        const window: u32 = @intCast(@min(remaining, frame.frame_bytes_max));
+        if (head.len < frame.frame_header_size) return window;
+        if (std.mem.allEqual(u8, head, 0)) return window;
+        const len = std.mem.readInt(u32, head[0..4], .little);
+        if (len > frame.payload_bytes_max) return window;
+        const total = frame.frame_header_size + len;
+        if (total > remaining) return window;
+        assert(total <= window);
+        return total;
     }
 
     /// True when every byte from the cursor to the end of the segment is zero.

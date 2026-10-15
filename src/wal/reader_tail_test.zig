@@ -10,6 +10,7 @@ const crash = @import("../testing/crash.zig");
 const fault_io = @import("../testing/fault_io.zig");
 const frame = @import("frame.zig");
 const fx = @import("reader_fixtures.zig");
+const segment = @import("segment.zig");
 const sfx = @import("segment_fixtures.zig");
 
 const Reader = fx.Reader;
@@ -469,4 +470,138 @@ test "reader: injected read faults surface as typed errors, short reads change n
         }
         try testing.expectEqual(@as(?frame.Frame, null), try rd.next(io));
     }
+}
+
+test "reader: a frame costs a read of exactly its own bytes, not of the rest of the segment" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    _ = try fx.put_segment(tmp.dir, 1, 1, &.{ pa, pb, pc });
+
+    var fio: fault_io.FaultIo = undefined; // Reads of 1 byte: `read_calls` counts bytes.
+    const plan: fault_io.Plan = .{ .write = .none, .read = .{ .short = 1 }, .after_calls = 0 };
+    fault_io.FaultIo.init(&fio, testing.io, plan);
+    var rd: Reader = undefined;
+    try fx.open_ok(&rd, tmp.dir, 2);
+    defer rd.deinit(testing.io, testing.allocator);
+
+    const io = fio.io();
+    for ([_][]const u8{ pa, pb, pc }) |payload| {
+        const got = (try rd.next(io)).?;
+        try testing.expectEqualSlices(u8, payload, got.payload);
+    }
+    try testing.expectEqual(@as(?frame.Frame, null), try rd.next(io));
+    try testing.expectEqual(f3_end - header_size, fio.read_calls);
+}
+
+/// An `Io` that, at the first file close, tries to open the segment `probe_index` and records
+/// whether that failed with `WouldBlock`, i.e. whether the reader already holds its lock.
+const HandoffIo = struct {
+    fio: fault_io.FaultIo,
+    vtable: std.Io.VTable,
+    dir: std.Io.Dir,
+    probe_index: u32,
+    probed: bool,
+    probe_locked: bool,
+
+    fn init(target: *HandoffIo, dir: std.Io.Dir, probe_index: u32) void {
+        assert(probe_index >= 1);
+        const plan: fault_io.Plan = .{ .write = .none, .read = .none, .after_calls = 0 };
+        fault_io.FaultIo.init(&target.fio, testing.io, plan);
+        target.vtable = target.fio.vtable;
+        target.vtable.fileClose = close_probe;
+        target.dir = dir;
+        target.probe_index = probe_index;
+        target.probed = false;
+        target.probe_locked = false;
+        assert(target.vtable.fileClose != target.fio.vtable.fileClose);
+        assert(target.fio.read_calls == 0);
+    }
+
+    fn io(self: *HandoffIo) std.Io {
+        assert(self.vtable.fileClose == close_probe);
+        assert(self.vtable.fileReadPositional == self.fio.vtable.fileReadPositional);
+        return .{ .userdata = &self.fio, .vtable = &self.vtable };
+    }
+
+    fn close_probe(userdata: ?*anyopaque, files: []const std.Io.File) void {
+        const fio: *fault_io.FaultIo = @ptrCast(@alignCast(userdata));
+        const self: *HandoffIo = @fieldParentPtr("fio", fio);
+        assert(files.len > 0);
+        assert(self.probe_index >= 1);
+        if (!self.probed) {
+            self.probed = true;
+            const options = fx.opts(4);
+            if (segment.Segment.open(testing.io, self.dir, self.probe_index, options)) |seg| {
+                seg.close(testing.io);
+            } else |err| self.probe_locked = err == error.WouldBlock;
+        }
+        fio.inner.vtable.fileClose(fio.inner.userdata, files);
+    }
+};
+
+test "reader: crossing locks the next segment before it releases the previous one" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const end = try fx.put_segment(tmp.dir, 1, 1, &.{pa});
+    _ = try fx.put_segment(tmp.dir, 2, end, &.{pb});
+
+    var handoff: HandoffIo = undefined;
+    HandoffIo.init(&handoff, tmp.dir, 2);
+    var rd: Reader = undefined;
+    try fx.open_ok(&rd, tmp.dir, 4);
+    defer rd.deinit(testing.io, testing.allocator);
+
+    const io = handoff.io();
+    try testing.expectEqualSlices(u8, pa, (try rd.next(io)).?.payload);
+    try testing.expect(!handoff.probed); // Still inside the first segment.
+    try testing.expectEqualSlices(u8, pb, (try rd.next(io)).?.payload);
+    try testing.expect(handoff.probed);
+    try testing.expect(handoff.probe_locked); // Segment 2 was held when segment 1 was closed.
+    rd.check_invariants();
+    try fx.expect_open_error(error.WouldBlock, tmp.dir, 4); // Still locked: no gap, no leak.
+}
+
+test "reader: an error from next releases the segment lock and leaves a valid reader" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var image: [256]u8 = undefined;
+    const len = fx.build(&image, 1, 1, &.{ pa, pb, pc });
+    const cases = [_]struct { flip: u32, reads: u32, want: anyerror }{
+        .{ .flip = f2_offset + 17, .reads = 1, .want = error.ChecksumMismatch },
+        .{ .flip = f3_offset + 17, .reads = 2, .want = error.TornWrite },
+    };
+    for (cases) |case| {
+        image[case.flip] ^= 1;
+        try sfx.put_file(tmp.dir, 1, image[0..len], len);
+        image[case.flip] ^= 1;
+        var rd: Reader = undefined;
+        try fx.open_ok(&rd, tmp.dir, 4);
+        defer rd.deinit(testing.io, testing.allocator);
+
+        for (0..case.reads) |_| _ = (try rd.next(testing.io)).?;
+        try fx.expect_open_error(error.WouldBlock, tmp.dir, 4); // Held while reading.
+        try fx.expect_next_error(&rd, case.want);
+        rd.check_invariants();
+        var other: Reader = undefined;
+        try fx.open_ok(&other, tmp.dir, 4); // The failed reader no longer holds the lock.
+        other.deinit(testing.io, testing.allocator);
+    }
+}
+
+test "reader: a failed crossing releases the lock of the segment it left behind" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const end = try fx.put_segment(tmp.dir, 1, 1, &.{pa});
+    _ = try fx.put_segment(tmp.dir, 2, end - 1, &.{pb}); // Starts inside the first segment.
+
+    var rd: Reader = undefined;
+    try fx.open_ok(&rd, tmp.dir, 4);
+    defer rd.deinit(testing.io, testing.allocator);
+
+    try fx.expect_record(&rd, 1, pa);
+    try fx.expect_next_error(&rd, error.Corrupted);
+    rd.check_invariants();
+    var other: Reader = undefined;
+    try fx.open_ok(&other, tmp.dir, 4);
+    other.deinit(testing.io, testing.allocator);
 }
