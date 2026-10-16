@@ -393,9 +393,15 @@ pub const Reader = struct {
 };
 ```
 
-`Reader.open` has no `from_lsn` yet: it reads from the oldest live segment, with indices contiguous
-from there. The seek of section 8 (`from_lsn`, never `TornWrite` at the seek target) belongs to
-`Recovery.replay` (item 7), which needs `position()` to learn where the log ended.
+`Reader.open` has no `from_lsn`: it reads from the oldest live segment, with indices contiguous
+from there. The seek of section 8 is done by `Recovery.replay` (item 7, `src/wal/recovery.zig`)
+by reading and skipping the frames below `from_lsn`: no frame starting exactly at `from_lsn`
+(below the oldest, inside a frame, at or past the end) is `Corrupted`, and a `TornWrite` before
+the target is reached is `Corrupted`, never truncated. `replay(io, gpa, dir, target: Apply,
+options) ReplayError!Result{ last_lsn }` truncates a torn frame (`setLength`, sync) or deletes a
+partial newest header (then `platform.sync_dir`, which closes Open question 4); `Unwritten`
+newest segments are left to the writer. Repairs run after the whole log was read, so an `Apply`
+error leaves the log untouched.
 
 `Writer` (item 5, `src/wal/writer.zig`) takes `Options { segments_max, sync_policy,
 segment_bytes_max }` and exposes `init(target, io, gpa, dir, options)`, `append(io, type, payload)

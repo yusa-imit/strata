@@ -6,11 +6,10 @@
 //! positional append) and `wal/reader.zig` (sequential read across segments with the ADR-0003
 //! section 8 torn-tail rule) and `wal/writer.zig` (append, sync and rotate over the newest
 //! segment; refuses a torn tail with `RecoveryRequired`; syncs the directory after creating a
-//! segment).
+//! segment) and `wal/recovery.zig` (replay into an `Apply` target; truncates a torn tail).
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `wal/checkpoint.zig`
-//!   - `wal/recovery.zig`
 //!
 //! Status: stub. Public declarations are added as PRD phases land.
 
@@ -20,6 +19,7 @@ pub const frame = @import("wal/frame.zig");
 pub const segment = @import("wal/segment.zig");
 pub const reader = @import("wal/reader.zig");
 pub const writer = @import("wal/writer.zig");
+pub const recovery = @import("wal/recovery.zig");
 
 /// Module-level error set. Extend as functionality lands; keep names descriptive
 /// (`error.ChecksumMismatch`, not `error.Invalid`).

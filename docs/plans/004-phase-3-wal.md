@@ -55,7 +55,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       or `ConcurrencyUnavailable` path in library code (ADR-0001 risk); `error.Canceled` stays
       in `CommitError`. Verify: 8 committers under `std.testing.io` → `stats.syncs` < commits,
       each returns with `durable_lsn >= upto`; a failed leader sync reaches its whole batch.
-- [ ] **`wal/recovery.zig` — replay** (`src/wal/`). `Recovery.replay` from `options.from_lsn`
+- [x] **`wal/recovery.zig` — replay** (`src/wal/`). `Recovery.replay` from `options.from_lsn`
       through the §4.5 `Apply` vtable; truncates a torn tail per ADR-0003, returns the last good
       LSN; mid-log damage → `Corrupted`, never a silent skip. Verify: replay twice into a model
       = once (REALM.md idempotence); `Writer.init` succeeds after tail truncation; a bad frame
