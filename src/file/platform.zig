@@ -9,6 +9,9 @@
 //!   cache there). Only a filesystem that does not support it (`NOTSUP`, `OPNOTSUPP`, `NOTTY`,
 //!   `INVAL`, `NODEV`) downgrades to `Io.File.sync`; real failures (`EIO`, `ENOSPC`, ...) are
 //!   returned, never swallowed. Every other OS uses `Io.File.sync`.
+//! - `sync_dir`: `fsync(2)` of a directory handle, which makes the names created, deleted or
+//!   renamed in it durable (ADR-0003 section 2 and open question 4); a no-op on Windows, where
+//!   NTFS journals metadata and a directory handle cannot be flushed.
 //! - `reserve`: best-effort block reservation (Linux `fallocate(2)` with `KEEP_SIZE`, darwin
 //!   `F_PREALLOCATE`), only for growth beyond the current length. An unsupported filesystem
 //!   or OS is not an error; running out of space is.
@@ -108,6 +111,18 @@ pub fn sync_full(io: Io, handle: Io.File) Io.File.SyncError!void {
     }
     // Non-darwin, or interrupted every time: `Io.File.sync` retries with cancelation checks.
     return handle.sync(io);
+}
+
+/// Makes the directory entries of `dir` durable: every file created or deleted in it before
+/// this call survives a crash after it returns (`File.sync` flushes contents, not names). The
+/// handle is `dir`'s own descriptor, which is never closed or modified here. A no-op on
+/// Windows. The caller applies its `SyncPolicy` (`.none` skips this call).
+pub fn sync_dir(io: Io, dir: Io.Dir) Io.File.SyncError!void {
+    if (comptime builtin.os.tag == .windows) return;
+    assert(dir.handle >= 0);
+    const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+    assert(as_file.handle == dir.handle);
+    try as_file.sync(io);
 }
 
 /// Reserves blocks so the file can hold `len` bytes beyond `length_now`. Never changes the

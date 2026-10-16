@@ -7,8 +7,11 @@
 //!     `after_calls` (0-based, counted per direction) each obeys the plan for its direction:
 //!     capped to `short` bytes, zero bytes transferred, or `error.Canceled`. Earlier calls pass
 //!     through; every call is counted.
+//!   - `fileSync`: counted; from call number `sync_fail_after` (0-based, any file or directory
+//!     handle) it fails with `error.InputOutput` without reaching the inner `Io`; earlier
+//!     calls, and every call when it is null, forward.
 //!   - forwarders to the inner `Io` with the inner userdata: `dirCreateFile`, `dirOpenFile`,
-//!     `fileClose`, `fileSync`, `fileLength`, `fileSetLength`, `fileStat`, `fileLock`,
+//!     `dirRead` (listing), `fileClose`, `fileLength`, `fileSetLength`, `fileStat`, `fileLock`,
 //!     `fileTryLock`, `fileUnlock`, `checkCancel`: everything `strata.file.File` uses.
 //! Any other `Io` operation through the wrapper is not supported: use the inner `Io` directly.
 //!
@@ -41,6 +44,9 @@ pub const Plan = struct {
     read: Fault,
     /// Number of calls per direction (0-based count) that pass through before the fault starts.
     after_calls: u32,
+    /// Syncs (0-based count, every `fileSync` of any file or directory) that pass through
+    /// before every later one fails with `error.InputOutput`; null never fails a sync.
+    sync_fail_after: ?u32 = null,
 };
 
 /// A fault-injecting `Io` wrapper; see the file header for what is faulted and forwarded.
@@ -49,6 +55,7 @@ pub const FaultIo = struct {
     plan: Plan,
     write_calls: u32,
     read_calls: u32,
+    sync_calls: u32,
     vtable: Io.VTable,
 
     /// Builds the wrapper in place; counters start at zero.
@@ -65,14 +72,16 @@ pub const FaultIo = struct {
             .plan = plan,
             .write_calls = 0,
             .read_calls = 0,
+            .sync_calls = 0,
             .vtable = Io.failing.vtable.*,
         };
         target.vtable.fileWritePositional = write_positional;
         target.vtable.fileReadPositional = read_positional;
         target.vtable.dirCreateFile = forward_dir_create_file;
         target.vtable.dirOpenFile = forward_dir_open_file;
+        target.vtable.dirRead = forward_dir_read;
         target.vtable.fileClose = forward_file_close;
-        target.vtable.fileSync = forward_file_sync;
+        target.vtable.fileSync = sync_file;
         target.vtable.fileLength = forward_file_length;
         target.vtable.fileSetLength = forward_file_set_length;
         target.vtable.fileStat = forward_file_stat;
@@ -82,6 +91,7 @@ pub const FaultIo = struct {
         target.vtable.checkCancel = forward_check_cancel;
         assert(target.write_calls == 0);
         assert(target.read_calls == 0);
+        assert(target.sync_calls == 0);
     }
 
     /// The faulting `Io`; valid while `self` stays at the same address.
@@ -96,7 +106,7 @@ pub const FaultIo = struct {
         assert(self.inner.vtable != &self.vtable);
         assert(self.vtable.fileWritePositional == write_positional);
         assert(self.vtable.fileReadPositional == read_positional);
-        assert(self.vtable.fileSync == forward_file_sync);
+        assert(self.vtable.fileSync == sync_file);
         if (self.plan.write == .short) assert(self.plan.write.short >= 1);
         if (self.plan.read == .short) assert(self.plan.read.short >= 1);
     }
@@ -132,16 +142,35 @@ fn forward_dir_open_file(
     return self.inner.vtable.dirOpenFile(self.inner.userdata, dir, sub_path, options);
 }
 
+/// Directory listing (`Dir.iterate`) passes through, so a `Writer.init` can run on a `FaultIo`.
+fn forward_dir_read(
+    userdata: ?*anyopaque,
+    reader: *Dir.Reader,
+    buffer: []Dir.Entry,
+) Dir.Reader.Error!usize {
+    const self = self_of(userdata);
+    assert(buffer.len > 0);
+    assert(self.inner.vtable.dirRead != forward_dir_read);
+    return self.inner.vtable.dirRead(self.inner.userdata, reader, buffer);
+}
+
 fn forward_file_close(userdata: ?*anyopaque, files: []const File) void {
     const self = self_of(userdata);
     assert(files.len > 0);
     self.inner.vtable.fileClose(self.inner.userdata, files);
 }
 
-fn forward_file_sync(userdata: ?*anyopaque, file: File) File.SyncError!void {
+/// Counts one sync; from `plan.sync_fail_after` on it fails with `error.InputOutput` and does
+/// not reach the inner `Io`, otherwise it forwards.
+fn sync_file(userdata: ?*anyopaque, file: File) File.SyncError!void {
     const self = self_of(userdata);
-    assert(self.inner.vtable.fileSync != forward_file_sync);
+    assert(self.inner.vtable.fileSync != sync_file);
     assert(self.inner.userdata != userdata); // Forward the inner userdata, never ours.
+    const index = self.sync_calls;
+    self.sync_calls +|= 1;
+    if (self.plan.sync_fail_after) |after| {
+        if (index >= after) return error.InputOutput;
+    }
     return self.inner.vtable.fileSync(self.inner.userdata, file);
 }
 

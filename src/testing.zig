@@ -6,7 +6,7 @@
 //!     truncation-point enumerator; simulated cuts are a floor, not a proof of power-loss
 //!     safety, since reordered or partially flushed sectors are not reproduced)
 //!   - `testing/fault_io.zig` (landed: fault-injecting `std.Io` wrapper for positional reads
-//!     and writes: short, zero, canceled)
+//!     and writes: short, zero, canceled; and failing syncs)
 //!   - `testing/truncation_matrix_test.zig` (landed, test-only: every truncation and torn cut
 //!     of a real `wal.frame` must decode to a typed error, never to a damaged payload)
 //!   - `testing/page_matrix_test.zig` (landed, test-only: the same sweep over the real page

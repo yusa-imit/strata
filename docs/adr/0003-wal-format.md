@@ -394,7 +394,20 @@ pub const Reader = struct {
 
 `Reader.open` has no `from_lsn` yet: it reads from the oldest live segment, with indices contiguous
 from there. The seek of section 8 (`from_lsn`, never `TornWrite` at the seek target) belongs to
-`Recovery.replay` (item 7), which needs `position()` to learn where the log ended. A non-newest
+`Recovery.replay` (item 7), which needs `position()` to learn where the log ended.
+
+`Writer` (item 5, `src/wal/writer.zig`) takes `Options { segments_max, sync_policy,
+segment_bytes_max }` and exposes `init(target, io, gpa, dir, options)`, `append(io, type, payload)
+-> Lsn`, `sync(io)`, `position()`, `deinit(io, gpa)` and `check_invariants()`, plus the fields
+`next_lsn`, `last_lsn` and `durable_lsn` (inclusive: the LSN of the last durable frame). `init`
+reads the log through `Reader`: `TornWrite` becomes `error.RecoveryRequired`, a newest segment
+that is `Unwritten` is deleted and created again at the end LSN of its predecessor, and one with
+a partial non-zero header is `RecoveryRequired`. Frames read back may never have been synced, so
+`init` of a non-empty log syncs the newest segment once (not under `.none`) before `durable_lsn`
+becomes the last LSN read; a failing sync fails `init`. `append` returns `PayloadTooLarge`,
+`InvalidFrame`, `LsnExhausted` (a frame may not end at `2^63`), `SegmentLimit` or
+`SegmentIndexExhausted` without side effects, and latches the writer (`Failed`) on any I/O
+error after validation, as section 9 requires for a failed sync. A non-newest
 segment whose header `first_lsn` does not grow, or lies beyond the previous file's bytes, is
 `Corrupted` at `open`; the exact `first_lsn == end LSN of the previous frames` rule is checked
 when `next` crosses the boundary, because a zero tail hides the end until then.
@@ -492,3 +505,8 @@ table above without a `format_version` bump is rejected on review.
    `Corrupted`. There is no reseeding option in v1.
 4. **Directory sync.** It is required at rotation, after create, and after a header delete.
    Recommendation: a free function in `file/` (`platform.zig`), not a new `File` method.
+   *Resolved in plan 004 item 5:* `platform.sync_dir(io, dir)` is `fsync` of the directory
+   handle (a no-op on Windows, where a directory handle cannot be flushed). `Writer` calls it
+   after every `Segment.create`, at `init` and at rotation, unless the policy is `.none`. The
+   `Unwritten` rewrite (delete, then create) is covered by that one call. Recovery (item 7)
+   must call it after deleting a torn newest header.

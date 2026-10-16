@@ -429,3 +429,39 @@ test "segment: a zero-progress header read is TornWrite, never a hang" {
     try testing.expectError(error.TornWrite, result);
     try expect_open_ok(tmp.dir, 1, 1);
 }
+
+test "segment: a create whose sync fails closes and unlocks the file and leaves its header" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fio: fault_io.FaultIo = undefined;
+    const plan: fault_io.Plan = .{
+        .write = .none,
+        .read = .none,
+        .after_calls = 0,
+        .sync_fail_after = 0,
+    };
+    fault_io.FaultIo.init(&fio, testing.io, plan);
+
+    const failed = Segment.create(fio.io(), tmp.dir, 1, 5, opts(.fsync));
+    try testing.expectError(error.InputOutput, failed);
+    try testing.expectEqual(@as(u32, 1), fio.sync_calls);
+    // A leaked handle would still hold the lock: `open` would be `WouldBlock`, not the header.
+    try expect_open_ok(tmp.dir, 1, 5);
+    const again = Segment.create(testing.io, tmp.dir, 1, 5, opts(.none));
+    try testing.expectError(error.PathAlreadyExists, again);
+}
+
+test "segment: a create whose header write is canceled leaves an unlocked empty file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fio: fault_io.FaultIo = undefined;
+    const plan: fault_io.Plan = .{ .write = .canceled, .read = .none, .after_calls = 0 };
+    fault_io.FaultIo.init(&fio, testing.io, plan);
+
+    try testing.expectError(
+        error.Canceled,
+        Segment.create(fio.io(), tmp.dir, 1, 5, opts(.fsync)),
+    );
+    try testing.expectEqual(@as(u32, 0), fio.sync_calls); // The sync is never reached.
+    try expect_open_error(error.Unwritten, tmp.dir, 1); // Not WouldBlock: nothing stayed locked.
+}
