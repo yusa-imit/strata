@@ -23,7 +23,7 @@ discovered, not stored. These forces shape the design:
    silently or refuses a legal crash (plan 004, risk 2).
 2. **Position must be part of validity.** As with pages (ADR-0002 §2), a frame with a valid CRC
    that sits at the wrong place is stale data. It must not verify.
-3. **Recovery needs O(1) seeks and a bounded scan.** Redo starts at a checkpoint, not at segment
+3. **Recovery needs a bounded seek and a bounded scan.** Redo starts at a checkpoint, not at segment
    1. Deciding torn-or-damaged needs a look-ahead whose cost has a ceiling.
 4. **Throughput is per frame.** PRD §5 targets 200k appends/s, and consumers log 30–100 B
    records (zoltraak commands, synod entries). Every header byte is about 1% of bandwidth.
@@ -125,8 +125,10 @@ LSNs are unique, strictly increasing, and `< 2⁶³`. A writer asserts this; on 
 `Corrupted`.
 
 *Why bytes and not a counter.*
-- **O(1) seek.** Find the segment with the greatest `first_lsn ≤ L`; the offset follows from the
-  formula. A counter needs a scan or an index.
+- **Addressable seek.** Find the segment with the greatest `first_lsn ≤ L`; the offset follows from
+  the formula. A counter needs a scan or an index. v1 recovery does not use it: it reads and
+  skips the frames below `from_lsn` (§13), which also checks them; the formula stays available
+  for a later direct seek.
 - **Exact expectation everywhere.** The expected LSN of any byte offset is known, so the
   look-ahead (§8) can verify a candidate frame at any offset after a damaged one. With a counter,
   the number of lost frames is unknown, and so is the expected LSN.
@@ -443,7 +445,8 @@ table above without a `format_version` bump is rejected on review.
 - Each failure maps to one typed error. Torn tail → `TornWrite`, the only error recovery
   truncates. Bit rot or a stale or misplaced frame → `ChecksumMismatch`. A structural violation
   → `Corrupted`. A renamed segment → `ChecksumMismatch`, with certainty. No path panics.
-- O(1) redo seek, and a bounded look-ahead that runs only on the failure path.
+- A redo seek that the format can do in O(1) (v1 recovery reads and skips instead, §13), and a
+  bounded look-ahead that runs only on the failure path.
 - 17 B per frame. LSNs double as byte accounting.
 
 **Costs.**
@@ -517,3 +520,10 @@ table above without a `format_version` bump is rejected on review.
    after every `Segment.create`, at `init` and at rotation, unless the policy is `.none`. The
    `Unwritten` rewrite (delete, then create) is covered by that one call. Recovery (item 7)
    must call it after deleting a torn newest header.
+5. **Damage before the checkpoint blocks recovery.** `Recovery.replay` reads and checks every
+   frame below `from_lsn` (item 7), so a bad frame there is `Corrupted` or `ChecksumMismatch`
+   even though redo would not apply it, and a log whose oldest segments were damaged cannot be
+   opened until they are reclaimed or restored. This is deliberate: it never hides damage, and
+   reading is linear in the skipped bytes. Recommendation: keep it; a direct seek by the §5
+   formula (trusting the checkpoint frame, §8 "the seek target is trusted") is a later
+   optimisation if the skip cost matters, at the price of not checking the skipped frames.

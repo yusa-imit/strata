@@ -19,6 +19,13 @@
 //! same torn state, so replaying twice applies the same frames and repairs once. Under
 //! `SyncPolicy.none` no sync is issued, as in the writer.
 //!
+//! Single process: a repair checks that its segment still has the length the read saw (else
+//! `Corrupted`), but recovery assumes it is the only process on the log; it runs before a
+//! `Writer` opens it, and the segment lock is the backstop. Damage before `from_lsn` is found
+//! too (those frames are read), so it blocks recovery. Not here: validating the checkpoint
+//! frame at the page file's `wal_lsn` and deriving `redo_lsn` from it belong to the caller
+//! (plan 004, item 10); `replay` takes the resulting `from_lsn`.
+//!
 //! Allocation: the reader's buffers, from `gpa`, freed before `replay` returns. No recursion;
 //! the frame loop is bounded by `frames_max`. `io` is passed per call, and on to `Apply`.
 
@@ -58,7 +65,7 @@ pub const Apply = struct {
 pub const ReplayOptions = struct {
     /// First LSN to apply: 0 for the start of the log, else the LSN of an intact frame.
     from_lsn: Lsn,
-    segment: segment.Options,
+    segment_options: segment.Options,
 };
 
 pub const Result = struct {
@@ -70,9 +77,10 @@ pub const ReplayError = ApplyError || reader.OpenError || reader.FormatError ||
     file.SetLengthError || file.SyncError || Io.Dir.DeleteFileError;
 
 /// Frames are at least a header, so a segment holds at most this many.
-const frames_per_segment_max: u64 = segment.segment_bytes_limit / frame.frame_header_size + 1;
+const frames_per_segment_max: u64 =
+    @divFloor(segment.segment_bytes_limit, frame.frame_header_size) + 1;
 
-const Torn = struct { segment_index: u32, offset: u64 };
+const Torn = struct { segment_index: u32, offset: u64, length: u64 };
 /// How the scan ended: `torn` is the frame to cut, `header_index` the newest segment file whose
 /// header the reader could not read (0 when there is none).
 const Outcome = struct { last_lsn: Lsn, torn: ?Torn, header_index: u32 };
@@ -81,7 +89,8 @@ pub const Recovery = struct {
     /// Replays the log in `dir` (opened with iteration) into `target` and repairs a torn tail;
     /// see the file header. Errors: `Corrupted`, `ChecksumMismatch` (also for a bad start),
     /// `SegmentLimit`, `WouldBlock`, I/O errors, and whatever `target` returns.
-    /// Preconditions: `options.segment.segments_max >= 1`; `options.from_lsn < lsn_limit`.
+    /// Precondition: `options.segment_options.segments_max >= 1`. A `from_lsn` that is no LSN is
+    /// `Corrupted`.
     pub fn replay(
         io: Io,
         gpa: Allocator,
@@ -89,14 +98,15 @@ pub const Recovery = struct {
         target: Apply,
         options: ReplayOptions,
     ) ReplayError!Result {
-        assert(options.segment.segments_max >= 1);
-        assert(options.from_lsn < frame.lsn_limit);
+        assert(options.segment_options.segments_max >= 1);
+        if (options.from_lsn >= frame.lsn_limit) return error.Corrupted; // Not an LSN at all.
         const outcome = try scan(io, gpa, dir, target, options);
-        if (outcome.torn) |torn| try cut_frame(io, dir, torn, options.segment);
+        if (outcome.torn) |torn| try cut_frame(io, dir, torn, options.segment_options);
         if (outcome.header_index != 0) {
-            try discard_header(io, dir, outcome.header_index, options.segment);
+            try discard_header(io, dir, outcome.header_index, options.segment_options);
         }
-        assert(outcome.torn == null or outcome.header_index == 0); // Torn frame: newest is live.
+        if (outcome.torn != null) assert(outcome.header_index == 0); // Torn frame: newest is live.
+        assert(outcome.last_lsn < frame.lsn_limit);
         return .{ .last_lsn = outcome.last_lsn };
     }
 };
@@ -109,9 +119,9 @@ fn scan(
     target: Apply,
     options: ReplayOptions,
 ) ReplayError!Outcome {
-    assert(options.segment.segments_max >= 1);
+    assert(options.segment_options.segments_max >= 1);
     var rd: reader.Reader = undefined;
-    try reader.Reader.open(&rd, io, gpa, dir, options.segment);
+    try reader.Reader.open(&rd, io, gpa, dir, options.segment_options);
     defer rd.deinit(io, gpa);
 
     const from = if (options.from_lsn == 0) frame.lsn_first else options.from_lsn;
@@ -120,19 +130,25 @@ fn scan(
     }
     var reached = options.from_lsn == 0;
     var last_lsn: Lsn = 0;
-    const frames_max = @as(u64, options.segment.segments_max) * frames_per_segment_max;
-    for (0..frames_max) |_| {
+    const segments_max: u64 = options.segment_options.segments_max;
+    const frames_max: u64 = segments_max * frames_per_segment_max;
+    var frames_seen: u64 = 0;
+    while (frames_seen < frames_max) : (frames_seen += 1) {
         const found = rd.next(io) catch |err| switch (err) {
             error.TornWrite => {
                 if (!reached) return error.Corrupted; // Torn at or before the seek target.
                 const at = rd.position();
                 return .{
                     .last_lsn = last_lsn,
-                    .torn = .{ .segment_index = at.segment_index, .offset = at.offset },
+                    .torn = .{
+                        .segment_index = at.segment_index,
+                        .offset = at.offset,
+                        .length = rd.length,
+                    },
                     .header_index = 0,
                 };
             },
-            else => |other| return other,
+            else => |other| return other, // Deliberate: every other error is the caller's.
         };
         const got = found orelse break;
         last_lsn = got.lsn;
@@ -164,6 +180,7 @@ fn cut_frame(io: Io, dir: Io.Dir, torn: Torn, options: segment.Options) ReplayEr
     defer seg.close(io);
 
     const length = try seg.length(io);
+    if (length != torn.length) return error.Corrupted; // The file changed since the read.
     if (length < torn.offset) return error.Corrupted;
     try seg.file.setLength(io, torn.offset);
     try seg.sync(io);
@@ -180,7 +197,7 @@ fn discard_header(io: Io, dir: Io.Dir, index: u32, options: segment.Options) Rep
     } else |err| switch (err) {
         error.Unwritten => return,
         error.TornWrite => {},
-        else => |other| return other,
+        else => |other| return other, // Deliberate: I/O, lock and damage errors pass through.
     }
     var name: [segment.name_size]u8 = @splat(0);
     segment.format_name(index, &name);

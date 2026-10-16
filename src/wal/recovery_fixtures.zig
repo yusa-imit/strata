@@ -8,9 +8,11 @@ const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 const Io = std.Io;
+const file_mod = @import("../file/file.zig");
 const frame = @import("frame.zig");
 const recovery = @import("recovery.zig");
 const rfx = @import("reader_fixtures.zig");
+const s = @import("segment.zig");
 const sfx = @import("segment_fixtures.zig");
 const wfx = @import("writer_fixtures.zig");
 
@@ -44,14 +46,14 @@ pub const Model = struct {
     const vtable: recovery.Apply.VTable = .{ .apply = apply_fn };
 
     pub fn target(self: *Model) recovery.Apply {
-        assert(self.count <= records_max);
-        assert(self.fail_at >= 0);
+        assert(self.count < records_max);
+        assert(@intFromError(self.fail_with) != 0);
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     fn apply_fn(ptr: *anyopaque, io: Io, f: frame.Frame) recovery.ApplyError!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
-        assert(self.count <= records_max);
+        assert(self.count < records_max);
         assert(f.payload.len <= 16);
         _ = io;
         if (self.count == self.fail_at) return self.fail_with;
@@ -84,11 +86,27 @@ pub const Model = struct {
     }
 };
 
-pub fn options(from_lsn: Lsn, segments_max: u32) recovery.ReplayOptions {
+pub fn options(
+    from_lsn: Lsn,
+    segments_max: u32,
+    policy: file_mod.SyncPolicy,
+) recovery.ReplayOptions {
     assert(lsn1 == 1);
     assert(segments_max >= 1);
+    const segment_options: s.Options = .{ .segments_max = segments_max, .sync_policy = policy };
+    return .{ .from_lsn = from_lsn, .segment_options = segment_options };
+}
+
+pub fn replay_policy(
+    dir: Io.Dir,
+    model: *Model,
+    from_lsn: Lsn,
+    policy: file_mod.SyncPolicy,
+) recovery.ReplayError!recovery.Result {
+    assert(model.count < records_max);
     assert(from_lsn < frame.lsn_limit);
-    return .{ .from_lsn = from_lsn, .segment = rfx.opts(segments_max) };
+    const opts = options(from_lsn, 4, policy);
+    return recovery.Recovery.replay(testing.io, testing.allocator, dir, model.target(), opts);
 }
 
 pub fn replay(
@@ -98,8 +116,8 @@ pub fn replay(
     segments_max: u32,
 ) recovery.ReplayError!recovery.Result {
     assert(segments_max >= 1);
-    assert(model.count <= records_max);
-    const opts = options(from_lsn, segments_max);
+    assert(model.count < records_max);
+    const opts = options(from_lsn, segments_max, .none);
     return recovery.Recovery.replay(testing.io, testing.allocator, dir, model.target(), opts);
 }
 
@@ -112,7 +130,7 @@ pub fn replay_ok(dir: Io.Dir, model: *Model, from_lsn: Lsn) !Lsn {
 }
 
 pub fn expect_replay_error(want: anyerror, dir: Io.Dir, from_lsn: Lsn, segments_max: u32) !void {
-    assert(from_lsn < frame.lsn_limit);
+    assert(segments_max >= 1);
     assert(want != error.OutOfMemory);
     var model: Model = .{};
     try testing.expectError(want, replay(dir, &model, from_lsn, segments_max));

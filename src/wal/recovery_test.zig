@@ -87,16 +87,21 @@ test "recovery: a torn tail at every cut is truncated and the log stays appendab
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var cut: u32 = fx.f2_end + 1;
-    while (cut < fx.f3_end) : (cut += 1) {
-        try fx.put_three(tmp.dir, cut);
-        var model: Model = .{};
-        try testing.expectEqual(fx.lsn2, try fx.replay_ok(tmp.dir, &model, 0));
-        try model.expect_records(&.{ fx.lsn1, fx.lsn2 }, &.{ pa, pb });
-        try fx.expect_len(tmp.dir, 1, fx.f2_end);
-        try fx.expect_writer_continues(tmp.dir, fx.lsn3);
+    var cuts: u32 = 0;
+    for (sfx.policies) |policy| {
+        var cut: u32 = fx.f2_end + 1;
+        while (cut < fx.f3_end) : (cut += 1) {
+            try fx.put_three(tmp.dir, cut);
+            var model: Model = .{};
+            const got = try fx.replay_policy(tmp.dir, &model, 0, policy);
+            try testing.expectEqual(fx.lsn2, got.last_lsn);
+            try model.expect_records(&.{ fx.lsn1, fx.lsn2 }, &.{ pa, pb });
+            try fx.expect_len(tmp.dir, 1, fx.f2_end);
+            try fx.expect_writer_continues(tmp.dir, fx.lsn3);
+            cuts += 1;
+        }
     }
-    try testing.expectEqual(fx.f3_end, cut);
+    try testing.expectEqual(@as(u32, 4 * 23), cuts);
 }
 
 test "recovery: a torn tail inside the first frame leaves an empty appendable log" {
@@ -149,14 +154,17 @@ test "recovery: a partial newest header is deleted, an unwritten one is left to 
 
     var image: [256]u8 = undefined;
     const n = rfx.build(&image, 1, 1, &.{ pa, pb });
-    try sfx.put_file(tmp.dir, 1, image[0..n], n);
-    const header = sfx.header_of(2, fx.lsn3);
-    try sfx.put_file(tmp.dir, 2, header[0..10], 10);
-    var model: Model = .{};
-    try testing.expectEqual(fx.lsn2, try fx.replay_ok(tmp.dir, &model, 0));
-    try testing.expectEqual(@as(u32, 2), model.count);
-    try sfx.expect_open_error(error.FileNotFound, tmp.dir, 2);
-    try fx.expect_writer_continues(tmp.dir, fx.lsn3);
+    for (sfx.policies) |policy| {
+        try sfx.put_file(tmp.dir, 1, image[0..n], n);
+        const header = sfx.header_of(2, fx.lsn3);
+        try sfx.put_file(tmp.dir, 2, header[0..10], 10);
+        var model: Model = .{};
+        const got = try fx.replay_policy(tmp.dir, &model, 0, policy);
+        try testing.expectEqual(fx.lsn2, got.last_lsn);
+        try testing.expectEqual(@as(u32, 2), model.count);
+        try sfx.expect_open_error(error.FileNotFound, tmp.dir, 2);
+        try fx.expect_writer_continues(tmp.dir, fx.lsn3);
+    }
 }
 
 test "recovery: an unwritten newest segment stays and the writer rewrites it" {
@@ -201,14 +209,74 @@ test "recovery: a damaged length field is never truncated" {
     const f = try sfx.raw_open(tmp.dir, 1);
     defer f.close(testing.io);
 
-    try sfx.flip_bit(f, fx.f1_end + 1, 0);
-    var model: Model = .{};
-    const got = fx.replay(tmp.dir, &model, 0, 4);
-    if (got) |_| return error.TestUnexpectedResult else |err| switch (err) {
-        error.ChecksumMismatch, error.Corrupted => {},
-        else => return err,
-    }
+    try sfx.flip_bit(f, fx.f1_end, 0); // Frame 2's len 7 reads as 6; a valid frame follows.
+    try fx.expect_replay_error(error.ChecksumMismatch, tmp.dir, 0, 4);
     try sfx.expect_length(f, fx.f3_end);
+}
+
+test "recovery: a flipped bit in the last frame with nothing valid after it is truncated" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try fx.put_three(tmp.dir, fx.f3_end);
+    const f = try sfx.raw_open(tmp.dir, 1);
+    defer f.close(testing.io);
+
+    try sfx.flip_bit(f, fx.f3_end - 2, 1);
+    var model: Model = .{};
+    try testing.expectEqual(fx.lsn2, try fx.replay_ok(tmp.dir, &model, 0));
+    try testing.expectEqual(@as(u32, 2), model.count);
+    try sfx.expect_length(f, fx.f2_end);
+}
+
+test "recovery: a from_lsn that is no LSN is Corrupted" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try fx.put_three(tmp.dir, fx.f3_end);
+    try fx.expect_replay_error(error.Corrupted, tmp.dir, frame.lsn_limit, 4);
+    try fx.expect_replay_error(error.Corrupted, tmp.dir, std.math.maxInt(u64), 4);
+    try fx.expect_len(tmp.dir, 1, fx.f3_end);
+}
+
+test "recovery: a torn frame in a non-newest segment is never truncated" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var image: [256]u8 = undefined;
+    const n = rfx.build(&image, 1, 1, &.{ pa, pb });
+    const mid: fx.Lsn = 1 + (n - fx.header_size);
+    var next: [256]u8 = undefined;
+    const m = rfx.build(&next, 2, mid, &.{pc});
+    const cuts = [_]u32{ n - 3, n - 1 };
+    for (cuts) |cut| {
+        try sfx.put_file(tmp.dir, 1, image[0..cut], cut);
+        try sfx.put_file(tmp.dir, 2, next[0..m], m);
+        try fx.expect_replay_error(error.Corrupted, tmp.dir, 0, 4);
+        try fx.expect_replay_error(error.Corrupted, tmp.dir, fx.lsn2, 4);
+        try fx.expect_len(tmp.dir, 1, cut);
+        try fx.expect_len(tmp.dir, 2, m);
+    }
+    try sfx.put_file(tmp.dir, 1, image[0..n], n); // Zeroed, not cut: same length as written.
+    @memset(image[n - 3 .. n], 0);
+    try sfx.put_file(tmp.dir, 1, image[0..n], n);
+    try fx.expect_replay_error(error.ChecksumMismatch, tmp.dir, 0, 4);
+    try fx.expect_len(tmp.dir, 1, n);
+    try fx.expect_len(tmp.dir, 2, m);
+}
+
+test "recovery: a partial header in a non-newest segment is never deleted" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const mid = try rfx.put_segment(tmp.dir, 1, 1, &.{pa});
+    const header = sfx.header_of(2, mid);
+    try sfx.put_file(tmp.dir, 2, header[0..10], 10);
+    _ = try rfx.put_segment(tmp.dir, 3, mid + 24, &.{pb});
+    try fx.expect_replay_error(error.Corrupted, tmp.dir, 0, 4);
+    try fx.expect_len(tmp.dir, 2, 10);
+    try fx.expect_len(tmp.dir, 3, fx.header_size + 24);
+    try fx.expect_len(tmp.dir, 1, fx.header_size + 22);
 }
 
 test "recovery: replaying twice into a model equals replaying once" {
@@ -258,11 +326,15 @@ test "recovery: SegmentLimit and WouldBlock are returned, nothing is repaired" {
     defer tmp.cleanup();
 
     const mid = try rfx.put_segment(tmp.dir, 1, 1, &.{pa});
-    _ = try rfx.put_segment(tmp.dir, 2, mid, &.{pb});
+    var image: [256]u8 = undefined;
+    const n = rfx.build(&image, 2, mid, &.{pb});
+    try sfx.put_file(tmp.dir, 2, image[0 .. n - 5], n - 5); // Torn: repairable if it were read.
     try fx.expect_replay_error(error.SegmentLimit, tmp.dir, 0, 1);
-    var w: wfx.Writer = undefined;
-    try wfx.open_ok(&w, tmp.dir, wfx.opts(4, 1 << 20));
-    defer w.deinit(testing.io, testing.allocator);
+    try fx.expect_len(tmp.dir, 2, n - 5);
+    const seg = try s.Segment.open(testing.io, tmp.dir, 2, sfx.opts(.none));
+    defer seg.close(testing.io);
 
     try fx.expect_replay_error(error.WouldBlock, tmp.dir, 0, 4);
+    try fx.expect_len(tmp.dir, 2, n - 5);
+    try fx.expect_len(tmp.dir, 1, fx.header_size + 22);
 }

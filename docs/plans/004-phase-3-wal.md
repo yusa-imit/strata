@@ -76,6 +76,8 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       (new `PageManager.set_wal_lsn`), `sync`, delete segments wholly below C. A sync fences
       each step, so a crash anywhere recovers from the old or new `wal_lsn`. Verify: `FaultIo`
       failing each of the 5 steps → replay reaches the model state; active segment never deleted.
+      Also here: checking the frame at `wal_lsn` (intact `checkpoint`, else `Corrupted`) and
+      deriving `redo_lsn` is this item's job, not `Recovery.replay`'s; it takes the `from_lsn`.
 - [ ] **3E crash-recovery property tests** (`src/testing/wal_recovery_test.zig`). Seeded model:
       random appends, commits, pool page edits, checkpoints; crash at a random write (`FaultIo`
       stop, then a torn or truncated cut of the unsynced tail); recover; every committed LSN
