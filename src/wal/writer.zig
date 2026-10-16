@@ -355,6 +355,7 @@ pub const Writer = struct {
         self.failed = true;
         try self.current.sync(io);
         self.failed = false;
+        self.group.batch_error = null;
         self.durable_lsn = self.last_lsn;
         self.stats.syncs += 1;
     }
@@ -385,12 +386,17 @@ pub const Writer = struct {
         assert(target >= upto);
         const outcome: group_commit.Outcome = if (self.current.sync(io)) |_|
             .{ .synced = target }
-        else |err|
-            .{ .failed = err };
+        else |err| switch (err) {
+            // Canceled is not an I/O failure: nothing was learned about the disk, so the writer
+            // stays usable and a waiting committer takes over as leader.
+            error.Canceled => .abandoned,
+            else => .{ .failed = err },
+        };
         self.group.finish(io, &self.stats, &self.durable_lsn, &self.failed, outcome);
         switch (outcome) {
             .failed => |err| return err,
-            .synced, .abandoned => {},
+            .abandoned => return error.Canceled,
+            .synced => {},
         }
         assert(self.durable_lsn >= upto);
     }

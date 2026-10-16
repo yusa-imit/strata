@@ -13,6 +13,7 @@ const fault_io = @import("../testing/fault_io.zig");
 const frame = @import("frame.zig");
 const fx = @import("writer_fixtures.zig");
 
+const group_commit = @import("group_commit.zig");
 const writer_mod = @import("writer.zig");
 const Writer = fx.Writer;
 const Lsn = fx.Lsn;
@@ -201,4 +202,67 @@ test "commit: no allocation after init" {
     try run_batch(&w, testing.io, &slots);
     for (slots) |slot| try testing.expectEqual(@as(?anyerror, null), slot.result);
     try testing.expectEqual(allocs, failing.alloc_index);
+}
+
+const GroupFixture = struct {
+    group: group_commit.Group = .{},
+    stats: group_commit.Stats = .{},
+    durable_lsn: Lsn = 0,
+    failed: bool = false,
+
+    fn enter(self: *GroupFixture, upto: Lsn) group_commit.Error!group_commit.Turn {
+        assert(upto >= frame.lsn_first);
+        assert(self.durable_lsn <= upto or self.durable_lsn > 0);
+        return self.group.enter(testing.io, &self.stats, upto, &self.durable_lsn, &self.failed);
+    }
+
+    fn finish(self: *GroupFixture, outcome: group_commit.Outcome) void {
+        assert(self.group.leader_active);
+        assert(self.stats.syncs <= self.stats.commits + 1);
+        self.group.finish(
+            testing.io,
+            &self.stats,
+            &self.durable_lsn,
+            &self.failed,
+            outcome,
+        );
+    }
+};
+
+test "group: a durable LSN is done, an undurable one leads, success wakes and counts" {
+    var fixture: GroupFixture = .{ .durable_lsn = 50 };
+    try testing.expectEqual(group_commit.Turn.done, try fixture.enter(40)); // Durable follower.
+    try testing.expectEqual(@as(u64, 1), fixture.stats.commits);
+    try testing.expectEqual(group_commit.Turn.leader, try fixture.enter(60));
+    try testing.expect(fixture.group.leader_active);
+    fixture.finish(.{ .synced = 80 });
+    try testing.expect(!fixture.group.leader_active);
+    try testing.expectEqual(@as(Lsn, 80), fixture.durable_lsn);
+    try testing.expectEqual(@as(u64, 1), fixture.stats.syncs);
+    try testing.expectEqual(@as(u64, 2), fixture.stats.commits);
+    try testing.expectEqual(group_commit.Turn.done, try fixture.enter(60));
+}
+
+test "group: a failed batch latches and later committers get Failed, not the batch error" {
+    var fixture: GroupFixture = .{};
+    try testing.expectEqual(group_commit.Turn.leader, try fixture.enter(10));
+    fixture.finish(.{ .failed = error.InputOutput });
+    try testing.expect(fixture.failed);
+    try testing.expectEqual(@as(?group_commit.Error, error.InputOutput), fixture.group.batch_error);
+    try testing.expectEqual(@as(Lsn, 0), fixture.durable_lsn);
+    try testing.expectError(error.Failed, fixture.enter(10)); // Arrived after the batch.
+    try testing.expectError(error.Failed, fixture.enter(20));
+    try testing.expectEqual(@as(u64, 0), fixture.stats.commits);
+}
+
+test "group: an abandoned leader hands leadership to the next committer" {
+    var fixture: GroupFixture = .{};
+    try testing.expectEqual(group_commit.Turn.leader, try fixture.enter(10));
+    fixture.finish(.abandoned);
+    try testing.expect(!fixture.failed); // Not latched: nothing was learned about the disk.
+    try testing.expectEqual(@as(u64, 0), fixture.stats.syncs);
+    try testing.expectEqual(@as(Lsn, 0), fixture.durable_lsn);
+    try testing.expectEqual(group_commit.Turn.leader, try fixture.enter(10));
+    fixture.finish(.{ .synced = 10 });
+    try testing.expectEqual(@as(Lsn, 10), fixture.durable_lsn);
 }

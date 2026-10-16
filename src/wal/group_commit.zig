@@ -57,9 +57,11 @@ pub const Group = struct {
         failed: *const bool,
     ) Error!Turn {
         assert(upto < frame.lsn_limit);
-        assert(!g.leader_active or g.batch_error == null);
+        assert(rounds_max > 0);
         try g.mutex.lock(io);
         defer g.mutex.unlock(io);
+
+        assert(!g.leader_active or g.batch_error == null);
 
         var waited = false;
         for (0..rounds_max) |_| {
@@ -78,7 +80,9 @@ pub const Group = struct {
             waited = true;
             try g.cond.wait(io, &g.mutex);
         }
-        unreachable; // See `rounds_max`: a waiter is resolved long before the bound.
+        // See `rounds_max`: a waiter is resolved long before the bound; if it is ever reached
+        // the batch made no progress, which is a failure of this commit, not a hang.
+        return error.Failed;
     }
 
     /// The leader's result: `target` is durable (`null`), or its sync failed with `err`, or it was
@@ -122,11 +126,3 @@ pub const Outcome = union(enum) {
     /// Canceled during the window: nothing synced, leadership returns to the waiters.
     abandoned,
 };
-
-test "group: a fresh group has no leader and no error" {
-    const g: Group = .{};
-    try std.testing.expect(!g.leader_active);
-    try std.testing.expectEqual(@as(?file.SyncError, null), g.batch_error);
-    const stats: Stats = .{};
-    try std.testing.expectEqual(@as(u64, 0), stats.syncs + stats.commits);
-}
