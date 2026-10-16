@@ -55,7 +55,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       or `ConcurrencyUnavailable` path in library code (ADR-0001 risk); `error.Canceled` stays
       in `CommitError`. Verify: 8 committers under `std.testing.io` → `stats.syncs` < commits,
       each returns with `durable_lsn >= upto`; a failed leader sync reaches its whole batch.
-- [ ] **`wal/recovery.zig` — replay** (`src/wal/`). `Recovery.replay` from `options.from_lsn`
+- [x] **`wal/recovery.zig` — replay** (`src/wal/`). `Recovery.replay` from `options.from_lsn`
       through the §4.5 `Apply` vtable; truncates a torn tail per ADR-0003, returns the last good
       LSN; mid-log damage → `Corrupted`, never a silent skip. Verify: replay twice into a model
       = once (REALM.md idempotence); `Writer.init` succeeds after tail truncation; a bad frame
@@ -76,6 +76,8 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       (new `PageManager.set_wal_lsn`), `sync`, delete segments wholly below C. A sync fences
       each step, so a crash anywhere recovers from the old or new `wal_lsn`. Verify: `FaultIo`
       failing each of the 5 steps → replay reaches the model state; active segment never deleted.
+      Also here: checking the frame at `wal_lsn` (intact `checkpoint`, else `Corrupted`) and
+      deriving `redo_lsn` is this item's job, not `Recovery.replay`'s; it takes the `from_lsn`.
 - [ ] **3E crash-recovery property tests** (`src/testing/wal_recovery_test.zig`). Seeded model:
       random appends, commits, pool page edits, checkpoints; crash at a random write (`FaultIo`
       stop, then a torn or truncated cut of the unsynced tail); recover; every committed LSN

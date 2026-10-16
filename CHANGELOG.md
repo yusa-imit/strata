@@ -9,6 +9,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `wal`: `wal.recovery`, `Recovery.replay`: reads the log from `from_lsn` (skipping and checking
+  earlier frames; `Corrupted` when no frame starts there), applies each intact frame through an
+  `Apply` vtable, truncates a torn tail (`setLength` + sync) or deletes a partial newest header
+  (+ directory sync), never repairs `ChecksumMismatch`/`Corrupted`; returns the last intact LSN
+  (plan 004, item 7).
 - `docs`: ADR-0003, WAL format v1 (24-byte segment header, 17-byte frames with a CRC32C seeded
   by LSN, byte-position LSNs, torn-tail rule, golden bytes); PRD §4.5 links it and uses
   eight-hex-digit segment names (plan 004, item 1).
