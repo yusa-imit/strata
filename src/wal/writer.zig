@@ -39,7 +39,10 @@
 //! group commit item grows it into a batch) from the `gpa` it is given, plus the reader's
 //! temporary allocations, freed before `init` returns. `append`, `sync` and `position` allocate
 //! nothing, and no allocator is stored: `deinit` takes the same `gpa` back. `io` is per call
-//! (ADR-0001). Not thread-safe: one caller (the group commit item adds the sharing).
+//! (ADR-0001). Thread-safety: `commit` calls may overlap each other (group commit, see
+//! `group_commit.zig`); `append`, `sync` and `deinit` are for one caller and must not overlap a
+//! `commit`. `commit` allocates nothing and has no batch buffer: `append` writes through, so
+//! `group_commit_bytes_max` bounds the pending bytes a leader waits for, not a buffer.
 //! Cost sketch: `init` reads the log once (see `reader.zig`); `append` is one CRC32C pass and
 //! one positional write of the frame, plus a rotation (two syncs and a directory sync) once per
 //! segment; `sync` is one file sync, or nothing when the log is already durable.
@@ -48,7 +51,7 @@
 //! a `File` method, so a durable segment is also durable by name. Under `SyncPolicy.none`
 //! nothing is synced, the directory included. Not here: deleting reclaimed segments
 //! (checkpoint, item 10, must tell the writer how many it removed so `segments_max` counts only
-//! live ones) and group commit (item 6).
+//! live ones).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -57,6 +60,7 @@ const Allocator = std.mem.Allocator;
 const file = @import("../file/file.zig");
 const platform = @import("../file/platform.zig");
 const frame = @import("frame.zig");
+const group_commit = @import("group_commit.zig");
 const reader = @import("reader.zig");
 const segment = @import("segment.zig");
 
@@ -72,6 +76,12 @@ pub const Options = struct {
     /// A segment that already holds a frame takes no frame that would end past this size.
     /// In `(segment_header_size, segment_bytes_limit - frame_bytes_max]`.
     segment_bytes_max: u64,
+    /// How long the first committer of a batch waits for more committers before it syncs.
+    /// Zero syncs at once.
+    group_commit_window: Io.Duration = .zero,
+    /// Pending bytes (`next_lsn - durable_lsn`) at which the leader skips the window. At least
+    /// `frame_bytes_max`, so one full frame never waits.
+    group_commit_bytes_max: u32 = frame.frame_bytes_max,
 };
 
 const LogError = file.OpenError || file.TryLockError || file.LengthError ||
@@ -82,6 +92,10 @@ pub const InitError = LogError || reader.OpenError || error{RecoveryRequired};
 pub const AppendError = error{ Failed, PayloadTooLarge, InvalidFrame, LsnExhausted } ||
     segment.LimitError || segment.CreateError || file.WriteError || file.SyncError;
 pub const SyncError = error{Failed} || file.SyncError;
+/// `commit`: `Failed` when the writer is latched, the leader's sync error for its batch,
+/// `Canceled` (part of `file.SyncError`) when the wait or the window was canceled.
+pub const CommitError = group_commit.Error;
+pub const Stats = group_commit.Stats;
 
 /// Frames are at least a header, so a log of `segments_max` full segments holds at most this
 /// many: the bound of the tail scan in `init`.
@@ -101,6 +115,8 @@ fn options_check(options: Options) void {
     assert(options.segments_max >= 1);
     assert(options.segment_bytes_max > segment.segment_header_size);
     assert(options.segment_bytes_max <= segment.segment_bytes_limit - frame.frame_bytes_max);
+    assert(options.group_commit_bytes_max >= frame.frame_bytes_max);
+    assert(options.group_commit_window.nanoseconds >= 0);
 }
 
 fn segment_options(options: Options) segment.Options {
@@ -223,6 +239,9 @@ pub const Writer = struct {
     /// LSN of the last frame known durable, or 0; never above `last_lsn`.
     durable_lsn: Lsn,
     failed: bool,
+    /// Leader/follower state of `commit`.
+    group: group_commit.Group,
+    stats: Stats,
 
     /// Finds the end of the log in `dir` (opened with iteration) and takes its newest segment,
     /// creating segment 1 in an empty directory. `RecoveryRequired` for a torn tail;
@@ -263,6 +282,8 @@ pub const Writer = struct {
             .last_lsn = tail.last_lsn,
             .durable_lsn = tail.last_lsn,
             .failed = false,
+            .group = .{},
+            .stats = .{},
         };
         target.check_invariants();
     }
@@ -334,7 +355,50 @@ pub const Writer = struct {
         self.failed = true;
         try self.current.sync(io);
         self.failed = false;
+        self.group.batch_error = null;
         self.durable_lsn = self.last_lsn;
+        self.stats.syncs += 1;
+    }
+
+    /// Returns when `durable_lsn >= upto` (group commit). The first committer whose LSN is not
+    /// durable leads: it waits `group_commit_window` unless `group_commit_bytes_max` bytes are
+    /// pending, syncs once and wakes the followers, who return when their LSN is durable. A
+    /// failed leader sync returns its error to the leader and every follower waiting on it,
+    /// latches the writer (later calls: `Failed`) and is not retried. `upto` must be an LSN
+    /// returned by `append` (or 0), so a batch always ends at or past it. Commits may overlap
+    /// each other; `append`, `sync` and `deinit` must not overlap a `commit`, the caller
+    /// serializes them. No allocation, no `io.concurrent`.
+    pub fn commit(self: *Writer, io: Io, upto: Lsn) CommitError!void {
+        assert(upto <= self.last_lsn);
+        assert(self.buf.len == frame.frame_bytes_max);
+        const turn = try self.group.enter(io, &self.stats, upto, &self.durable_lsn, &self.failed);
+        if (turn == .done) return;
+
+        const pending = self.next_lsn - self.durable_lsn;
+        const window = self.options.group_commit_window;
+        if (pending < self.options.group_commit_bytes_max and window.nanoseconds > 0) {
+            io.sleep(window, .awake) catch |err| {
+                self.group.finish(io, &self.stats, &self.durable_lsn, &self.failed, .abandoned);
+                return err;
+            };
+        }
+        const target = self.last_lsn;
+        assert(target >= upto);
+        const outcome: group_commit.Outcome = if (self.current.sync(io)) |_|
+            .{ .synced = target }
+        else |err| switch (err) {
+            // Canceled is not an I/O failure: nothing was learned about the disk, so the writer
+            // stays usable and a waiting committer takes over as leader.
+            error.Canceled => .abandoned,
+            else => .{ .failed = err },
+        };
+        self.group.finish(io, &self.stats, &self.durable_lsn, &self.failed, outcome);
+        switch (outcome) {
+            .failed => |err| return err,
+            .abandoned => return error.Canceled,
+            .synced => {},
+        }
+        assert(self.durable_lsn >= upto);
     }
 
     /// Section 9 rotation: sync the full segment, create the next one, then hand the lock over.
@@ -381,4 +445,6 @@ test {
     _ = @import("writer_test.zig");
     _ = @import("writer_tail_test.zig");
     _ = @import("writer_fault_test.zig");
+    _ = @import("writer_commit_test.zig");
+    _ = @import("group_commit.zig");
 }

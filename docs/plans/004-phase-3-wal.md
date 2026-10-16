@@ -49,7 +49,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       truncation is recovery's job); batch buffer allocated in `init`; `sync` per `SyncPolicy`;
       rotate at `segment_bytes_max`. Verify: reopen continues the LSN; `FaultIo` failing sync
       leaves `durable_lsn` unchanged; `FailingAllocator` armed after `init`; 4 KiB rotation.
-- [ ] **Group commit — `Writer.commit`** (`src/wal/writer.zig`). Leader/follower: the first
+- [x] **Group commit — `Writer.commit`** (`src/wal/writer.zig`). Leader/follower: the first
       committer waits `group_commit_window` (`io.sleep`) or `group_commit_bytes_max`, syncs once,
       wakes followers via `Io.Mutex`/`Io.Condition`. No background flusher, so no `io.concurrent`
       or `ConcurrencyUnavailable` path in library code (ADR-0001 risk); `error.Canceled` stays

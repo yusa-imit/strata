@@ -262,8 +262,9 @@ it is reopened through recovery.
 at `init`. Each segment `File` carries it as data. It is deliberately not a per-`commit`
 argument: one `durable_lsn` must mean one thing. Under `.none`, "durable" means "handed to the
 OS": process crashes are covered, power loss is not. Every blocking call takes `io` (ADR-0001).
-Nothing allocates after `init`: the reader buffer is `frame_bytes_max`, and the writer batch is
-`group_commit_bytes_max ≥ frame_bytes_max` (asserted).
+Nothing allocates after `init`: the reader buffer is `frame_bytes_max`. The writer has no batch
+buffer (`append` writes through); `group_commit_bytes_max ≥ frame_bytes_max` (asserted) is the
+pending-byte level at which a group-commit leader stops waiting for more committers.
 
 **Rotation.** Before appending an `n`-byte frame to a segment of length `L`: if the segment
 already holds a frame and `L + n > Options.segment_bytes_max`, the writer:
