@@ -36,6 +36,13 @@ All notable changes to this project are documented in this file. The format foll
   `SegmentIndexExhausted`; one `gpa` allocation in `init`, none after). `file/platform.zig`
   gains `sync_dir`, called after every segment create (ADR-0003 open question 4), and
   `testing.fault_io` can fail syncs (`Plan.sync_fail_after`) (plan 004, item 5).
+- `wal`: `Writer.commit(io, upto)`, group commit (`wal/group_commit.zig`): the first committer
+  whose LSN is not durable leads, waits `group_commit_window` (`io.sleep`) unless
+  `group_commit_bytes_max` bytes are pending, syncs once and wakes the followers through
+  `Io.Mutex`/`Io.Condition`; a failed leader sync returns its error to the whole batch and
+  latches the writer; `error.Canceled` stays in `CommitError`; `Writer.stats` counts `syncs`
+  and `commits`; no allocation, no `io.concurrent`. `testing.fault_io` forwards the futex and
+  `sleep` slots (plan 004, item 6).
 
 ## [0.4.0] - 2026-10-13
 
