@@ -60,7 +60,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       LSN; mid-log damage → `Corrupted`, never a silent skip. Verify: replay twice into a model
       = once (REALM.md idempotence); `Writer.init` succeeds after tail truncation; a bad frame
       followed by a valid one → `Corrupted`.
-- [ ] **Pool WAL-before-data gate** (`src/cache/`). Safety: today a page whose `lsn` is past the
+- [x] **Pool WAL-before-data gate** (`src/cache/`). Safety: today a page whose `lsn` is past the
       durable WAL can be written back, and a crash leaves a page no log explains. Add
       `set_durable_lsn` (no `io`, cannot fail); write-back skips frames with `lsn` above it and
       leaves them dirty; all victims skipped → `PoolExhausted`. Off until first set, so v0.4

@@ -18,8 +18,13 @@
 //! inside `fetch`/`fetchForUpdate`, before the page table entry is removed, and `flushAll`.
 //! `release` never writes. A failed write-back surfaces from the call that needed it and leaves
 //! the frame resident, dirty and unchanged, so the bytes are not lost and a later call retries.
-//! Who stamps what: the caller owns the page type byte and the lsn (`set_lsn`; WAL-before-data
-//! ordering is plan 004's job); `PageManager.write` stamps magic, version and the page-id-seeded
+//! WAL-before-data (plan 004): `set_durable_lsn` turns on a gate (off until its first call, so
+//! v0.4 callers see no change). Once on, neither eviction nor `flushAll` writes a dirty frame
+//! whose page lsn is above the durable bound: it stays dirty and resident, eviction scans past
+//! it, `flushAll` skips it (counted in `Stats.gated`, not an error), and a pool whose every
+//! unpinned frame is gated or pinned returns `PoolExhausted` until the bound moves.
+//! Who stamps what: the caller owns the page type byte and the lsn (`set_lsn`);
+//! `PageManager.write` stamps magic, version and the page-id-seeded
 //! checksum from `header.peek` of the frame at write-back time, so a frame's checksum is stale
 //! while it is dirty. The pool never calls `sync`; durability is the caller's call.
 //! `deinit` asserts zero pinned and zero dirty frames: `flushAll` (or `discardAll`) first.
@@ -67,11 +72,14 @@ pub const PageGuard = guard.PageGuard;
 /// preconditions; a miss that fails to load still counts. `evictions` counts pages dropped to
 /// make room, whether or not the following load succeeded (a victim whose write-back fails is
 /// not evicted). `writebacks` counts successful page writes, from eviction and `flushAll`.
+/// `gated` counts dirty frames `flushAll` left unwritten because their lsn was above the
+/// durable bound, once per frame per call (eviction scans past gated frames without counting).
 pub const Stats = struct {
     hits: u64,
     misses: u64,
     evictions: u64,
     writebacks: u64,
+    gated: u64,
 };
 
 pub const Frame = struct {
@@ -109,6 +117,10 @@ pub const BufferPool = struct {
     empty_count: u32,
     /// Frames with `dirty` set, kept in step by `mark_dirty` and `write_back`.
     dirty_count: u32,
+    /// WAL-before-data gate: once `gate_on`, a dirty frame whose page lsn is above `durable_lsn`
+    /// is never written back. Off until the first `set_durable_lsn`.
+    gate_on: bool,
+    durable_lsn: u64,
     counters: Stats,
 
     /// Allocates every buffer the pool will ever use and builds it in place at `target`. The
@@ -148,7 +160,9 @@ pub const BufferPool = struct {
             .hand = 0,
             .empty_count = options.frames_max,
             .dirty_count = 0,
-            .counters = .{ .hits = 0, .misses = 0, .evictions = 0, .writebacks = 0 },
+            .gate_on = false,
+            .durable_lsn = 0,
+            .counters = .{ .hits = 0, .misses = 0, .evictions = 0, .writebacks = 0, .gated = 0 },
         };
         assert(target.frames.len == options.frames_max);
         assert(target.slab.len == slab_len);
@@ -157,8 +171,9 @@ pub const BufferPool = struct {
     /// Frees the buffers `init` allocated; `gpa` must be the allocator given to `init`.
     /// Preconditions: no guard is outstanding and no frame is dirty. Dropping dirty pages is a
     /// programmer error, asserted here: call `flushAll` to keep them or `discardAll` to drop
-    /// them on purpose. Plain asserts: the kingdom has no `stdx.assert_always` yet, so in
-    /// ReleaseFast a violation silently loses dirty data; build with ReleaseSafe (REALM.md).
+    /// them on purpose (frames the WAL gate holds back stay dirty: raise the bound first).
+    /// Plain asserts: the kingdom has no `stdx.assert_always` yet, so in ReleaseFast a
+    /// violation silently loses dirty data; build with ReleaseSafe (REALM.md).
     pub fn deinit(self: *BufferPool, gpa: Allocator) void {
         assert(self.pinned_count() == 0);
         assert(self.dirty_count == 0);
@@ -201,14 +216,40 @@ pub const BufferPool = struct {
     /// `markDirty` again, because the flush cleared the flag. Stops at the first failed write:
     /// that frame and every later dirty one stay dirty and a retry continues from there. Does
     /// not `sync` the file. Cost: one page write per dirty frame, `frames_max` frame visits.
+    /// With the WAL gate on (`set_durable_lsn`), a dirty frame whose lsn is above the bound is
+    /// skipped, not an error: it stays dirty and resident, `stats().gated` counts it, and a
+    /// later call writes it once the bound has moved. So after a successful `flushAll` every
+    /// dirty frame left is gated; with the gate off none is.
     pub fn flushAll(self: *BufferPool, io: Io) FlushError!void {
         assert(self.frames.len == self.frames_max);
         assert(self.dirty_count <= self.frames_max);
+        var skipped: u32 = 0;
         for (0..self.frames_max) |index| {
             if (!self.frames[index].dirty) continue;
+            if (self.gate_blocks(@intCast(index))) {
+                skipped += 1;
+                continue;
+            }
             try self.write_back(io, @intCast(index));
         }
-        assert(self.dirty_count == 0);
+        self.counters.gated += skipped;
+        assert(self.dirty_count == skipped);
+        assert(self.gate_on or skipped == 0);
+    }
+
+    /// Raises the WAL-before-data bound to `lsn` and turns the gate on (the first call). From
+    /// then on write-back, from eviction and `flushAll`, skips a dirty frame whose page lsn is
+    /// above the bound and leaves it dirty and resident; a page lsn equal to the bound passes.
+    /// Pass the writer's `durable_lsn` after each sync. Pure bookkeeping: no `io`, cannot fail,
+    /// nothing is written now. Precondition: `lsn` is not below the previous bound (the log's
+    /// durable point never moves back); a plain assert, like the rest of the caller contract.
+    pub fn set_durable_lsn(self: *BufferPool, lsn: u64) void {
+        assert(!self.gate_on or lsn >= self.durable_lsn);
+        assert(self.dirty_count <= self.frames_max);
+        self.gate_on = true;
+        self.durable_lsn = lsn;
+        assert(self.gate_on);
+        assert(self.durable_lsn == lsn);
     }
 
     /// Empties the pool without writing anything: every dirty change is lost, every frame is
@@ -321,6 +362,19 @@ pub const BufferPool = struct {
         self.counters.writebacks += 1;
     }
 
+    /// True when the gate is on and frame `index` is dirty with a page lsn above the durable
+    /// bound, so it must not be written back yet. A clean frame is never blocked: dropping it
+    /// loses nothing.
+    fn gate_blocks(self: *const BufferPool, index: u32) bool {
+        assert(index < self.frames_max);
+        const frame = self.frames[index];
+        if (!self.gate_on or !frame.dirty) return false;
+        assert(frame.page_id != 0);
+        const start = @as(usize, index) * self.page_size;
+        const sealed = header.peek(self.slab[start..][0..self.page_size]);
+        return sealed.lsn > self.durable_lsn;
+    }
+
     fn pin_hit(self: *BufferPool, index: u32, updatable: bool) PageGuard {
         const frame = &self.frames[index];
         assert(frame.page_id != 0);
@@ -344,7 +398,7 @@ pub const BufferPool = struct {
 
     /// Picks the frame to load into: an empty one if any, else the CLOCK victim. Two sweeps of
     /// the hand are enough (the first clears every reference bit it passes), so more than
-    /// `2 * frames_max` visits means every frame is pinned.
+    /// `2 * frames_max` visits means every frame is pinned or gated (dirty above the WAL bound).
     fn victim_find(self: *BufferPool) error{PoolExhausted}!u32 {
         assert(self.hand < self.frames_max);
         if (self.empty_count > 0) {
@@ -357,6 +411,7 @@ pub const BufferPool = struct {
             self.hand = if (index + 1 == self.frames_max) 0 else index + 1;
             const frame = &self.frames[index];
             if (frame.pin_count > 0) continue;
+            if (self.gate_blocks(index)) continue; // Cannot be written back yet: not a victim.
             if (frame.referenced) {
                 frame.referenced = false;
                 continue;
@@ -386,6 +441,7 @@ pub const BufferPool = struct {
         const frame = &self.frames[index];
         assert(frame.pin_count == 0);
         assert(frame.page_id != 0 or !frame.dirty);
+        assert(!self.gate_blocks(index)); // `victim_find` never hands out a gated frame.
         if (frame.page_id == 0) return;
         if (frame.dirty) try self.write_back(io, index);
 
@@ -403,4 +459,5 @@ pub const BufferPool = struct {
 test {
     _ = @import("buffer_pool_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("buffer_pool_dirty_test.zig");
+    _ = @import("buffer_pool_gate_test.zig");
 }
