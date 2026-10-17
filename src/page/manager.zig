@@ -1,7 +1,9 @@
 //! Page manager (ADR-0002 §5, §7): owns one `file.File` of fixed-size, checksummed pages, moves
 //! whole pages between a caller buffer and the file, and hands out page ids through the trunk
 //! freelist: `allocate` pops (or grows the file, bounded by `Options.page_count_max`), `free`
-//! pushes, `sync` makes completed writes durable per the file's `SyncPolicy`.
+//! pushes, `ensure_page_count` grows the file without touching the freelist (WAL redo of a page
+//! the file does not have yet), `sync` makes completed writes durable per the file's
+//! `SyncPolicy`.
 //!
 //! Invariants: page 0 holds the file header and is owned by the manager (callers address pages
 //! `1 ..< page_count`); `page_size` is a valid power of two and equals the file header's; the
@@ -243,6 +245,26 @@ pub const PageManager = struct {
         assert(self.freelist_head != null);
     }
 
+    /// Grows the file so that `page_count >= count`, leaving the freelist alone (unlike
+    /// `allocate`, which reuses freed pages first). For redo, which must write a page id the
+    /// file does not have yet. The new pages read as `Unwritten` and belong to nobody, so they
+    /// are not on the freelist: a caller that ends up not using one leaks it. A `count` at or
+    /// below `page_count` changes nothing. Growth past `page_count_max` is `NoSpaceLeft`. Space
+    /// is reserved first, then published in page 0; on error the manager is unchanged.
+    /// Precondition: `count >= 1`.
+    pub fn ensure_page_count(self: *PageManager, io: Io, count: u32) AllocateError!void {
+        assert(count >= 1);
+        assert(self.page_count >= 1);
+        if (count <= self.page_count) return;
+        if (count > self.page_count_max) return error.NoSpaceLeft;
+        var scratch = [_]u8{0} ** header.page_size_max;
+        try self.file.preallocate(io, @as(u64, count) * self.page_size);
+        try self.write_file_header(io, &scratch, count, self.freelist_head);
+        self.page_count = count;
+        assert(self.page_count >= 2);
+        assert(self.page_count <= self.page_count_max);
+    }
+
     /// Makes every completed write durable per the file's `SyncPolicy` (a no-op for `.none`).
     pub fn sync(self: *PageManager, io: Io) SyncError!void {
         assert(self.page_count >= 1);
@@ -358,4 +380,5 @@ fn open_file_header(io: Io, handle: file.File, page_size: u32) OpenError!header.
 test {
     _ = @import("manager_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("manager_alloc_test.zig");
+    _ = @import("manager_grow_test.zig");
 }

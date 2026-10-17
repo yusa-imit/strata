@@ -66,7 +66,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       leaves them dirty; all victims skipped → `PoolExhausted`. Off until first set, so v0.4
       callers see no change. Verify: scripted eviction skips the frame; `flushAll` leaves it
       dirty until the bound moves; 8-size matrix green.
-- [ ] **Full-page-image redo** (`src/wal/redo.zig`). ADR-0002 §6's torn-page repair: a
+- [x] **Full-page-image redo** (`src/wal/redo.zig`). ADR-0002 §6's torn-page repair: a
       `PageRedo` `Apply` target writes a `page_image` frame through `PageManager` when the page
       fails to decode or has `lsn < frame.lsn`, else skips. When to log an image is the B+Tree's
       call (plan 005). Verify: torn page + image → restored; newer page untouched; replay twice

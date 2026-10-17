@@ -9,6 +9,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `wal`: `wal.redo`, `PageRedo`: an `Apply` target that restores a `page_image` frame through
+  `PageManager` when the page is torn, unwritten or has `lsn < frame.lsn` (else skips), re-stamps
+  it with `lsn = frame.lsn`, grows the file for a page id past `page_count`, ignores other frame
+  types; page 0, a size mismatch or a bad image is `Corrupted`, I/O errors and the file limit
+  are `Failed` (plan 004, item 9).
+- `page`: `PageManager.ensure_page_count(io, count)` grows the file to `count` pages without
+  touching the freelist (new pages read as `Unwritten`); `NoSpaceLeft` past `page_count_max`.
 - `cache`: WAL-before-data gate on `BufferPool`: `set_durable_lsn(lsn)` (no `io`, cannot fail,
   monotonic) turns it on; eviction and `flushAll` then skip dirty frames whose page lsn is above
   the bound and leave them dirty; eviction scans past them, all victims pinned or gated is
