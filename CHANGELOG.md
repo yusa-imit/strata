@@ -9,6 +9,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `cache`: WAL-before-data gate on `BufferPool`: `set_durable_lsn(lsn)` (no `io`, cannot fail,
+  monotonic) turns it on; eviction and `flushAll` then skip dirty frames whose page lsn is above
+  the bound and leave them dirty; eviction scans past them, all victims pinned or gated is
+  `PoolExhausted`; `flushAll` skips without error and counts them in the new `Stats.gated`. Off
+  until the first call, so existing callers see no change (plan 004, item 8).
 - `wal`: `wal.recovery`, `Recovery.replay`: reads the log from `from_lsn` (skipping and checking
   earlier frames; `Corrupted` when no frame starts there), applies each intact frame through an
   `Apply` vtable, truncates a torn tail (`setLength` + sync) or deletes a partial newest header
