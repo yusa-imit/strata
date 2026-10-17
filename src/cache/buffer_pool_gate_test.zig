@@ -9,6 +9,7 @@ const testing = std.testing;
 const Io = std.Io;
 const header = @import("../page/header.zig");
 const fx = @import("../page/manager_fixtures.zig");
+const fault_io = @import("../testing/fault_io.zig");
 const buffer_pool = @import("buffer_pool.zig");
 const base = @import("buffer_pool_test.zig");
 
@@ -151,6 +152,8 @@ test "gate: flushAll leaves gated frames dirty, pinned ones included, until the 
         try update(&pool, testing.io, 1, 10);
         try update(&pool, testing.io, 3, 51); // One above the bound.
         var pinned = try pool.fetchForUpdate(testing.io, fx.id_of(2));
+        errdefer if (!pinned.released) pinned.release(); // A failed expect must not trip deinit.
+
         pinned.set_lsn(900);
         try pool.flushAll(testing.io); // Writes page 1 only; no error for the gated two.
         try expect_counts(&pool, 2, 1, 2);
@@ -167,4 +170,77 @@ test "gate: flushAll leaves gated frames dirty, pinned ones included, until the 
         try expect_disk_lsn(&pm, 2, 900);
         try expect_disk_lsn(&pm, 3, 51);
     }
+}
+
+test "gate: set_durable_lsn with the same value is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pm: PageManager = undefined;
+    try base.make_pages(&pm, tmp.dir, 512, 2);
+    defer pm.close(testing.io);
+
+    var pool: BufferPool = undefined;
+    try BufferPool.init(&pool, testing.allocator, &pm, base.pool_options(&pm, 2));
+    defer pool.deinit(testing.allocator);
+
+    pool.set_durable_lsn(50);
+    pool.set_durable_lsn(50); // Same bound again: still on, nothing changes.
+    try testing.expectEqual(@as(u64, 50), pool.durable_lsn);
+    try testing.expect(pool.gate_on);
+    try update(&pool, testing.io, 1, 51);
+    pool.set_durable_lsn(50);
+    try pool.flushAll(testing.io);
+    try expect_counts(&pool, 1, 0, 1); // Page 1 is still gated.
+    pool.set_durable_lsn(51);
+    try pool.flushAll(testing.io);
+    try expect_counts(&pool, 0, 1, 1);
+}
+
+test "gate: eviction alone skipping a gated frame leaves Stats.gated at zero" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pm: PageManager = undefined;
+    try base.make_pages(&pm, tmp.dir, 512, 4);
+    defer pm.close(testing.io);
+
+    var pool: BufferPool = undefined;
+    try BufferPool.init(&pool, testing.allocator, &pm, base.pool_options(&pm, 2));
+    defer pool.deinit(testing.allocator);
+
+    pool.set_durable_lsn(5);
+    try update(&pool, testing.io, 1, 900); // Gated for the whole test.
+    try base.fetch_release(&pool, 2);
+    try base.fetch_release(&pool, 3); // Evicts clean page 2, scanning past page 1.
+    try base.fetch_release(&pool, 4); // Evicts clean page 3, scanning past page 1 again.
+    try testing.expectEqual(@as(u64, 2), pool.stats().evictions);
+    try expect_counts(&pool, 1, 0, 0);
+    pool.set_durable_lsn(900);
+    try pool.flushAll(testing.io);
+    try expect_counts(&pool, 0, 1, 0);
+}
+
+test "gate: a failed write in flushAll still counts the frames skipped before it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pm: PageManager = undefined;
+    try base.make_pages(&pm, tmp.dir, 512, 3);
+    defer pm.close(testing.io);
+
+    var pool: BufferPool = undefined;
+    try BufferPool.init(&pool, testing.allocator, &pm, base.pool_options(&pm, 3));
+    defer pool.deinit(testing.allocator);
+
+    pool.set_durable_lsn(50);
+    try update(&pool, testing.io, 1, 900); // Frame 0: gated, skipped first.
+    try update(&pool, testing.io, 2, 10); // Frame 1: eligible, its write fails.
+    var faulty: fault_io.FaultIo = undefined;
+    faulty.init(testing.io, .{ .write = .canceled, .read = .none, .after_calls = 0 });
+    try testing.expectError(error.Canceled, pool.flushAll(faulty.io()));
+    try expect_counts(&pool, 2, 0, 1);
+    pool.set_durable_lsn(900);
+    try pool.flushAll(testing.io);
+    try expect_counts(&pool, 0, 2, 1);
 }

@@ -187,8 +187,9 @@ pub const BufferPool = struct {
     /// Pins page `id` and returns a read-only guard (`bytes`) over its frame. A hit costs no
     /// I/O; a miss evicts the first unpinned frame whose reference bit is clear (taking an
     /// empty frame first), writing it back first if it is dirty, and reads the page into it.
-    /// Every frame pinned is `PoolExhausted`, returned at once, never waited on. A failed
-    /// write-back returns its error with the victim still resident and dirty (`FetchError`). A
+    /// Every frame pinned or gated (WAL gate, `set_durable_lsn`) is `PoolExhausted`, returned at
+    /// once, never waited on. A failed write-back returns its error with the victim still
+    /// resident and dirty (`FetchError`). A
     /// page that fails to load (`Unwritten`, `Corrupted`, `ChecksumMismatch`, `TornWrite`, I/O
     /// errors) leaves its frame empty, and the clean page it displaced stays gone.
     /// Preconditions: `0 < id < page_count` of the manager (the same contract as
@@ -223,16 +224,16 @@ pub const BufferPool = struct {
     pub fn flushAll(self: *BufferPool, io: Io) FlushError!void {
         assert(self.frames.len == self.frames_max);
         assert(self.dirty_count <= self.frames_max);
-        var skipped: u32 = 0;
+        const gated_before = self.counters.gated;
         for (0..self.frames_max) |index| {
             if (!self.frames[index].dirty) continue;
             if (self.gate_blocks(@intCast(index))) {
-                skipped += 1;
+                self.counters.gated += 1; // Counted at once: a later failed write keeps it.
                 continue;
             }
             try self.write_back(io, @intCast(index));
         }
-        self.counters.gated += skipped;
+        const skipped = self.counters.gated - gated_before;
         assert(self.dirty_count == skipped);
         assert(self.gate_on or skipped == 0);
     }
@@ -291,6 +292,7 @@ pub const BufferPool = struct {
         assert(self.slab.len == @as(usize, self.frames_max) * self.page_size);
         assert(self.hand < self.frames_max);
         assert(self.page_size == self.pages.page_size);
+        assert(self.gate_on or self.durable_lsn == 0);
         var empty: u32 = 0;
         var dirty: u32 = 0;
         for (self.frames, 0..) |frame, index| {
