@@ -21,8 +21,11 @@
 //!
 //! Growth: a `page_id` at or past `page_count` first grows the file with
 //! `PageManager.ensure_page_count`, so the file covers the id (pages in between read as
-//! `Unwritten` and are not on the freelist). A `page_id` at or past `page_count_max` is `Failed`.
+//! `Unwritten` and are not on the freelist). Only a page the file lacks meets `page_count_max`:
+//! growth past it is `Failed`, while a page already inside `page_count` is redone even if the
+//! limit is lower than the file (a reopened `Options`).
 //!
+//! Precedence: a malformed image is `Corrupted` before any limit or I/O `Failed` is possible.
 //! Errors: `Corrupted` for a bad image (the log said something the format forbids); `Failed`
 //! for every I/O error and for the file limit. Both stop `Recovery.replay` and leave the log
 //! untouched. Allocation: one page-sized buffer from `gpa` in `init`, freed in `deinit`;
@@ -82,7 +85,7 @@ pub const PageRedo = struct {
     /// The `Apply` target for `Recovery.replay`; valid while `self` stays at this address.
     pub fn apply_target(self: *PageRedo) recovery.Apply {
         assert(self.buf.len == self.pm.page_size);
-        assert(self.stats.applied + self.stats.skipped + self.stats.ignored < std.math.maxInt(u64));
+        assert(self.pm.page_count >= 1);
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -95,9 +98,11 @@ pub const PageRedo = struct {
             return;
         }
         const image = try self.parse(f.payload);
-        // A page id at the file limit cannot exist; checked first so `id + 1` cannot overflow.
-        if (@intFromEnum(image.id) >= self.pm.page_count_max) return error.Failed;
-        self.pm.ensure_page_count(io, @intFromEnum(image.id) + 1) catch return error.Failed;
+        const id_raw: u32 = @intFromEnum(image.id);
+        if (id_raw >= self.pm.page_count) { // Only a page the file lacks meets the limit.
+            const count = std.math.add(u32, id_raw, 1) catch return error.Failed;
+            self.pm.ensure_page_count(io, count) catch return error.Failed;
+        }
         if (!try self.needs_redo(io, image.id, f.lsn)) {
             self.stats.skipped += 1;
             return;
@@ -139,7 +144,19 @@ pub const PageRedo = struct {
             error.Corrupted,
             error.ChecksumMismatch,
             => return true,
-            else => return error.Failed, // Deliberate: every I/O error stops the replay.
+            // Every I/O error stops the replay; listed so a new variant breaks the build.
+            error.InputOutput,
+            error.SystemResources,
+            error.IsDir,
+            error.WouldBlock,
+            error.AccessDenied,
+            error.LockViolation,
+            error.Unseekable,
+            error.NotOpenForReading,
+            error.Canceled,
+            error.Unexpected,
+            error.UnexpectedEof,
+            => return error.Failed,
         };
         return page_header.lsn < lsn;
     }

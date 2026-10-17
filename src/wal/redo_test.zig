@@ -216,7 +216,28 @@ test "redo: an I/O error on read, write or growth is Failed and the page stays a
     const grow_got = env.apply_with(writes.io(), .page_image, 9, payload);
     try testing.expectError(error.Failed, grow_got);
     try testing.expectEqual(@as(u32, 4), env.pm.page_count);
+    try fx.expect_page0_intact(&env.pm, 4);
     try env.expect_stats(0, 0, 0);
+}
+
+test "redo: a page inside the file is redone even when page_count_max is lower" {
+    var env: Env = undefined;
+    try env.init(512, 4);
+    defer env.deinit();
+
+    env.pm.page_count_max = 2; // As after a reopen with smaller options: the file is bigger.
+    try env.apply_image(3, 7, 30);
+    try env.expect_page(3, 7, 30);
+    try env.expect_stats(1, 0, 0);
+
+    const payload = try rx.image_payload(512, 4, 7, rx.consumer_type, 1);
+    defer testing.allocator.free(payload);
+
+    try env.expect_apply_error(error.Failed, 31, payload); // A page the file lacks meets it.
+    try testing.expectEqual(@as(u32, 4), env.pm.page_count);
+    std.mem.writeInt(u32, payload[0..4], std.math.maxInt(u32), .little);
+    try env.expect_apply_error(error.Failed, 31, payload); // `id + 1` would overflow.
+    try fx.expect_page0_intact(&env.pm, 4);
 }
 
 test "redo: init with no memory is OutOfMemory" {

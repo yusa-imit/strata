@@ -43,6 +43,7 @@ pub const OpenError = file.OpenError || file.ReadError || file.TryLockError ||
     file.LengthError || error{ Corrupted, ChecksumMismatch };
 pub const ReadError = file.ReadError || header.DecodeError || error{TornWrite};
 pub const WriteError = file.WriteError;
+pub const GrowError = file.PreallocateError || file.WriteError;
 pub const AllocateError = file.ReadError || file.WriteError || file.PreallocateError ||
     error{ Corrupted, ChecksumMismatch, TornWrite };
 pub const FreeError = file.ReadError || file.WriteError ||
@@ -250,9 +251,10 @@ pub const PageManager = struct {
     /// file does not have yet. The new pages read as `Unwritten` and belong to nobody, so they
     /// are not on the freelist: a caller that ends up not using one leaks it. A `count` at or
     /// below `page_count` changes nothing. Growth past `page_count_max` is `NoSpaceLeft`. Space
-    /// is reserved first, then published in page 0; on error the manager is unchanged.
+    /// is reserved first, then published in page 0; on error `page_count` and page 0 are
+    /// unchanged, but the file may already be longer (the reserved space is not given back).
     /// Precondition: `count >= 1`.
-    pub fn ensure_page_count(self: *PageManager, io: Io, count: u32) AllocateError!void {
+    pub fn ensure_page_count(self: *PageManager, io: Io, count: u32) GrowError!void {
         assert(count >= 1);
         assert(self.page_count >= 1);
         if (count <= self.page_count) return;

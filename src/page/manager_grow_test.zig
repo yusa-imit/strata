@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 const header = @import("header.zig");
 const fx = @import("manager_fixtures.zig");
+const fault_io = @import("../testing/fault_io.zig");
 
 const PageManager = @import("manager.zig").PageManager;
 
@@ -79,4 +80,24 @@ test "ensure_page_count: the freelist survives growth and still serves allocate 
     try testing.expectEqual(a, try pm.allocate(testing.io)); // LIFO reuse, not the grown pages.
     try testing.expect(b != a);
     assert(header.page_size_valid(pm.page_size));
+}
+
+test "ensure_page_count: a failed page-0 write leaves page_count and page 0 as they were" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pm: PageManager = undefined;
+    try PageManager.create(&pm, testing.io, tmp.dir, "x.db", fx.opts(512));
+    defer pm.close(testing.io);
+
+    try pm.ensure_page_count(testing.io, 3);
+    var fio: fault_io.FaultIo = undefined;
+    const plan: fault_io.Plan = .{ .write = .canceled, .read = .none, .after_calls = 0 };
+    fault_io.FaultIo.init(&fio, testing.io, plan);
+    // The space is reserved before page 0 is written, so the file may be longer afterwards.
+    try testing.expectError(error.Canceled, pm.ensure_page_count(fio.io(), 9));
+    try testing.expectEqual(@as(u32, 3), pm.page_count);
+    try fx.expect_page0_intact(&pm, 3);
+    try pm.ensure_page_count(testing.io, 9); // The retry succeeds.
+    try fx.expect_page0_intact(&pm, 9);
 }
