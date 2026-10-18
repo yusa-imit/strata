@@ -12,20 +12,31 @@
 //!   5. `PageManager.sync`: the new `wal_lsn` is durable.
 //! A crash or error anywhere recovers from the old or the new `wal_lsn`: before step 5 returns
 //! the file header holds either, both name an intact `checkpoint` frame (or 0), and every page
-//! the new start relies on was synced in step 3. `Checkpoint.stage` is the last step that
-//! completed, for diagnostics and tests. Reclaim follows (`reclaim`): segment `k` is deleted
-//! iff it is not the newest and `(k+1).first_lsn <= C`, ascending, then one directory sync
-//! (skipped under `SyncPolicy.none`). The active segment is never deleted. `Writer.live_count`
+//! the new start relies on was synced in step 3. Honest limit: step 4 rewrites page 0 in one
+//! write, which is not atomic above 512 B (ADR-0002 section 6: only a sector write is). The old
+//! and the new image differ only in `wal_lsn` (byte 40) and the checksum, both inside the first
+//! 512 B, and are zero after byte 48, so if the device writes that first sector atomically a
+//! torn write leaves exactly the old or the new page 0 at every page size. Without that
+//! guarantee a torn page 0 is `ChecksumMismatch` on `PageManager.open`, a typed error and not a
+//! silent wrong start, but the page file is then unopenable (ADR-0003 open question 6).
+//! `Checkpoint.stage` is the last step that completed, for diagnostics and tests. Reclaim
+//! follows (`reclaim`): segment `k` is deleted iff it is not the newest and
+//! `(k+1).first_lsn <= C`, ascending, then one directory sync (skipped under
+//! `SyncPolicy.none`). The active segment is never deleted. `Writer.live_count`
 //! is lowered through `Writer.segments_reclaimed` after each delete, so a failure part-way keeps
 //! it true; a failed reclaim leaves a complete checkpoint, and `reclaim` may be called again.
+//! `reclaim` deletes only below `reclaim_lsn`, the checkpoint whose step 5 returned; after a
+//! `run` that failed earlier it is `NotCheckpointed` (or the previous completed checkpoint), so
+//! it can never delete what the durable `wal_lsn` still needs.
 //!
 //! Caller contract (asserted or typed): every frame appended before `run` has been applied to
-//! the pool (or the page file), nothing edits pages during `run`, one `Checkpoint` per log
-//! and page file, and no other handle holds an old segment (a held lock is `WouldBlock`). A page
-//! file whose `wal_lsn` is at or past the log's next LSN belongs to another log: `Corrupted`
-//! before any side effect. `run` must leave room: if the current segment is full and the log
-//! holds `segments_max` segments, appending `C` is `SegmentLimit` and only a checkpoint could
-//! have prevented it, so checkpoint before the limit.
+//! the pool (or the page file) and no dirty page has an lsn above the log (`PagesAheadOfLog`,
+//! checked before the checkpoint frame is appended), nothing edits pages during `run`, one
+//! `Checkpoint` per log and page file, and no other handle holds an old segment (a held lock
+//! is `WouldBlock`). A page file whose `wal_lsn` is at or past the log's next LSN belongs to
+//! another log: `Corrupted` before any side effect. `run` must leave room: if the current
+//! segment is full and the log holds `segments_max` segments, appending `C` is `SegmentLimit`
+//! and only a checkpoint could have prevented it, so checkpoint before the limit.
 //!
 //! Recovery start, `redo_start`: `wal_lsn == 0` means "from the start of the log" and returns 0
 //! (what `Recovery.replay` takes for that; it also accepts an empty log then). Otherwise the
@@ -71,9 +82,13 @@ pub const Stage = enum(u8) {
     reclaimed,
 };
 
-pub const ReclaimError = segment.OpenError || Io.Dir.DeleteFileError || file.SyncError;
+/// `NotCheckpointed`: no checkpoint of this value has completed its fifth step, so no segment
+/// may be deleted yet (the durable `wal_lsn` may still name an older start).
+pub const ReclaimError = segment.OpenError || Io.Dir.DeleteFileError || file.SyncError ||
+    error{NotCheckpointed};
 /// `Corrupted`: the page file's `wal_lsn` is not below the log's next LSN. `PagesAheadOfLog`:
-/// after `flushAll` a dirty page remains, whose lsn is above the log's durable point.
+/// a dirty page has an lsn above the log's last frame; checked before anything is appended, and
+/// again after `flushAll` (a dirty page left is one the gate held back).
 pub const RunError = writer.AppendError || writer.CommitError || buffer_pool.FlushError ||
     manager.SyncError || manager.WriteError || ReclaimError ||
     error{ Corrupted, PagesAheadOfLog };
@@ -97,8 +112,12 @@ pub const Checkpoint = struct {
     pool: *BufferPool,
     pages: *PageManager,
     stage: Stage,
-    /// LSN of the last checkpoint frame this value committed, or 0.
+    /// LSN of the last checkpoint frame this value committed, or 0. Diagnostic: it may name a
+    /// frame whose `wal_lsn` never became durable.
     redo_lsn: Lsn,
+    /// `redo_lsn` of the last checkpoint whose step 5 returned, or 0: the only LSN `reclaim`
+    /// may delete below. Set once the new `wal_lsn` is durable, never earlier.
+    reclaim_lsn: Lsn,
     /// A segment was deleted and the directory not yet synced.
     dir_dirty: bool,
 
@@ -112,6 +131,7 @@ pub const Checkpoint = struct {
             .pages = pages,
             .stage = .idle,
             .redo_lsn = 0,
+            .reclaim_lsn = 0,
             .dir_dirty = false,
         };
         target.check_invariants();
@@ -126,6 +146,7 @@ pub const Checkpoint = struct {
         self.stage = .idle;
         const lsn_c = self.log.next_lsn;
         if (self.pages.wal_lsn >= lsn_c) return error.Corrupted; // Foreign log: no side effect.
+        if (self.pool.dirty_lsn_max() > self.log.last_lsn) return error.PagesAheadOfLog;
 
         var payload: [payload_size]u8 = undefined;
         std.mem.writeInt(u64, &payload, lsn_c, .little);
@@ -147,25 +168,29 @@ pub const Checkpoint = struct {
         self.stage = .header_set;
         try self.pages.sync(io);
         self.stage = .header_synced;
+        self.reclaim_lsn = lsn_c; // Durable now: only from here may segments below it go.
 
         const reclaimed = try self.reclaim(io);
         assert(self.stage == .reclaimed);
         return .{ .redo_lsn = lsn_c, .segments_reclaimed = reclaimed };
     }
 
-    /// Deletes the segments wholly below the last checkpoint's `redo_lsn`, oldest first, never
-    /// the newest, and syncs the directory once. Returns how many were deleted. May be called
-    /// again after an error (it continues where it stopped, and syncs a directory left
-    /// unsynced). Precondition: `run` completed step 5 (`stage >= header_synced`).
+    /// Deletes the segments wholly below the last *completed* checkpoint (`reclaim_lsn`), oldest
+    /// first, never the newest, and syncs the directory once. Returns how many were deleted.
+    /// `NotCheckpointed` (nothing deleted) when no checkpoint of this value has finished its
+    /// fifth step: a `run` that failed earlier leaves the durable `wal_lsn` at an older start,
+    /// which still needs those segments. May be called again after an error (it continues where
+    /// it stopped, and syncs a directory left unsynced).
     pub fn reclaim(self: *Checkpoint, io: Io) ReclaimError!u32 {
         self.check_invariants();
-        assert(@intFromEnum(self.stage) >= @intFromEnum(Stage.header_synced));
+        if (self.reclaim_lsn == 0) return error.NotCheckpointed;
+        assert(self.reclaim_lsn <= self.redo_lsn);
         const log = self.log;
         var deleted: u32 = 0;
         for (0..log.live_count) |_| { // Each pass deletes one of at most `live_count - 1`.
             if (log.live_count == 1) break; // Only the active segment is left.
             const index = log.oldest_index();
-            if (try self.first_lsn_of(io, index + 1) > self.redo_lsn) break;
+            if (try self.first_lsn_of(io, index + 1) > self.reclaim_lsn) break;
             try delete_segment(io, log.dir, index);
             log.segments_reclaimed(1);
             self.dir_dirty = true;
@@ -202,8 +227,9 @@ pub const Checkpoint = struct {
         assert(self.pool.pages == self.pages);
         assert(self.log.live_count >= 1);
         assert(self.redo_lsn <= self.log.last_lsn);
+        assert(self.reclaim_lsn <= self.redo_lsn);
         if (self.stage != .idle) assert(self.redo_lsn >= frame.lsn_first);
-        if (self.dir_dirty) assert(@intFromEnum(self.stage) >= @intFromEnum(Stage.header_synced));
+        if (self.dir_dirty) assert(self.reclaim_lsn != 0);
     }
 };
 
@@ -234,11 +260,16 @@ pub fn redo_start(
     try reader.Reader.open(&rd, io, gpa, dir, options);
     defer rd.deinit(io, gpa);
 
+    // Frames before `wal_lsn` are read in order; the loop ends at the frame with `lsn >=
+    // wal_lsn`, or when the log ends first (`null`), so it needs one pass per frame at most.
     const frames_max = @as(u64, options.segments_max) * frames_per_segment_max;
     for (0..frames_max) |_| {
         const found = rd.next(io) catch |err| switch (err) {
             error.TornWrite => return error.Corrupted, // The log ends inside the way there.
-            else => |other| return other, // Deliberate: damage and I/O are the caller's.
+            error.ChecksumMismatch, error.Corrupted => |damage| return damage,
+            // Deliberate: the I/O and lock errors (open, tryLock, length, read) are the
+            // caller's; the set is large and owned by `file`, so it is not listed here.
+            else => |other| return other,
         };
         const got = found orelse return error.Corrupted; // The log ends before `wal_lsn`.
         if (got.lsn < wal_lsn) continue;
@@ -249,8 +280,7 @@ pub fn redo_start(
         assert(redo_lsn >= frame.lsn_first);
         assert(redo_lsn <= got.lsn);
         return redo_lsn;
-    }
-    return error.Corrupted; // Unreachable for a sane log: the bound exceeds its frames.
+    } else return error.Corrupted; // Unreachable for a sane log: the bound exceeds its frames.
 }
 
 test {

@@ -22,9 +22,10 @@ fn bit(stage: Stage) u32 {
     return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(stage)));
 }
 
-/// Two edits, a first checkpoint (reclaims them), two more edits made durable: the state a
-/// second checkpoint starts from, so a failure leaves an old `wal_lsn` that is not 0.
-fn prepare(env: *Env, size: u32) !void {
+/// Warm: two edits, a first checkpoint (reclaims them), two more edits made durable, so a
+/// failure of the second checkpoint leaves an old `wal_lsn` that is not 0. Cold: three durable
+/// edits and no checkpoint at all, so the old `wal_lsn` is 0 and `reclaim_lsn` stays 0.
+fn prepare(env: *Env, size: u32, warm: bool) !void {
     assert(size >= 512);
     assert(sizes_fault.len > 0);
     try env.init(size, 8, 1, .fsync);
@@ -32,9 +33,11 @@ fn prepare(env: *Env, size: u32) !void {
 
     _ = try env.edit(1, 11);
     _ = try env.edit(2, 12);
-    const first = try env.cp.run(testing.io);
-    assert(first.redo_lsn == env.pm.wal_lsn);
-    _ = try env.edit(2, 22);
+    if (warm) {
+        const first = try env.cp.run(testing.io);
+        assert(first.redo_lsn == env.pm.wal_lsn);
+        _ = try env.edit(2, 22);
+    }
     _ = try env.edit(3, 23);
     try env.log.sync(testing.io);
 }
@@ -50,43 +53,64 @@ fn plan(write: fault_io.Fault, sync_fail_after: ?u32, after_calls: u32) fault_io
     };
 }
 
-const Counts = struct { syncs: u32, writes: u32 };
+fn delete_plan(delete_fail_after: u32) fault_io.Plan {
+    assert(delete_fail_after < 64);
+    var faults = plan(.none, null, 0);
+    faults.delete_fail_after = delete_fail_after;
+    return faults;
+}
 
-/// The second checkpoint without faults: how many syncs and writes it makes.
-fn dry_run(size: u32) !Counts {
+const Counts = struct { syncs: u32, writes: u32, deletes: u32 };
+
+/// The second checkpoint without faults: how many syncs, writes and deletes it makes.
+fn dry_run(size: u32, warm: bool) !Counts {
     assert(size >= 512);
     assert(size <= 65536);
     var env: Env = undefined;
-    try prepare(&env, size);
+    try prepare(&env, size, warm);
     defer env.deinit();
 
     var fio: fault_io.FaultIo = undefined;
     fault_io.FaultIo.init(&fio, testing.io, plan(.none, null, 0));
     const result = try env.cp.run(fio.io());
-    // Segments 3 (checkpoint 1), 4 and 5 (the edits) go; 6 holds the second checkpoint.
+    // Warm: segments 3 (checkpoint 1), 4 and 5 (the edits) go; 6 holds the second checkpoint.
+    // Cold: segments 1 to 3 (the edits) go; 4 holds the checkpoint.
     try testing.expectEqual(@as(u32, 3), result.segments_reclaimed);
     try testing.expectEqual(Stage.reclaimed, env.cp.stage);
-    return .{ .syncs = fio.sync_calls, .writes = fio.write_calls };
+    return .{ .syncs = fio.sync_calls, .writes = fio.write_calls, .deletes = fio.delete_calls };
 }
 
-/// Runs the second checkpoint under `faults`, expects it to fail, drops every handle without
-/// syncing, and recovers cold. Returns the stage the failure left.
-fn fail_and_recover(size: u32, faults: fault_io.Plan) !Stage {
+/// Runs the checkpoint under `faults`, expects it to fail, then checks `reclaim` (it deletes
+/// nothing and says `NotCheckpointed` unless step 5 returned; when it may run it finishes),
+/// drops every handle without syncing, and recovers cold. Returns the stage the failure left.
+fn fail_and_recover(size: u32, warm: bool, faults: fault_io.Plan) !Stage {
     assert(size >= 512);
-    assert(faults.sync_fail_after != null or faults.write != .none);
+    const any_fault = faults.write != .none or faults.sync_fail_after != null;
+    assert(any_fault or faults.delete_fail_after != null);
+    assert(faults.read == .none);
     var env: Env = undefined;
-    try prepare(&env, size);
+    try prepare(&env, size, warm);
     defer env.deinit();
 
     var fio: fault_io.FaultIo = undefined;
     fault_io.FaultIo.init(&fio, testing.io, faults);
     const old_wal_lsn = env.pm.wal_lsn;
-    try testing.expect(old_wal_lsn >= 1);
+    try testing.expectEqual(warm, old_wal_lsn >= 1);
     if (env.cp.run(fio.io())) |_| return error.TestExpectedError else |_| {}
     const stage = env.cp.stage;
     const new_redo = env.cp.redo_lsn;
     try testing.expect(stage != Stage.reclaimed);
 
+    const live_before = env.log.live_count;
+    if (env.cp.reclaim_lsn == 0) { // Cold and not past step 5: the durable start is still 0.
+        try testing.expectError(error.NotCheckpointed, env.cp.reclaim(testing.io));
+        try testing.expectEqual(live_before, env.log.live_count);
+        for (1..4) |index| try testing.expect(try env.segment_exists(@intCast(index)));
+    } else {
+        _ = try env.cp.reclaim(testing.io); // Retry: safe, and it finishes the job.
+        try testing.expectEqual(Stage.reclaimed, env.cp.stage);
+        env.log.check_invariants();
+    }
     env.close_handles();
     const got = try fx.recover(env.tmp.dir, size, 8, &env.model);
     // The disk holds the old or the new start, never anything else.
@@ -95,41 +119,48 @@ fn fail_and_recover(size: u32, faults: fault_io.Plan) !Stage {
     return stage;
 }
 
-test "run: failing any sync or write of a checkpoint recovers to the model state" {
+fn sweep(size: u32, warm: bool) !void {
+    assert(size >= 512);
+    assert(size <= 65536);
+    const counts = try dry_run(size, warm);
+    // Segment sync, creation sync, directory sync, commit, two page syncs, directory sync.
+    try testing.expectEqual(@as(u32, 7), counts.syncs);
+    try testing.expect(counts.writes >= 5); // Header, frame, pages, page 0.
+    try testing.expectEqual(@as(u32, 3), counts.deletes);
+    var seen: u32 = 0;
+    for (0..counts.syncs) |k| {
+        seen |= bit(try fail_and_recover(size, warm, plan(.none, @intCast(k), 0)));
+    }
+    for (0..counts.writes) |k| {
+        seen |= bit(try fail_and_recover(size, warm, plan(.zero, null, @intCast(k))));
+    }
+    for (0..counts.deletes) |k| {
+        seen |= bit(try fail_and_recover(size, warm, delete_plan(@intCast(k))));
+    }
+    // Every step of the checkpoint, and the reclaim, was the one that failed in some run.
+    const steps = [_]Stage{ .idle, .logged, .flushed, .pages_synced, .header_set, .header_synced };
+    for (steps) |step| try testing.expect(seen & bit(step) != 0);
+    try testing.expect(seen & bit(.reclaimed) == 0);
+}
+
+test "run: failing any sync, write or delete of a checkpoint recovers to the model state" {
     for (sizes_fault) |size| {
-        const counts = try dry_run(size);
-        // Segment sync, creation sync, directory sync, commit, two page syncs, directory sync.
-        try testing.expectEqual(@as(u32, 7), counts.syncs);
-        try testing.expect(counts.writes >= 5); // Header, frame, two pages, page 0.
-        var seen: u32 = 0;
-        for (0..counts.syncs) |k| {
-            const stage = try fail_and_recover(size, plan(.none, @intCast(k), 0));
-            seen |= bit(stage);
-        }
-        for (0..counts.writes) |k| {
-            const stage = try fail_and_recover(size, plan(.zero, null, @intCast(k)));
-            seen |= bit(stage);
-        }
-        // Every step of the checkpoint, and the reclaim, was the one that failed in some run.
-        const steps = [_]Stage{
-            .idle, .logged, .flushed, .pages_synced, .header_set, .header_synced,
-        };
-        for (steps) |step| try testing.expect(seen & bit(step) != 0);
-        try testing.expect(seen & bit(.reclaimed) == 0);
+        try sweep(size, true);
+        try sweep(size, false);
     }
 }
 
 test "run: a canceled write fails the step the same way" {
-    const counts = try dry_run(512);
+    const counts = try dry_run(512, true);
     for (0..counts.writes) |k| {
-        const stage = try fail_and_recover(512, plan(.canceled, null, @intCast(k)));
+        const stage = try fail_and_recover(512, true, plan(.canceled, null, @intCast(k)));
         try testing.expect(stage != Stage.reclaimed);
     }
 }
 
 test "run: a failed log step latches the writer, and a later run says Failed" {
     var env: Env = undefined;
-    try prepare(&env, 512);
+    try prepare(&env, 512, true);
     defer env.deinit();
 
     const writebacks = env.pool.stats().writebacks;
@@ -144,7 +175,7 @@ test "run: a failed log step latches the writer, and a later run says Failed" {
 
 test "reclaim: FaultIo forwards the deletes, so a checkpoint under it deletes segments" {
     var env: Env = undefined;
-    try prepare(&env, 512);
+    try prepare(&env, 512, true);
     defer env.deinit();
 
     var fio: fault_io.FaultIo = undefined;

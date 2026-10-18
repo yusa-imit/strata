@@ -270,9 +270,12 @@ pub const PageManager = struct {
     /// Rewrites page 0 (checksum included) with `file_header.wal_lsn = lsn`: the LSN of the
     /// checkpoint frame recovery starts from (ADR-0003 section 10), 0 for none. The write is
     /// not synced: the caller's `sync` makes it durable, and a crash before that leaves the old
-    /// value, which is a valid (older) start. `lsn` equal to the current value rewrites page 0
-    /// unchanged. Precondition: `lsn >= wal_lsn` (the durable start never moves back; a caller
-    /// contract, asserted). On error `wal_lsn` is unchanged in memory, page 0 may be torn.
+    /// value, which is a valid (older) start. Page 0 is one write: only a 512 B sector write is
+    /// atomic (ADR-0002 section 6), but old and new images differ only in the first 512 B, so
+    /// with atomic sectors a crash leaves exactly one of them; otherwise open sees
+    /// `ChecksumMismatch` (ADR-0003 open question 6). `lsn` equal to the current value rewrites
+    /// page 0 unchanged. Precondition: `lsn >= wal_lsn` (the durable start never moves back; a
+    /// caller contract, asserted). On error `wal_lsn` is unchanged in memory, page 0 may be torn.
     pub fn set_wal_lsn(self: *PageManager, io: Io, lsn: u64) WriteError!void {
         assert(lsn >= self.wal_lsn);
         assert(self.page_count >= 1);

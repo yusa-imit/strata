@@ -302,6 +302,7 @@ pub const Writer = struct {
     /// Index of the oldest live segment: the live ones are contiguous up to the current one.
     pub fn oldest_index(self: *const Writer) u32 {
         assert(self.live_count >= 1);
+        // Contiguous: rotation adds `index + 1` and reclaim removes a prefix, never a middle one.
         assert(self.current.index >= self.live_count); // Indices start at 1.
         return self.current.index - (self.live_count - 1);
     }

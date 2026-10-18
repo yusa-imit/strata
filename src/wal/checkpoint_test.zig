@@ -250,20 +250,24 @@ test "run: a page file ahead of the log is Corrupted before any side effect" {
     try testing.expectEqual(@as(u32, 1), env.pool.dirty_count);
 }
 
-test "run: a dirty page ahead of the log is PagesAheadOfLog and wal_lsn stays" {
+test "run: a dirty page ahead of the log is PagesAheadOfLog before anything is appended" {
     var env: Env = undefined;
     try env.init(512, 4, frames_all_in_one, .none);
     defer env.deinit();
 
-    _ = try env.edit(1, 11);
+    const lsn = try env.edit(1, 11);
+    try testing.expectEqual(lsn, env.pool.dirty_lsn_max());
     var guard = try env.pool.fetchForUpdate(testing.io, pfx.id_of(2));
     guard.set_lsn(1 << 40); // A page change the log never described.
     guard.release();
+    try testing.expectEqual(@as(u64, 1 << 40), env.pool.dirty_lsn_max());
+    const before = env.log.position();
     try testing.expectError(error.PagesAheadOfLog, env.cp.run(testing.io));
-    try testing.expectEqual(checkpoint.Stage.logged, env.cp.stage);
+    try testing.expectEqual(checkpoint.Stage.idle, env.cp.stage);
+    try testing.expectEqual(before, env.log.position()); // No checkpoint frame was written.
     try testing.expectEqual(@as(u64, 0), env.pm.wal_lsn);
-    try testing.expectEqual(@as(u32, 1), env.pool.dirty_count); // Page 2 stayed gated.
-    try testing.expectEqual(@as(u32, 1), env.log.live_count);
+    try testing.expectEqual(@as(u32, 2), env.pool.dirty_count); // Nothing was flushed.
+    try testing.expectError(error.NotCheckpointed, env.cp.reclaim(testing.io));
 }
 
 test "run: the segment limit refuses a checkpoint that needs a new segment, unchanged" {

@@ -15,7 +15,12 @@ All notable changes to this project are documented in this file. The format foll
   fences each step, so a crash anywhere recovers from the old or the new `wal_lsn`.
   `checkpoint.redo_start` derives the replay start from `wal_lsn` (0 = whole log, else the
   intact `checkpoint` frame there, else `Corrupted`). `Writer.oldest_index` and
-  `Writer.segments_reclaimed` keep `live_count` true after a reclaim (plan 004, item 10).
+  `Writer.segments_reclaimed` keep `live_count` true after a reclaim; `reclaim` deletes only
+  below the last checkpoint whose step 5 returned (`NotCheckpointed` otherwise). "Old or new
+  `wal_lsn`" relies on atomic 512 B sector writes for page 0 (ADR-0003 open question 6)
+  (plan 004, item 10).
+- `cache`: `BufferPool.dirty_lsn_max()`. `testing`: `FaultIo` `Plan.delete_fail_after` and
+  forwarded, counted file deletion.
 - `page`: `PageManager.set_wal_lsn(io, lsn)` rewrites page 0 with the checkpoint LSN
   (monotonic; the caller syncs).
 - `wal`: `wal.redo`, `PageRedo`: an `Apply` target that restores a `page_image` frame through

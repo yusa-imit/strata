@@ -312,6 +312,22 @@ pub const BufferPool = struct {
         assert(self.table.count() == self.frames_max - empty);
     }
 
+    /// The highest page lsn among the dirty frames (read from the in-memory headers), or 0 when
+    /// none is dirty. For a checkpoint, which must not run over a page the log does not
+    /// describe yet. Cost: `frames_max` frame visits.
+    pub fn dirty_lsn_max(self: *BufferPool) u64 {
+        assert(self.frames.len == self.frames_max);
+        assert(self.dirty_count <= self.frames_max);
+        var highest: u64 = 0;
+        for (self.frames, 0..) |frame, index| {
+            if (!frame.dirty) continue;
+            const bytes = self.frame_bytes(@intCast(index));
+            highest = @max(highest, header.peek(bytes).lsn);
+        }
+        assert(self.dirty_count > 0 or highest == 0);
+        return highest;
+    }
+
     /// The bytes of frame `index`. Internal to the cache module: `PageGuard` hands them out.
     pub fn frame_bytes(self: *BufferPool, index: u32) []u8 {
         assert(index < self.frames_max);

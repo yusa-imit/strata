@@ -11,9 +11,11 @@
 //!     handle) it fails with `error.InputOutput` without reaching the inner `Io`; earlier
 //!     calls, and every call when it is null, forward.
 //!   - forwarders to the inner `Io` with the inner userdata: `dirCreateFile`, `dirOpenFile`,
-//!     `dirRead` (listing), `dirDeleteFile` (segment reclaim), `fileClose`, `fileLength`,
-//!     `fileSetLength`, `fileStat`, `fileLock`, `fileTryLock`, `fileUnlock`, `checkCancel`:
+//!     `dirRead` (listing), `fileClose`, `fileLength`, `fileSetLength`,
+//!     `fileStat`, `fileLock`, `fileTryLock`, `fileUnlock`, `checkCancel`:
 //!     everything `strata.file.File` uses.
+//!   - `dirDeleteFile` (segment reclaim): counted; from call number `delete_fail_after` it fails
+//!     with `error.AccessDenied` without reaching the inner `Io`, else it forwards.
 //! Any other `Io` operation through the wrapper is not supported: use the inner `Io` directly.
 //!
 //! Allocation: none, ever. Ownership: nothing is owned; the inner `Io` is borrowed and must
@@ -48,6 +50,9 @@ pub const Plan = struct {
     /// Syncs (0-based count, every `fileSync` of any file or directory) that pass through
     /// before every later one fails with `error.InputOutput`; null never fails a sync.
     sync_fail_after: ?u32 = null,
+    /// File deletions (0-based count) that pass through before every later one fails with
+    /// `error.AccessDenied` without reaching the inner `Io`; null never fails a deletion.
+    delete_fail_after: ?u32 = null,
 };
 
 /// A fault-injecting `Io` wrapper; see the file header for what is faulted and forwarded.
@@ -57,6 +62,7 @@ pub const FaultIo = struct {
     write_calls: u32,
     read_calls: u32,
     sync_calls: u32,
+    delete_calls: u32,
     vtable: Io.VTable,
 
     /// Builds the wrapper in place; counters start at zero.
@@ -74,6 +80,7 @@ pub const FaultIo = struct {
             .write_calls = 0,
             .read_calls = 0,
             .sync_calls = 0,
+            .delete_calls = 0,
             .vtable = Io.failing.vtable.*,
         };
         target.vtable.fileWritePositional = write_positional;
@@ -160,7 +167,8 @@ fn forward_dir_read(
     return self.inner.vtable.dirRead(self.inner.userdata, reader, buffer);
 }
 
-/// File deletion passes through (checkpoint reclaim); it is not counted and never faults.
+/// Counts one deletion (checkpoint reclaim); from `plan.delete_fail_after` on it fails with
+/// `error.AccessDenied` and does not reach the inner `Io`, otherwise it forwards.
 fn forward_dir_delete_file(
     userdata: ?*anyopaque,
     dir: Dir,
@@ -169,6 +177,11 @@ fn forward_dir_delete_file(
     const self = self_of(userdata);
     assert(sub_path.len > 0);
     assert(self.inner.vtable.dirDeleteFile != forward_dir_delete_file);
+    const index = self.delete_calls;
+    self.delete_calls +|= 1;
+    if (self.plan.delete_fail_after) |after| {
+        if (index >= after) return error.AccessDenied;
+    }
     return self.inner.vtable.dirDeleteFile(self.inner.userdata, dir, sub_path);
 }
 
