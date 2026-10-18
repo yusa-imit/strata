@@ -527,3 +527,12 @@ table above without a `format_version` bump is rejected on review.
    reading is linear in the skipped bytes. Recommendation: keep it; a direct seek by the §5
    formula (trusting the checkpoint frame, §8 "the seek target is trusted") is a later
    optimisation if the skip cost matters, at the price of not checking the skipped frames.
+6. **Page 0 is rewritten in place at checkpoint.** `PageManager.set_wal_lsn` (item 10) rewrites
+   the whole of page 0 in one write, and ADR-0002 §6 says only a 512 B sector write is atomic.
+   The old and new images differ only in `wal_lsn` (byte 40) and the checksum, both in the first
+   512 B, and are zero after byte 48, so a device with atomic 512 B sectors leaves exactly the old
+   or the new page 0 at every page size and "recovers from the old or the new `wal_lsn`" holds.
+   On a device without that guarantee a torn page 0 is `ChecksumMismatch` on open: typed, never a
+   silent wrong start, but the page file cannot be opened. Recommendation: accept for v1; a
+   double-buffered header (two slots, higher valid `wal_lsn` wins) is the fix if a target needs
+   it, at the price of a page format change.

@@ -71,7 +71,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       fails to decode or has `lsn < frame.lsn`, else skips. When to log an image is the B+Tree's
       call (plan 005). Verify: torn page + image → restored; newer page untouched; replay twice
       = once; at 512 B, 4 KiB, 64 KiB.
-- [ ] **`wal/checkpoint.zig` — checkpoint and reclaim** (`src/wal/`, `src/page/manager.zig`).
+- [x] **`wal/checkpoint.zig` — checkpoint and reclaim** (`src/wal/`, `src/page/manager.zig`).
       Commit a `checkpoint` frame at C, `flushAll`, page `sync`, set file-header `wal_lsn = C`
       (new `PageManager.set_wal_lsn`), `sync`, delete segments wholly below C. A sync fences
       each step, so a crash anywhere recovers from the old or new `wal_lsn`. Verify: `FaultIo`
