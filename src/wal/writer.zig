@@ -49,9 +49,10 @@
 //! Directory durability (ADR-0003 section 2 and open question 4): after every `Segment.create`
 //! the directory is synced through `platform.sync_dir`, a free function in `file/` rather than
 //! a `File` method, so a durable segment is also durable by name. Under `SyncPolicy.none`
-//! nothing is synced, the directory included. Not here: deleting reclaimed segments
-//! (checkpoint, item 10, must tell the writer how many it removed so `segments_max` counts only
-//! live ones).
+//! nothing is synced, the directory included. Reclaim: the writer never deletes a segment;
+//! `checkpoint.zig` does, and tells the writer through `segments_reclaimed` so `live_count`
+//! (and so `segments_max`) counts only live ones. The live segments are the contiguous indices
+//! `oldest_index() .. current.index`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -296,6 +297,23 @@ pub const Writer = struct {
         self.current.close(io);
         gpa.free(self.buf);
         self.* = undefined;
+    }
+
+    /// Index of the oldest live segment: the live ones are contiguous up to the current one.
+    pub fn oldest_index(self: *const Writer) u32 {
+        assert(self.live_count >= 1);
+        assert(self.current.index >= self.live_count); // Indices start at 1.
+        return self.current.index - (self.live_count - 1);
+    }
+
+    /// Records that the checkpoint deleted the `count` oldest live segments, so a later rotation
+    /// may reuse their slots under `segments_max`. The current segment is never reclaimed:
+    /// `count < live_count`, a caller contract (asserted).
+    pub fn segments_reclaimed(self: *Writer, count: u32) void {
+        assert(count >= 1);
+        assert(count < self.live_count);
+        self.live_count -= count;
+        self.check_invariants();
     }
 
     /// Where the next frame goes; see `Position`.

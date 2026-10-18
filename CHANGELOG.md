@@ -9,6 +9,15 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `wal`: `wal.checkpoint`, `Checkpoint.run`: sharp checkpoint (commit a `checkpoint` frame at `C`,
+  `flushAll` with the pool bound at `C`, page sync, `set_wal_lsn(C)`, sync) and reclaim of the
+  segments wholly below `C` (ascending, never the active one, one directory sync); a sync
+  fences each step, so a crash anywhere recovers from the old or the new `wal_lsn`.
+  `checkpoint.redo_start` derives the replay start from `wal_lsn` (0 = whole log, else the
+  intact `checkpoint` frame there, else `Corrupted`). `Writer.oldest_index` and
+  `Writer.segments_reclaimed` keep `live_count` true after a reclaim (plan 004, item 10).
+- `page`: `PageManager.set_wal_lsn(io, lsn)` rewrites page 0 with the checkpoint LSN
+  (monotonic; the caller syncs).
 - `wal`: `wal.redo`, `PageRedo`: an `Apply` target that restores a `page_image` frame through
   `PageManager` when the page is torn, unwritten or has `lsn < frame.lsn` (else skips), re-stamps
   it with `lsn = frame.lsn`, grows the file for a page id past `page_count`, ignores other frame

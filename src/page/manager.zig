@@ -2,8 +2,8 @@
 //! whole pages between a caller buffer and the file, and hands out page ids through the trunk
 //! freelist: `allocate` pops (or grows the file, bounded by `Options.page_count_max`), `free`
 //! pushes, `ensure_page_count` grows the file without touching the freelist (WAL redo of a page
-//! the file does not have yet), `sync` makes completed writes durable per the file's
-//! `SyncPolicy`.
+//! the file does not have yet), `set_wal_lsn` records the checkpoint LSN in page 0 (ADR-0003
+//! section 10), `sync` makes completed writes durable per the file's `SyncPolicy`.
 //!
 //! Invariants: page 0 holds the file header and is owned by the manager (callers address pages
 //! `1 ..< page_count`); `page_size` is a valid power of two and equals the file header's; the
@@ -267,6 +267,25 @@ pub const PageManager = struct {
         assert(self.page_count <= self.page_count_max);
     }
 
+    /// Rewrites page 0 (checksum included) with `file_header.wal_lsn = lsn`: the LSN of the
+    /// checkpoint frame recovery starts from (ADR-0003 section 10), 0 for none. The write is
+    /// not synced: the caller's `sync` makes it durable, and a crash before that leaves the old
+    /// value, which is a valid (older) start. `lsn` equal to the current value rewrites page 0
+    /// unchanged. Precondition: `lsn >= wal_lsn` (the durable start never moves back; a caller
+    /// contract, asserted). On error `wal_lsn` is unchanged in memory, page 0 may be torn.
+    pub fn set_wal_lsn(self: *PageManager, io: Io, lsn: u64) WriteError!void {
+        assert(lsn >= self.wal_lsn);
+        assert(self.page_count >= 1);
+        var scratch = [_]u8{0} ** header.page_size_max;
+        const previous = self.wal_lsn;
+        self.wal_lsn = lsn; // `write_file_header` reads it; restored on error.
+        errdefer self.wal_lsn = previous;
+
+        try self.write_file_header(io, &scratch, self.page_count, self.freelist_head);
+        assert(self.wal_lsn == lsn);
+        assert(self.wal_lsn >= previous);
+    }
+
     /// Makes every completed write durable per the file's `SyncPolicy` (a no-op for `.none`).
     pub fn sync(self: *PageManager, io: Io) SyncError!void {
         assert(self.page_count >= 1);
@@ -383,4 +402,5 @@ test {
     _ = @import("manager_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("manager_alloc_test.zig");
     _ = @import("manager_grow_test.zig");
+    _ = @import("manager_wal_lsn_test.zig");
 }

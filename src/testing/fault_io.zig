@@ -11,8 +11,9 @@
 //!     handle) it fails with `error.InputOutput` without reaching the inner `Io`; earlier
 //!     calls, and every call when it is null, forward.
 //!   - forwarders to the inner `Io` with the inner userdata: `dirCreateFile`, `dirOpenFile`,
-//!     `dirRead` (listing), `fileClose`, `fileLength`, `fileSetLength`, `fileStat`, `fileLock`,
-//!     `fileTryLock`, `fileUnlock`, `checkCancel`: everything `strata.file.File` uses.
+//!     `dirRead` (listing), `dirDeleteFile` (segment reclaim), `fileClose`, `fileLength`,
+//!     `fileSetLength`, `fileStat`, `fileLock`, `fileTryLock`, `fileUnlock`, `checkCancel`:
+//!     everything `strata.file.File` uses.
 //! Any other `Io` operation through the wrapper is not supported: use the inner `Io` directly.
 //!
 //! Allocation: none, ever. Ownership: nothing is owned; the inner `Io` is borrowed and must
@@ -80,6 +81,7 @@ pub const FaultIo = struct {
         target.vtable.dirCreateFile = forward_dir_create_file;
         target.vtable.dirOpenFile = forward_dir_open_file;
         target.vtable.dirRead = forward_dir_read;
+        target.vtable.dirDeleteFile = forward_dir_delete_file;
         target.vtable.fileClose = forward_file_close;
         target.vtable.fileSync = sync_file;
         target.vtable.fileLength = forward_file_length;
@@ -156,6 +158,18 @@ fn forward_dir_read(
     assert(buffer.len > 0);
     assert(self.inner.vtable.dirRead != forward_dir_read);
     return self.inner.vtable.dirRead(self.inner.userdata, reader, buffer);
+}
+
+/// File deletion passes through (checkpoint reclaim); it is not counted and never faults.
+fn forward_dir_delete_file(
+    userdata: ?*anyopaque,
+    dir: Dir,
+    sub_path: []const u8,
+) Dir.DeleteFileError!void {
+    const self = self_of(userdata);
+    assert(sub_path.len > 0);
+    assert(self.inner.vtable.dirDeleteFile != forward_dir_delete_file);
+    return self.inner.vtable.dirDeleteFile(self.inner.userdata, dir, sub_path);
 }
 
 fn forward_file_close(userdata: ?*anyopaque, files: []const File) void {
