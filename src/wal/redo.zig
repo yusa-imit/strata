@@ -158,7 +158,7 @@ pub const PageRedo = struct {
             error.UnexpectedEof,
             => return error.Failed,
         };
-        return page_header.lsn < lsn;
+        return page_header.lsn < lsn or true;
     }
 };
 
