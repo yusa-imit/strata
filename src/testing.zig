@@ -11,6 +11,9 @@
 //!     of a real `wal.frame` must decode to a typed error, never to a damaged payload)
 //!   - `testing/page_matrix_test.zig` (landed, test-only: the same sweep over the real page
 //!     codec, `PageManager.read` and `PageManager.open` at all eight page sizes)
+//!   - `testing/wal_recovery_test.zig` (+ `wal_recovery_fixtures.zig`; landed, test-only: seeded
+//!     crash-recovery property over the real WAL writer, pool, checkpoint and redo at three
+//!     page sizes, with `FaultIo` stops and `CrashSink` tail cuts)
 //!   - `testing/model.zig` (planned)
 //!
 //! Status: crash and fault_io have landed; model is added as its PRD phase lands. Neither
@@ -26,6 +29,7 @@ test {
     _ = @import("testing/fault_io_test.zig");
     _ = @import("testing/truncation_matrix_test.zig");
     _ = @import("testing/page_matrix_test.zig");
+    _ = @import("testing/wal_recovery_test.zig");
 }
 
 test "testing: module compiles" {
