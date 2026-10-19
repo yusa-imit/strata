@@ -9,6 +9,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `testing`: `wal_recovery_test.zig` (+ `wal_recovery_fixtures.zig`): seeded crash-recovery
+  property over the real WAL writer, buffer pool, checkpoint and redo at 512 B, 4 KiB and 64 KiB
+  pages with 12 fixed seeds each. A random op stream runs over a `FaultIo` that cancels writes
+  from a random call on, a `CrashSink` truncate or torn cut hits the unsynced tail, and cold
+  recovery must replay every acknowledged LSN in order, invent nothing, leave every page equal
+  to the model and replay idempotently. Checked by hand, not by a committed test: a redo that
+  never applies fails it at every page size, the pool gate switched off fails it at 64 KiB.
 - `wal`: `wal.checkpoint`, `Checkpoint.run`: sharp checkpoint (commit a `checkpoint` frame at `C`,
   `flushAll` with the pool bound at `C`, page sync, `set_wal_lsn(C)`, sync) and reclaim of the
   segments wholly below `C` (ascending, never the active one, one directory sync); a sync

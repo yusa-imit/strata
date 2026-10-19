@@ -158,13 +158,21 @@ pub const Env = struct {
     /// B+Tree would; the model learns it. Returns the frame's LSN.
     pub fn edit(env: *Env, id: u32, seed: u32) !Lsn {
         assert(id >= 1 and id <= pages_used);
+        assert(env.open);
+        return env.edit_io(testing.io, id, seed);
+    }
+
+    /// `edit` with the log and the pool going through `io` (a `FaultIo` in crash tests). When
+    /// the pool step fails the frame is already in the log and the page is not edited.
+    pub fn edit_io(env: *Env, io: Io, id: u32, seed: u32) !Lsn {
+        assert(id >= 1 and id <= pages_used);
         const payload = try rfx.image_payload(env.size, id, seed, pfx.consumer_type, rfx.stale_lsn);
         defer testing.allocator.free(payload);
 
         assert(env.open);
         assert(payload.len == 4 + env.size);
-        const lsn = try env.log.append(testing.io, .page_image, payload);
-        var guard = try env.pool.fetchForUpdate(testing.io, pfx.id_of(id));
+        const lsn = try env.log.append(io, .page_image, payload);
+        var guard = try env.pool.fetchForUpdate(io, pfx.id_of(id));
         defer guard.release();
 
         fixtures.pattern(guard.bytes_mut()[header.header_size..], seed);
