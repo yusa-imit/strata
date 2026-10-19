@@ -27,11 +27,11 @@
 
 ## Phase 3 — WAL & Recovery
 
-- [ ] 3A `wal/frame.zig`, `wal/segment.zig`
-- [ ] 3B `wal/writer.zig` — group commit
-- [ ] 3C `wal/reader.zig`, `wal/recovery.zig`
-- [ ] 3D `wal/checkpoint.zig`
-- [ ] 3E crash-recovery property tests
+- [x] 3A `wal/frame.zig`, `wal/segment.zig`
+- [x] 3B `wal/writer.zig` — group commit
+- [x] 3C `wal/reader.zig`, `wal/recovery.zig`
+- [x] 3D `wal/checkpoint.zig`
+- [x] 3E crash-recovery property tests
 
 ## Phase 4 — B+Tree & KV
 
