@@ -135,7 +135,8 @@ pub const Ref = struct {
 
     /// End of the frame at `lsn` (the next frame's LSN, else `next_lsn`); `lsn == 0` is the
     /// start of the log.
-    pub fn end_of(self: *const Ref, lsn: Lsn, next_lsn: Lsn) Lsn {
+    /// `error.UnknownLsn` when the writer calls durable an LSN the harness never recorded.
+    pub fn end_of(self: *const Ref, lsn: Lsn, next_lsn: Lsn) error{UnknownLsn}!Lsn {
         assert(self.count <= recs_max);
         assert(lsn < next_lsn);
         const all = self.items();
@@ -144,7 +145,7 @@ pub const Ref = struct {
             if (rec.lsn != lsn) continue;
             return if (i + 1 < all.len) all[i + 1].lsn else next_lsn;
         }
-        unreachable; // Every LSN the writer calls durable is a frame the harness recorded.
+        return error.UnknownLsn;
     }
 
     /// The pages every frame up to `upto` leaves, on top of the initial pages.
@@ -272,7 +273,7 @@ pub const Run = struct {
             run.stats.ops += 1;
             run.step() catch |err| switch (classify(err)) {
                 .crash => run.finished = true,
-                .skip => run.relieve(),
+                .skip => try run.relieve(),
                 .fatal => return err,
             };
             if (run.finished) break;
@@ -300,11 +301,12 @@ pub const Run = struct {
 
     /// The log is full: a checkpoint is the only way to make room; if that fails too, the
     /// stream ends (a full log, not a crash).
-    fn relieve(run: *Run) void {
+    fn relieve(run: *Run) !void {
         assert(!run.finished);
         assert(run.ref.count + 8 < recs_max);
-        run.op_checkpoint(run.fio.io()) catch {
-            run.finished = true;
+        run.op_checkpoint(run.fio.io()) catch |err| switch (classify(err)) {
+            .crash, .skip => run.finished = true,
+            .fatal => return err,
         };
         assert(run.ref.count < recs_max);
         assert(run.env.log.live_count <= segments_max);
@@ -371,8 +373,8 @@ pub const Run = struct {
         log.check_invariants();
         run.durable_lsn = log.durable_lsn;
         try testing.expect(run.acked_lsn <= run.durable_lsn);
-        const durable_end = run.ref.end_of(run.durable_lsn, log.next_lsn);
-        assert(durable_end >= log.current.first_lsn);
+        const durable_end = try run.ref.end_of(run.durable_lsn, log.next_lsn);
+        try testing.expect(durable_end >= log.current.first_lsn);
         const durable_offset = segment.segment_header_size + (durable_end - log.current.first_lsn);
         const index = log.current.index;
         run.env.close_handles();
