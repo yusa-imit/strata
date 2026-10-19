@@ -7,8 +7,17 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-20
+
+WAL format v1 (`docs/adr/0003-wal-format.md`) is on-disk API from this tag: `wal-NNNNNNNN.log`
+segments with a 24-byte header, 17-byte frames, CRC32C seeded with the expected LSN, byte-position
+LSNs. A later change to it needs a version bump and migration notes.
+
 ### Added
 
+- `wal`: `wal.zig` drops its `NotImplemented` placeholder and re-exports `Frame`, `Reader`,
+  `Writer`, `Apply`, `Recovery`, `PageRedo` and `Checkpoint` next to the submodules (plan 004,
+  item 12).
 - `testing`: `wal_recovery_test.zig` (+ `wal_recovery_fixtures.zig`): seeded crash-recovery
   property over the real WAL writer, buffer pool, checkpoint and redo at 512 B, 4 KiB and 64 KiB
   pages with 12 fixed seeds each. A random op stream runs over a `FaultIo` that cancels writes

@@ -12,23 +12,25 @@
 //! checkpoint with `wal_lsn` update and segment reclaim; `redo_start`: the replay start derived
 //! from `wal_lsn`).
 //!
-//! Status: stub. Public declarations are added as PRD phases land.
+//! Status: landed (plan 004, WAL format v1 per `docs/adr/0003-wal-format.md`). Group commit
+//! is `Writer.commit`; its machinery lives in `wal/group_commit.zig`, which is internal.
 
 const std = @import("std");
 
 pub const frame = @import("wal/frame.zig");
+pub const Frame = frame.Frame;
 pub const segment = @import("wal/segment.zig");
 pub const reader = @import("wal/reader.zig");
+pub const Reader = reader.Reader;
 pub const writer = @import("wal/writer.zig");
+pub const Writer = writer.Writer;
 pub const recovery = @import("wal/recovery.zig");
+pub const Apply = recovery.Apply;
+pub const Recovery = recovery.Recovery;
 pub const redo = @import("wal/redo.zig");
+pub const PageRedo = redo.PageRedo;
 pub const checkpoint = @import("wal/checkpoint.zig");
-
-/// Module-level error set. Extend as functionality lands; keep names descriptive
-/// (`error.ChecksumMismatch`, not `error.Invalid`).
-pub const Error = error{
-    NotImplemented,
-};
+pub const Checkpoint = checkpoint.Checkpoint;
 
 test "wal: module compiles" {
     std.testing.refAllDecls(@This());

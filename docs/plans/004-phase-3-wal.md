@@ -83,7 +83,7 @@ data: format, then the read path (`Writer.init` reuses it to find the tail), the
       stop, then a torn or truncated cut of the unsynced tail); recover; every committed LSN
       present, nothing past the last sync invented, pages match. Verify: 3 page sizes × fixed
       seeds green in `zig build test`; mutants (gate off, redo ignores LSN) fail the property.
-- [ ] **Docs, module status, release v0.5.0** (`docs/`, `README.md`, `build.zig.zon`). After
+- [x] **Docs, module status, release v0.5.0** (`docs/`, `README.md`, `build.zig.zon`). After
       every box above. Drop `NotImplemented` from `src/wal.zig`, re-export real declarations;
       README wal row `Planned` → `Landed`; tick 3A–3E in `docs/plans/000-inherited.md`;
       `CHANGELOG.md` (with the WAL format v1 note) + `.version = "0.5.0"` in one PR, then tag.
