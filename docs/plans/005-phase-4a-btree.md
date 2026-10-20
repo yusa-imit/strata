@@ -21,7 +21,7 @@ No item is blocked — `.dependencies = .{}`. Order: format, pure node codec, tr
 proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a page does (PRD
 §4.6). Descent uses an explicit stack bounded by `height_max`, never recursion.
 
-- [ ] **ADR-0004 — B+Tree page format v1** (`docs/adr/0004-btree-format.md`). Format before
+- [x] **ADR-0004 — B+Tree page format v1** (`docs/adr/0004-btree-format.md`). Format before
       bytes (REALM.md). Fixes: leaf, internal, overflow types in ADR-0002's 16–31 range (no page
       bump, §8); slotted layout, `u16` offsets relative to the payload so 64 KiB fits (ADR-0002's
       open `u16` cost); `key_len_max` and inline value limit per page size (≥ 4 cells at 512 B);

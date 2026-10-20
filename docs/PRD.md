@@ -216,6 +216,7 @@ pub const Checkpoint = struct {
 
 ### 4.6 `btree`
 - 가변 길이 키/값, slotted page, 내부 노드 `[key, child]`, 리프 `[key, value] + next_leaf`
+  (바이트 단위 포맷은 [ADR-0004](adr/0004-btree-format.md))
 - split/merge/rebalance, 오버플로 페이지(큰 값), 범위 커서(prev/next/seek), 벌크 로드
 - `validate()` — 정렬, 팬아웃, 연결 리스트 불변식
 - `io` 캐시 없음. 경계는 명확하다: **`node.zig`(slotted page 인코딩)는 이미 메모리에 있는
@@ -243,7 +244,7 @@ pub const Cursor = struct {
 };
 
 // node.zig — 순수: encode/decode/split point 계산 모두 `io` 없음.
-pub fn parseLeaf(bytes: []const u8, page_size: u32) ParseError!Leaf;
+pub fn parseLeaf(bytes: []const u8) ParseError!Leaf; // page size = bytes.len (ADR-0004)
 ```
 
 ### 4.7 `lsm`

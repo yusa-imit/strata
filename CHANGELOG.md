@@ -7,6 +7,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- ADR-0004 `docs/adr/0004-btree-format.md`: B+Tree page format v1 (page types 16–18, slotted
+  layout, per-page-size limits, one-frame-per-op logging, deferred frees). No code yet.
+
 ## [0.5.0] - 2026-10-20
 
 WAL format v1 (`docs/adr/0003-wal-format.md`) is on-disk API from this tag: `wal-NNNNNNNN.log`
