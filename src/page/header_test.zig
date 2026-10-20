@@ -377,7 +377,8 @@ test "page header: every page_type byte is classified per ADR section 1 at id 5"
         var page = base;
         page[4] = @intCast(type_value);
         try restamp(gpa, &page, id_of(5));
-        const accepted = type_value == 2 or type_value >= 128;
+        const btree_type = type_value >= 16 and type_value <= 18; // ADR-0004 section 1.
+        const accepted = type_value == 2 or btree_type or type_value >= 128;
         if (accepted) {
             const header = try decode(&page, id_of(5));
             const returned: u8 = @intFromEnum(header.page_type);
@@ -390,6 +391,23 @@ test "page header: every page_type byte is classified per ADR section 1 at id 5"
     var stale = base;
     stale[4] = 3; // Unchecked type byte with a stale checksum is a mismatch, not corrupted.
     try std.testing.expectError(error.ChecksumMismatch, decode(&stale, id_of(5)));
+}
+
+test "page header: btree types 16..18 are named, round trip, and are illegal at id 0" {
+    try std.testing.expectEqual(@as(u8, 16), @intFromEnum(Type.btree_leaf));
+    try std.testing.expectEqual(@as(u8, 17), @intFromEnum(Type.btree_internal));
+    try std.testing.expectEqual(@as(u8, 18), @intFromEnum(Type.btree_overflow));
+    var page: [512]u8 = @splat(0);
+    for ([_]Type{ .btree_leaf, .btree_internal, .btree_overflow }) |page_type| {
+        encode(&page, id_of(1), .{ .page_type = page_type, .lsn = 3 });
+        const decoded = try decode(&page, id_of(1));
+        try std.testing.expectEqual(page_type, decoded.page_type);
+        try std.testing.expect(h.type_valid(id_of(1), @intFromEnum(page_type)));
+        try std.testing.expect(!h.type_valid(.file_header, @intFromEnum(page_type)));
+    }
+    try std.testing.expect(!h.type_valid(id_of(1), 19));
+    try std.testing.expect(!h.type_valid(id_of(1), 31));
+    try std.testing.expect(!h.type_valid(id_of(1), 15));
 }
 
 test "page header: only file_header is accepted at id 0, and id 0 accepts nothing else" {
