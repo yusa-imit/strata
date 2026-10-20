@@ -9,7 +9,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 - ADR-0004 `docs/adr/0004-btree-format.md`: B+Tree page format v1 (page types 16–18, slotted
-  layout, per-page-size limits, one-frame-per-op logging, deferred frees). No code yet.
+  layout, per-page-size limits, one-frame-per-op logging, deferred frees).
+- `btree/node.zig`: B+Tree leaf codec (`parse_leaf`, `Leaf.entry/search`, `leaf_insert`,
+  `leaf_remove`) with the ADR-0004 limits; page types `btree_leaf`, `btree_internal` and
+  `btree_overflow` (16–18) are now legal in `page/header.zig`.
 
 ## [0.5.0] - 2026-10-20
 

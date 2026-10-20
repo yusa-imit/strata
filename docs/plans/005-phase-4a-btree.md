@@ -29,7 +29,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       `height_max`; logging policy and atomicity (recommend one multi-image frame per op in the
       WAL's strata 16–127 range, under `frame_bytes_max`); frees deferred until the op is
       durable (Risks). Verify: ADR merged; PRD §4.6 links it.
-- [ ] **`btree/node.zig` — leaf cells** (`src/btree/`). Pure. Parse/encode a leaf over frame
+- [x] **`btree/node.zig` — leaf cells** (`src/btree/`). Pure. Parse/encode a leaf over frame
       bytes, binary search, insert/remove a cell, compact free space; register the types in
       `page/header.zig`. Disk bytes are untrusted: a bad offset or length is `Corrupted`, never
       an assert. Verify: golden leaf hex at 512 B; round trip at 512 B, 4 KiB, 64 KiB; a seeded

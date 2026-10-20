@@ -27,8 +27,16 @@ pub const magic: [4]u8 = "STRA".*;
 /// Page identifier. Id 0 is the file header page and doubles as the on-disk "none" link.
 pub const Id = enum(u32) { file_header = 0, _ };
 
-/// Page type byte. Values 128..255 belong to consumers and are accepted as-is.
-pub const Type = enum(u8) { file_header = 1, free_trunk = 2, _ };
+/// Page type byte. Values 16..18 are the B+Tree node types (ADR-0004 section 1); 19..31 are
+/// reserved for successor layouts; 128..255 belong to consumers and are accepted as-is.
+pub const Type = enum(u8) {
+    file_header = 1,
+    free_trunk = 2,
+    btree_leaf = 16,
+    btree_internal = 17,
+    btree_overflow = 18,
+    _,
+};
 
 pub const Header = struct { page_type: Type, lsn: u64 };
 
@@ -104,12 +112,17 @@ fn magic_is_zero(page: []const u8) bool {
 }
 
 /// True when the type byte is legal at `id` (ADR section 1): `file_header` only at id 0 and
-/// nothing else there; `free_trunk` and consumer types (128..255) elsewhere.
+/// nothing else there; `free_trunk`, the B+Tree types 16..18 (ADR-0004 section 1) and consumer
+/// types (128..255) elsewhere.
 pub fn type_valid(id: Id, type_byte: u8) bool {
     const file_header_byte: u8 = @intFromEnum(Type.file_header);
     const free_trunk_byte: u8 = @intFromEnum(Type.free_trunk);
     assert(file_header_byte != free_trunk_byte);
     if (id == .file_header) return type_byte == file_header_byte;
+    const btree_first: u8 = @intFromEnum(Type.btree_leaf);
+    const btree_last: u8 = @intFromEnum(Type.btree_overflow);
+    assert(btree_first < btree_last);
+    if (type_byte >= btree_first and type_byte <= btree_last) return true;
     return type_byte == free_trunk_byte or type_byte >= type_consumer_min;
 }
 
