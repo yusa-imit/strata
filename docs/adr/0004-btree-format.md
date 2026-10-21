@@ -388,8 +388,10 @@ pub const Value = union(enum) { bytes: []const u8, overflow: struct { head: Id, 
 pub const Entry = struct { key: []const u8, value: Value }; // borrows the page
 pub const Slot = struct { index: u16, found: bool };
 pub fn parse_leaf(page: []const u8) ParseError!Leaf; // Leaf.entry(i), Leaf.search(key)
+// btree/internal.zig: internal cells, same slot layout and untrusted-bytes rules as the leaf.
 pub fn parse_internal(page: []const u8, level: u8) ParseError!Internal;
-pub fn split_point(page: []const u8, incoming_bytes: u32, at: u16) u16; // after parse
+// btree/split.zig: Corrupted when the page bytes cannot be split; call it on a parsed node.
+pub fn split_point(page: []const u8, incoming_bytes: u32, at: u16) ParseError!u16;
 
 // btree/tree.zig
 pub const Options = struct { value_len_max: u32, frees_pending_max: u32 };

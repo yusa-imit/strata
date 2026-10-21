@@ -34,8 +34,8 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       `page/header.zig`. Disk bytes are untrusted: a bad offset or length is `Corrupted`, never
       an assert. Verify: golden leaf hex at 512 B; round trip at 512 B, 4 KiB, 64 KiB; a seeded
       random-bytes sweep yields typed errors only; the slot table never overlaps a cell.
-- [ ] **`btree/node.zig` — internal cells, split point** (`src/btree/`). Pure. `[key, child]`
-      cells plus the rightmost child; `split_point` by bytes, not count, so variable-length keys
+- [x] **`btree/internal.zig`, `btree/split.zig` — internal cells, split point**
+      (`src/btree/`). Pure. `[key, child]` cells plus the rightmost child; `split_point` by bytes, not count, so variable-length keys
       split evenly. Verify: golden internal hex; splitting a full node at all 8 page sizes leaves
       both halves ordered and under capacity; a child id 0 → `Corrupted`.
 - [ ] **`btree/tree.zig` — create, get, insert into the root leaf** (`src/btree/`, `src/cache/`).

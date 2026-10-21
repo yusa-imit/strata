@@ -7,13 +7,16 @@
 //!   - `btree/cursor.zig`
 //!   - `btree/overflow.zig`
 //!
-//! Landed: `btree/node.zig` (ADR-0004 limits and leaf cell codec).
+//! Landed: `btree/node.zig` (ADR-0004 limits and leaf cell codec), `btree/internal.zig`
+//! (internal cell codec) and `btree/split.zig` (split point by bytes).
 //!
 //! Status: partial. Public declarations are added as PRD phases land.
 
 const std = @import("std");
 
 pub const node = @import("btree/node.zig");
+pub const internal = @import("btree/internal.zig");
+pub const split = @import("btree/split.zig");
 
 /// Module-level error set. Extend as functionality lands; keep names descriptive
 /// (`error.ChecksumMismatch`, not `error.Invalid`).

@@ -13,6 +13,10 @@ All notable changes to this project are documented in this file. The format foll
 - `btree/node.zig`: B+Tree leaf codec (`parse_leaf`, `Leaf.entry/search`, `leaf_insert`,
   `leaf_remove`) with the ADR-0004 limits; page types `btree_leaf`, `btree_internal` and
   `btree_overflow` (16–18) are now legal in `page/header.zig`.
+- `btree/internal.zig`: B+Tree internal-node codec (`parse_internal`, `format_internal`,
+  `Internal.entry/child_index/child_at`, `internal_insert`, `internal_remove`, `set_child`,
+  `set_right_child`) and `btree/split.zig`: byte-balanced `split_point` for leaf and internal
+  nodes.
 
 ## [0.5.0] - 2026-10-20
 
