@@ -26,18 +26,18 @@ pub const height_limit: u8 = 16;
 pub const value_len_max: u32 = 1 << 20;
 pub const slot_size: u32 = 2;
 
-const payload_start: u32 = 8; // Payload offset of slot 0.
+pub const payload_start: u32 = 8; // Payload offset of slot 0.
 const images_header_size: u32 = 8; // `count` + `page_size` of a page_images frame (ADR section 9).
 const image_id_size: u32 = 4;
-const offset_count: u32 = 24;
-const offset_level: u32 = 26;
-const offset_reserved: u32 = 27;
-const offset_link: u32 = 28;
-const offset_slots: u32 = 32;
-const offset_type: u32 = 4;
+pub const offset_count: u32 = 24;
+pub const offset_level: u32 = 26;
+pub const offset_reserved: u32 = 27;
+pub const offset_link: u32 = 28;
+pub const offset_slots: u32 = 32;
+pub const offset_type: u32 = 4;
 const key_len_cap: u32 = 1024;
 const cell_overhead_max: u32 = 10; // two 3-byte varints plus a 4-byte overflow head.
-const search_steps_max: u32 = 16; // 2^16 > cell_count_max at every page size.
+pub const search_steps_max: u32 = 16; // 2^16 > cell_count_max at every page size.
 
 pub const ParseError = error{Corrupted};
 pub const InsertError = error{ NodeFull, Corrupted };
@@ -129,31 +129,32 @@ comptime {
     assert(codec.varint.encoded_size(value_len_max) == 3);
 }
 
-fn get16(page: []const u8, offset: u32) u32 {
+pub fn get16(page: []const u8, offset: u32) u32 {
     assert(offset + 2 <= page.len);
     assert(offset >= header.header_size);
     return std.mem.readInt(u16, page[offset..][0..2], .little);
 }
 
-fn put16(page: []u8, offset: u32, value: u32) void {
+pub fn put16(page: []u8, offset: u32, value: u32) void {
     assert(offset + 2 <= page.len);
+    assert(offset >= header.header_size);
     assert(value <= std.math.maxInt(u16));
     std.mem.writeInt(u16, page[offset..][0..2], @intCast(value), .little);
 }
 
-fn get32(page: []const u8, offset: u32) u32 {
+pub fn get32(page: []const u8, offset: u32) u32 {
     assert(offset + 4 <= page.len);
     assert(offset >= header.header_size);
     return std.mem.readInt(u32, page[offset..][0..4], .little);
 }
 
-fn put32(page: []u8, offset: u32, value: u32) void {
+pub fn put32(page: []u8, offset: u32, value: u32) void {
     assert(offset + 4 <= page.len);
     assert(offset >= header.header_size);
     std.mem.writeInt(u32, page[offset..][0..4], value, .little);
 }
 
-fn page_size_of(page: []const u8) u32 {
+pub fn page_size_of(page: []const u8) u32 {
     assert(page.len <= header.page_size_max);
     assert(header.page_size_valid(@intCast(page.len)));
     return @intCast(page.len);
