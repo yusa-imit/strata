@@ -27,6 +27,10 @@
 //! `PageManager.write` stamps magic, version and the page-id-seeded
 //! checksum from `header.peek` of the frame at write-back time, so a frame's checksum is stale
 //! while it is dirty. The pool never calls `sync`; durability is the caller's call.
+//! New pages (ADR-0004 section 13): `fetchNew` pins a page that `PageManager.allocate` just
+//! returned, whose bytes on disk are `Unwritten` (grown) or stale (reused) and so are never read:
+//! the frame is zero-filled, marked dirty and handed out writable. The caller formats it (a legal
+//! page type byte is required before any write-back, else `InvalidHeader`).
 //! `deinit` asserts zero pinned and zero dirty frames: `flushAll` (or `discardAll`) first.
 //! A page changed behind the pool's back through `PageManager.write` or freed through
 //! `PageManager.free` is not noticed while a frame still holds its old copy.
@@ -61,6 +65,9 @@ pub const Options = struct {
 /// through `bytes_mut`: caught at write-back in every build mode, the frame stays dirty.
 pub const FetchError = manager.ReadError || WriteBackError || error{PoolExhausted};
 
+/// `fetchNew` reads nothing, so only the victim's write-back and a full pool can fail it.
+pub const FetchNewError = WriteBackError || error{PoolExhausted};
+
 /// `flushAll` stops at the first failed write; that frame and every later dirty one stay dirty.
 pub const FlushError = WriteBackError;
 
@@ -69,7 +76,8 @@ pub const WriteBackError = manager.WriteError || error{InvalidHeader};
 pub const PageGuard = guard.PageGuard;
 
 /// Counters since `init`. `hits + misses` is the number of `fetch` calls that passed their
-/// preconditions; a miss that fails to load still counts. `evictions` counts pages dropped to
+/// preconditions, and `fetchNew` counts like `fetch` (a hit on a resident frame, else a miss);
+/// a miss that fails to load still counts. `evictions` counts pages dropped to
 /// make room, whether or not the following load succeeded (a victim whose write-back fails is
 /// not evicted). `writebacks` counts successful page writes, from eviction and `flushAll`.
 /// `gated` counts dirty frames `flushAll` left unwritten because their lsn was above the
@@ -208,6 +216,35 @@ pub const BufferPool = struct {
         assert(@intFromEnum(id) >= 1);
         const pinned = try self.fetch_pinned(io, id, true);
         assert(pinned.updatable);
+        return pinned;
+    }
+
+    /// Pins a page that was just allocated, without reading it: the frame is zero-filled (header
+    /// included), marked dirty and returned behind a writable guard. For an id that grew the
+    /// file (`fetch` would say `Unwritten`) and for a reused id (the file holds a stale trunk and
+    /// the pool may hold a stale frame, which is zeroed in place). The caller must write a legal
+    /// page type byte (and lsn) before the frame is written back, or write-back is
+    /// `InvalidHeader`. A miss evicts like `fetch` (`PoolExhausted`, or the victim's write error);
+    /// a hit counts as a hit. Never allocates. Preconditions: `0 < id < page_count`, and no
+    /// guard on `id` is outstanding (a page being re-created has no readers). The pinned-hit
+    /// check is a plain assert, so only ReleaseSafe and Debug catch a violation.
+    pub fn fetchNew(self: *BufferPool, io: Io, id: Id) FetchNewError!PageGuard {
+        const raw = @intFromEnum(id);
+        assert(raw >= 1);
+        assert(raw < self.pages.page_count);
+        var pinned: PageGuard = undefined;
+        if (self.table.get(raw)) |index| {
+            assert(self.frames[index].pin_count == 0);
+            pinned = self.pin_hit(index, true);
+        } else {
+            self.counters.misses += 1;
+            const index = try self.victim_find();
+            try self.victim_evict(io, index);
+            pinned = self.pin_load(index, raw, true);
+        }
+        @memset(self.frame_bytes(pinned.frame_index), 0);
+        self.mark_dirty(pinned.frame_index);
+        assert(self.frames[pinned.frame_index].dirty);
         return pinned;
     }
 
@@ -478,4 +515,5 @@ test {
     _ = @import("buffer_pool_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("buffer_pool_dirty_test.zig");
     _ = @import("buffer_pool_gate_test.zig");
+    _ = @import("buffer_pool_new_test.zig");
 }

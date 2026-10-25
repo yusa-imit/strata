@@ -35,7 +35,7 @@ pub const offset_reserved: u32 = 27;
 pub const offset_link: u32 = 28;
 pub const offset_slots: u32 = 32;
 pub const offset_type: u32 = 4;
-const key_len_cap: u32 = 1024;
+pub const key_len_cap: u32 = 1024;
 const cell_overhead_max: u32 = 10; // two 3-byte varints plus a 4-byte overflow head.
 pub const search_steps_max: u32 = 16; // 2^16 > cell_count_max at every page size.
 

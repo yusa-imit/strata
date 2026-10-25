@@ -401,7 +401,7 @@ pub const InsertError = cache.FetchError || page.AllocateError ||
 // release_frees(io) FreeError!u32, validate(io, gpa), check_invariants().
 
 // Additive elsewhere (no signature or error-set change):
-// BufferPool.fetchNew(io, id) FetchError!PageGuard   zeroed frame, no read
+// BufferPool.fetchNew(io, id) FetchNewError!PageGuard zeroed frame, no read
 // BufferPool.discard(id) void                        drop an unpinned frame, never write back
 // PageManager.free_at(io, id, lsn) FreeError!void    trunks stamped max(wal_lsn, lsn)
 // wal.frame.Type.page_images = 16                    payload_valid and PageRedo learn it
