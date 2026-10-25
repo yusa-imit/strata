@@ -2,7 +2,10 @@
 //! create allocates the fixed root, insert/get/overwrite without a split at all eight page sizes,
 //! key and value boundaries, `NodeFull` leaving the page byte-identical, corrupted root pages
 //! giving typed errors, no allocation after init, and a seeded model against a hash map. Every
-//! declared error variant of `Tree` is provoked here.
+//! error variant `Tree` declares itself (`KeyTooLarge`, `ValueTooLarge`, `NodeFull`, `Corrupted`
+//! from each of its branches) is provoked here; the page, pool and file layers' errors pass
+//! through unchanged and only the representative ones (`ChecksumMismatch`, `Unwritten`,
+//! `PoolExhausted`, `InvalidHeader`, `NoSpaceLeft`) are shown.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,6 +21,7 @@ const tree_mod = @import("tree.zig");
 const PageManager = manager.PageManager;
 const BufferPool = buffer_pool.BufferPool;
 const Tree = tree_mod.Tree;
+const Edit = *const fn ([]u8) anyerror!void;
 
 /// One construction path: a temp dir, a page file, a pool and a created tree, built in place.
 const Fixture = struct {
@@ -114,7 +118,7 @@ fn inline_value_max(page_size: u32, key_len: u32) u32 {
     return value_len;
 }
 
-test "create: the root is the first allocated id, an empty valid leaf, and nothing is read" {
+test "create: the root is the first allocated id and an empty valid leaf, not yet on disk" {
     for (fx.sizes_all) |size| {
         var f: Fixture = undefined;
         try f.start(testing.allocator, size, 2);
@@ -122,13 +126,15 @@ test "create: the root is the first allocated id, an empty valid leaf, and nothi
 
         try testing.expectEqual(@as(u32, 1), f.root_u32());
         try testing.expectEqual(size, f.tree.page_size);
+        try testing.expectEqual(@as(u64, 0), f.pool.stats().writebacks);
+        try testing.expectEqual(@as(u32, 1), f.pool.dirty_count);
         try testing.expectEqual(@as(u16, 0), try leaf_count(&f));
         try expect_get(&f.tree, "", null);
         try expect_get(&f.tree, "anything", null);
         try f.cold();
         try testing.expectEqual(@as(u16, 0), try leaf_count(&f)); // Durable after the flush.
         var reopened: Tree = undefined;
-        Tree.open(&reopened, &f.pool, f.tree.root);
+        try Tree.open(&reopened, &f.pool, f.tree.root);
         try expect_get(&reopened, "x", null);
     }
 }
@@ -189,20 +195,68 @@ test "insert and get: out-of-order keys, overwrite longer and shorter, at all pa
     }
 }
 
-test "insert: an edit stamps a valid checksum and keeps the page lsn" {
+test "insert: an edit stamps a valid checksum and keeps a non-zero page lsn" {
     var f: Fixture = undefined;
     try f.start(testing.allocator, 512, 2);
     defer f.stop(testing.allocator);
 
+    var guard = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+    guard.set_lsn(5);
+    guard.release();
     try f.tree.insert(testing.io, "a", "1");
+    try f.tree.insert(testing.io, "a", "22"); // An overwrite re-seals too.
+    try testing.expectEqual(@as(u64, 5), header.peek(try page_bytes(&f)).lsn);
     try f.cold();
     var buf: [512]u8 = undefined;
-    const h = try f.pm.read(testing.io, f.tree.root, &buf);
+    const h = try f.pm.read(testing.io, f.tree.root, &buf); // Decode verifies the checksum.
     try testing.expectEqual(header.Type.btree_leaf, h.page_type);
-    try testing.expectEqual(@as(u64, 0), h.lsn);
+    try testing.expectEqual(@as(u64, 5), h.lsn);
     const leaf = try node.parse_leaf(&buf);
     try leaf.check_link(f.tree.root);
     try testing.expectEqual(@as(?header.Id, null), leaf.next);
+    try expect_get(&f.tree, "a", "22");
+}
+
+test "open: a persisted root outside the file is Corrupted and leaves the target alone" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 2);
+    defer f.stop(testing.allocator);
+
+    var t: Tree = f.tree;
+    const before = t;
+    const past: header.Id = @enumFromInt(f.pm.page_count);
+    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, .file_header));
+    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, past));
+    try testing.expectEqual(before.root, t.root);
+    try Tree.open(&t, &f.pool, f.tree.root);
+    try expect_get(&t, "none", null);
+}
+
+test "create: PoolExhausted (id leaked, target untouched) and InvalidHeader (dirty victim)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pm: PageManager = undefined;
+    try PageManager.create(&pm, testing.io, tmp.dir, "c.db", fx.opts(512));
+    defer pm.close(testing.io);
+
+    var pool: BufferPool = undefined;
+    try BufferPool.init(&pool, testing.allocator, &pm, .{ .frames_max = 1, .page_size = 512 });
+    defer pool.deinit(testing.allocator);
+
+    const first = try pm.allocate(testing.io);
+    var pin = try pool.fetchNew(testing.io, first);
+    var t: Tree = .{ .pool = &pool, .root = first, .page_size = 512 };
+    const count_before = pm.page_count;
+    try testing.expectError(error.PoolExhausted, Tree.create(&t, testing.io, &pool));
+    try testing.expectEqual(first, t.root);
+    try testing.expectEqual(count_before + 1, pm.page_count); // The allocated id leaks.
+    pin.release();
+    // The victim is dirty and unformatted (type byte 0), so evicting it for the root fails.
+    try testing.expectError(error.InvalidHeader, Tree.create(&t, testing.io, &pool));
+    try testing.expectEqual(first, t.root);
+    try testing.expectEqual(@as(u32, 0), pool.pinned_count());
+    pool.discardAll();
 }
 
 test "boundaries: empty key, longest key, longest inline value, and one past each" {
@@ -285,65 +339,124 @@ fn page_bytes(f: *Fixture) ![]const u8 {
 }
 
 /// Re-reads the root, applies `edit`, rewrites it with a fresh checksum (so the codec accepts it).
-fn craft_root(f: *Fixture, edit: *const fn ([]u8) void) !void {
+fn craft_root(f: *Fixture, edit: Edit) !void {
     assert(f.pool.pinned_count() == 0);
     try f.cold();
     var buf: [header.page_size_max]u8 = undefined;
     const page = buf[0..f.pm.page_size];
     _ = try f.pm.read(testing.io, f.tree.root, page);
-    edit(page);
+    try edit(page);
     const sealed = header.peek(page);
     try f.pm.write(testing.io, f.tree.root, page, sealed);
     assert(header.peek(page).page_type == sealed.page_type);
 }
 
-fn edit_count_huge(page: []u8) void {
+fn edit_count_huge(page: []u8) anyerror!void {
     assert(page.len >= 64);
     assert(page[node.offset_type] == @intFromEnum(header.Type.btree_leaf));
     node.put16(page, node.offset_count, 0xFFFF);
 }
 
-fn edit_type_internal(page: []u8) void {
+fn edit_type_internal(page: []u8) anyerror!void {
     assert(page.len >= 64);
     page[node.offset_type] = @intFromEnum(header.Type.btree_internal);
 }
 
-fn edit_self_link(page: []u8) void {
+fn edit_self_link(page: []u8) anyerror!void {
     assert(page.len >= 64);
     node.put32(page, node.offset_link, 1); // The root is id 1: a leaf linking to itself.
 }
 
-fn edit_slot_garbage(page: []u8) void {
+fn edit_slot_garbage(page: []u8) anyerror!void {
     assert(page.len >= 64);
     node.put16(page, node.offset_slots, 9); // Inside the slot table, not a cell.
 }
 
-fn edit_level_one(page: []u8) void {
+fn edit_level_one(page: []u8) anyerror!void {
     assert(page.len >= 64);
     page[node.offset_level] = 1;
 }
 
-test "corruption: a flipped byte on disk is ChecksumMismatch for get and insert, then recovers" {
+fn edit_underflow_used(page: []u8) anyerror!void {
+    assert(page.len == 512);
+    assert(node.get16(page, node.offset_count) == 3);
+    node.put16(page, node.offset_count, 4); // A fourth slot that points at the page end,
+    node.put16(page, node.offset_slots + 6, @intCast(page.len - header.header_size));
+}
+
+fn edit_key_after_unsorted(page: []u8) anyerror!void {
+    assert(page.len == 512);
+    assert(page[page.len - 10] == 'c'); // Cell 2: [klen, vlen, key, value] ends at ps - 8.
+    page[page.len - 10] = 'a'; // Keys a, b, a: the cell after "b" sorts before it.
+}
+
+fn edit_key_before_unsorted(page: []u8) anyerror!void {
+    assert(page.len == 512);
+    assert(page[page.len - 2] == 'a'); // Cell 0 ends at the page end.
+    page[page.len - 2] = 'z'; // Keys z, b, c: the cell before "b" sorts after it.
+}
+
+fn edit_overflow_cell(page: []u8) anyerror!void {
+    assert(page.len == 512);
+    assert(node.get16(page, node.offset_count) == 0);
+    const spill: node.Overflow = .{ .head = @enumFromInt(2), .len = 1000 };
+    try node.leaf_insert(page, 0, "k", .{ .overflow = spill });
+}
+
+/// Crafts the root with `edit`, then proves `insert` of `key` is `Corrupted` and changes no byte.
+fn expect_insert_corrupted(f: *Fixture, edit: Edit, key: []const u8) !void {
+    assert(key.len <= 8);
+    assert(f.pool.pinned_count() == 0);
+    try craft_root(f, edit);
+    const snapshot = try testing.allocator.dupe(u8, try page_bytes(f));
+    defer testing.allocator.free(snapshot);
+
+    try testing.expectError(error.Corrupted, f.tree.insert(testing.io, key, "2"));
+    try testing.expectEqualSlices(u8, snapshot, try page_bytes(f));
+    try testing.expectEqual(@as(u32, 0), f.pool.dirty_count); // Not even dirtied.
+}
+
+fn insert_abc(f: *Fixture, b_value: []const u8) !void {
+    assert(b_value.len >= 1);
+    assert(f.tree.page_size == 512);
+    try f.tree.insert(testing.io, "a", "1");
+    try f.tree.insert(testing.io, "b", b_value);
+    try f.tree.insert(testing.io, "c", "1");
+}
+
+test "corruption: a slot table claiming fewer used bytes than a cell is Corrupted, not a trap" {
     var f: Fixture = undefined;
     try f.start(testing.allocator, 512, 2);
     defer f.stop(testing.allocator);
 
-    try f.tree.insert(testing.io, "a", "1");
-    try f.cold();
-    const base = @as(u64, 512) * f.root_u32();
-    for ([_]u64{ 30, 100, 511 }) |at| {
-        try fx.flip_byte(f.pm.file, base + at);
-        try testing.expectError(error.ChecksumMismatch, f.tree.get(testing.io, "a"));
-        try testing.expectError(error.ChecksumMismatch, f.tree.insert(testing.io, "b", "2"));
-        try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
-        try fx.flip_byte(f.pm.file, base + at);
-        try expect_get(&f.tree, "a", "1");
-        try f.cold();
+    try insert_abc(&f, "twenty bytes of value"); // Cell "b" is 24 bytes; used_bytes will say 8.
+    try expect_insert_corrupted(&f, edit_underflow_used, "b");
+}
+
+test "corruption: an overwrite whose neighbour breaks key order is Corrupted, page unchanged" {
+    const edits = [_]Edit{ edit_key_after_unsorted, edit_key_before_unsorted };
+    for (edits) |edit| {
+        var f: Fixture = undefined;
+        try f.start(testing.allocator, 512, 2);
+        defer f.stop(testing.allocator);
+
+        try insert_abc(&f, "1");
+        try expect_insert_corrupted(&f, edit, "b");
     }
 }
 
+test "corruption: an overflow cell is Corrupted for get and for an overwrite (not built yet)" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 2);
+    defer f.stop(testing.allocator);
+
+    try expect_insert_corrupted(&f, edit_overflow_cell, "k");
+    try testing.expectError(error.Corrupted, f.tree.get(testing.io, "k"));
+    try f.tree.check_invariants(testing.io); // The cell itself is well formed.
+}
+
 test "corruption: well-checksummed but malformed roots are Corrupted, never a panic" {
-    const edits = [_]*const fn ([]u8) void{
+    const edits = [_]Edit{
         edit_count_huge,
         edit_type_internal,
         edit_self_link,
@@ -372,7 +485,7 @@ test "corruption: an unwritten or foreign root page gives the page layer's typed
 
     const grown = try f.pm.allocate(testing.io); // Reads Unwritten.
     var stray: Tree = undefined;
-    Tree.open(&stray, &f.pool, grown);
+    try Tree.open(&stray, &f.pool, grown);
     try testing.expectError(error.Unwritten, stray.get(testing.io, "a"));
     try testing.expectError(error.Unwritten, stray.insert(testing.io, "a", "1"));
     var buf: [512]u8 = undefined;

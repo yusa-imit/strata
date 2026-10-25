@@ -76,7 +76,8 @@ pub const WriteBackError = manager.WriteError || error{InvalidHeader};
 pub const PageGuard = guard.PageGuard;
 
 /// Counters since `init`. `hits + misses` is the number of `fetch` calls that passed their
-/// preconditions; a miss that fails to load still counts. `evictions` counts pages dropped to
+/// preconditions, and `fetchNew` counts like `fetch` (a hit on a resident frame, else a miss);
+/// a miss that fails to load still counts. `evictions` counts pages dropped to
 /// make room, whether or not the following load succeeded (a victim whose write-back fails is
 /// not evicted). `writebacks` counts successful page writes, from eviction and `flushAll`.
 /// `gated` counts dirty frames `flushAll` left unwritten because their lsn was above the
@@ -225,7 +226,8 @@ pub const BufferPool = struct {
     /// page type byte (and lsn) before the frame is written back, or write-back is
     /// `InvalidHeader`. A miss evicts like `fetch` (`PoolExhausted`, or the victim's write error);
     /// a hit counts as a hit. Never allocates. Preconditions: `0 < id < page_count`, and no
-    /// guard on `id` is outstanding (a page being re-created has no readers).
+    /// guard on `id` is outstanding (a page being re-created has no readers). The pinned-hit
+    /// check is a plain assert, so only ReleaseSafe and Debug catch a violation.
     pub fn fetchNew(self: *BufferPool, io: Io, id: Id) FetchNewError!PageGuard {
         const raw = @intFromEnum(id);
         assert(raw >= 1);

@@ -33,6 +33,9 @@ const Id = header.Id;
 /// failure leaks, which ADR-0002 calls safe.
 pub const CreateError = manager.AllocateError || buffer_pool.FetchNewError;
 
+/// A persisted root id outside `1 ..< page_count`.
+pub const OpenError = node.ParseError;
+
 /// Read-only failures: the page layer's typed errors, plus `Corrupted` for a root page whose
 /// checksum is right but whose layout is not a valid leaf.
 pub const CheckError = buffer_pool.FetchError || node.ParseError;
@@ -65,13 +68,17 @@ pub const Tree = struct {
         assert(@intFromEnum(target.root) < pool.pages.page_count);
     }
 
-    /// Attaches to an existing tree whose root id the caller persisted. Reads nothing: a bad
-    /// root surfaces from the first `get` or `insert`. Preconditions: `0 < root < page_count`.
-    pub fn open(target: *Tree, pool: *BufferPool, root: Id) void {
-        assert(root != .file_header);
-        assert(@intFromEnum(root) < pool.pages.page_count);
+    /// Attaches to an existing tree whose root id the caller persisted. Reads no page: a bad
+    /// root page surfaces from the first `get` or `insert`. The id itself is data from outside
+    /// (the caller's own storage), so a root of 0 or at or past `page_count` is `Corrupted` and
+    /// `target` is left untouched.
+    pub fn open(target: *Tree, pool: *BufferPool, root: Id) OpenError!void {
+        assert(pool.page_size == pool.pages.page_size);
+        assert(pool.pages.page_count >= 1);
+        if (root == .file_header) return error.Corrupted;
+        if (@intFromEnum(root) >= pool.pages.page_count) return error.Corrupted;
         target.* = .{ .pool = pool, .root = root, .page_size = pool.page_size };
-        assert(target.page_size == pool.pages.page_size);
+        assert(target.root != .file_header);
     }
 
     /// The value stored under `key`, or null when absent. The slice borrows a pool frame: it
@@ -119,8 +126,12 @@ pub const Tree = struct {
         const freed = if (slot.found) try cell_bytes(leaf, slot.index) else 0;
         const added = cell_bytes_of(key_len, value_len);
         const grows_count = !slot.found and leaf.count >= node.cell_count_max(self.page_size);
+        // `used_bytes` derives from untrusted slots: a cell larger than it reports is a bad page.
+        const used_kept = std.math.sub(u32, leaf.used_bytes(), freed) catch {
+            return error.Corrupted;
+        };
         const slot_added: u32 = if (slot.found) 0 else node.slot_size;
-        const used_after = leaf.used_bytes() - freed + added + slot_added;
+        const used_after = used_kept + added + slot_added;
         if (grows_count or used_after > node.usable(self.page_size)) return error.NodeFull;
 
         const lsn = header.peek(guard.bytes()).lsn;
@@ -155,7 +166,7 @@ pub const Tree = struct {
 
 /// Total bytes of an inline cell for these lengths (matches `node`'s encoding).
 fn cell_bytes_of(key_len: u32, value_len: u32) u32 {
-    assert(key_len <= 1024);
+    assert(key_len <= node.key_len_cap);
     assert(value_len <= node.value_len_max);
     return codec.varint.encoded_size(key_len) + codec.varint.encoded_size(value_len) +
         key_len + value_len;
