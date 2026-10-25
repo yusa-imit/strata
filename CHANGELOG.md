@@ -17,6 +17,10 @@ All notable changes to this project are documented in this file. The format foll
   `Internal.entry/child_index/child_at`, `internal_insert`, `internal_remove`, `set_child`,
   `set_right_child`) and `btree/split.zig`: byte-balanced `split_point` for leaf and internal
   nodes.
+- `btree/tree.zig`: `Tree` over the buffer pool with a fixed root id: `create`, `open`, `get`
+  (borrowed slice) and `insert` with overwrite into the root leaf; a full leaf is `NodeFull`
+  until splits land. `cache`: `BufferPool.fetchNew(io, id)` pins a just-allocated page
+  zero-filled and dirty without reading it (`FetchNewError`).
 
 ## [0.5.0] - 2026-10-20
 
