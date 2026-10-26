@@ -1,9 +1,10 @@
-//! Contract tests for `Tree` over the root leaf (plan 005 item 4, ADR-0004 sections 2, 7, 8, 10):
-//! create allocates the fixed root, insert/get/overwrite without a split at all eight page sizes,
-//! key and value boundaries, `NodeFull` leaving the page byte-identical, corrupted root pages
-//! giving typed errors, no allocation after init, and a seeded model against a hash map. Every
-//! error variant `Tree` declares itself (`KeyTooLarge`, `ValueTooLarge`, `NodeFull`, `Corrupted`
-//! from each of its branches) is provoked here; the page, pool and file layers' errors pass
+//! Contract tests for `Tree` over the root leaf (plan 005 items 4 and 5, ADR-0004 sections 2, 7,
+//! 8, 10): create allocates the fixed root, insert/get/overwrite at all eight page sizes,
+//! key and value boundaries, the first root split, corrupted root pages
+//! giving typed errors, no allocation after init, and a seeded model against a hash map. A full
+//! root leaf splits (the old `NodeFull` is gone). Every error variant `Tree` declares itself
+//! (`KeyTooLarge`, `ValueTooLarge`, `Corrupted` from each of its branches; `HeightLimit` is in
+//! `split_tree_test.zig`) is provoked here; the page, pool and file layers' errors pass
 //! through unchanged and only the representative ones (`ChecksumMismatch`, `Unwritten`,
 //! `PoolExhausted`, `InvalidHeader`, `NoSpaceLeft`) are shown.
 
@@ -17,6 +18,7 @@ const manager = @import("../page/manager.zig");
 const buffer_pool = @import("../cache/buffer_pool.zig");
 const node = @import("node.zig");
 const tree_mod = @import("tree.zig");
+const tfx = @import("tree_fixtures.zig");
 
 const PageManager = manager.PageManager;
 const BufferPool = buffer_pool.BufferPool;
@@ -294,37 +296,33 @@ test "boundaries: empty key, longest key, longest inline value, and one past eac
     }
 }
 
-test "NodeFull: a full leaf rejects a new key and a growing overwrite, byte-identical" {
+test "full leaf: a new key and a growing overwrite split it instead of failing" {
     for (fx.sizes_all) |size| {
-        var f: Fixture = undefined;
-        try f.start(testing.allocator, size, 2);
+        var f: tfx.Fixture = undefined;
+        try f.start(testing.allocator, size, 8, 16);
         defer f.stop(testing.allocator);
 
         var key_buf: [8]u8 = undefined;
         var count: u32 = 0;
         while (count < 100_000) : (count += 1) {
             const key = key_of(&key_buf, count);
-            f.tree.insert(testing.io, key, "vvvv") catch |err| switch (err) {
-                error.NodeFull => break,
-                else => return err,
-            };
+            try f.tree.insert(testing.io, key, "vvvv");
+            var guard = try f.pool.fetch(testing.io, f.tree.root);
+            defer guard.release();
+
+            if (guard.bytes()[node.offset_type] != @intFromEnum(header.Type.btree_leaf)) break;
         }
-        try testing.expect(count >= 4 and count < 100_000);
-        try testing.expectEqual(@as(u32, count), try leaf_count(&f));
-
-        const snapshot = try testing.allocator.dupe(u8, try page_bytes(&f));
-        defer testing.allocator.free(snapshot);
-
-        const fresh = key_of(&key_buf, count);
-        try testing.expectError(error.NodeFull, f.tree.insert(testing.io, fresh, "vvvv"));
+        try testing.expect(count >= 4 and count < 100_000); // The root left leaf form: a split.
+        try testing.expectEqual(@as(u32, 1), @intFromEnum(f.tree.root)); // Same root id.
+        try testing.expectEqual(@as(u32, 4), f.pm.page_count); // Root plus two halves (plus 0).
+        try f.tree.validate(testing.io, testing.allocator);
         const grow = [_]u8{'g'} ** 100; // Inline at every size (cell max at 512 is 118).
-        try testing.expectError(error.NodeFull, f.tree.insert(testing.io, "k00000", &grow));
-        try testing.expectEqualSlices(u8, snapshot, try page_bytes(&f));
-        try expect_get(&f.tree, "k00000", "vvvv");
-        try f.tree.insert(testing.io, "k00000", "wwww"); // Same size still fits.
-        try f.tree.insert(testing.io, "k00000", "w"); // Shrinking always fits.
+        try f.tree.insert(testing.io, "k00000", &grow); // Outgrows its leaf's free space.
+        try expect_get(&f.tree, "k00000", &grow);
+        try f.tree.insert(testing.io, "k00000", "w");
         try expect_get(&f.tree, "k00000", "w");
-        try testing.expectEqual(@as(u32, count), try leaf_count(&f));
+        try expect_get(&f.tree, key_of(&key_buf, count), "vvvv");
+        try f.tree.validate(testing.io, testing.allocator);
     }
 }
 
@@ -564,12 +562,11 @@ fn model_free(model: *Model) void {
 fn model_compare(f: *Fixture, model: *const Model) !void {
     assert(model.count() <= 100_000);
     assert(f.pool.pinned_count() == 0);
-    try testing.expectEqual(@as(u32, model.count()), try leaf_count(f));
     var it = model.iterator();
     while (it.next()) |entry| try expect_get(&f.tree, entry.key_ptr.*, entry.value_ptr.*);
 }
 
-test "model: seeded random inserts and gets agree with a hash map; leaf invariants hold" {
+test "model: seeded random inserts and gets agree with a hash map; tree invariants hold" {
     const steps_max: u32 = 1500;
     const sizes = [_]u32{ 512, 4096 };
     for (sizes, 0..) |size, size_index| {
@@ -582,7 +579,6 @@ test "model: seeded random inserts and gets agree with a hash map; leaf invarian
 
         var prng = std.Random.DefaultPrng.init(0x5EED_0005 + size_index);
         const random = prng.random();
-        var full_seen: u32 = 0;
         var key_buf: [32]u8 = undefined;
         var value_buf: [64]u8 = undefined;
         for (0..steps_max) |step| {
@@ -593,23 +589,18 @@ test "model: seeded random inserts and gets agree with a hash map; leaf invarian
             const value = value_buf[0..random.uintAtMost(usize, 24)];
             random.bytes(value);
             if (random.boolean()) {
-                if (f.tree.insert(testing.io, key, value)) |_| {
-                    try model_put(&model, key, value);
-                } else |err| switch (err) {
-                    error.NodeFull => full_seen += 1,
-                    else => return err,
-                }
+                try f.tree.insert(testing.io, key, value);
+                try model_put(&model, key, value);
             } else {
                 const want: ?[]const u8 = model.get(key);
                 try expect_get(&f.tree, key, want);
             }
-            try testing.expectEqual(@as(u32, model.count()), try leaf_count(&f));
             if (step % 100 == 99) try model_compare(&f, &model);
             if (step % 500 == 499) try f.cold();
         }
         try model_compare(&f, &model);
         try f.tree.check_invariants(testing.io);
         try testing.expect(model.count() > 10);
-        if (size == 512) try testing.expect(full_seen > 0); // The tiny leaf really fills up.
+        if (size == 512) try testing.expect(f.pm.page_count > 3); // The tiny leaf really splits.
     }
 }

@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- `btree/split_tree.zig`, `btree/descend.zig`, `btree/validate.zig`: `Tree.insert` splits full
+  leaves and internal nodes (root id fixed, `error.HeightLimit`), `get` descends from the root,
+  and `Tree.validate(io, gpa)` checks order, separator bounds, levels, leaf links and sharing.
+  `Tree.insert` no longer returns `NodeFull`.
 - ADR-0004 `docs/adr/0004-btree-format.md`: B+Tree page format v1 (page types 16–18, slotted
   layout, per-page-size limits, one-frame-per-op logging, deferred frees).
 - `btree/node.zig`: B+Tree leaf codec (`parse_leaf`, `Leaf.entry/search`, `leaf_insert`,
