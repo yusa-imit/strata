@@ -13,8 +13,10 @@ const internal = @import("internal.zig");
 const descend = @import("descend.zig");
 const tree_mod = @import("tree.zig");
 const fx = @import("tree_fixtures.zig");
+const buffer_pool_guard = @import("../cache/buffer_pool.zig").PageGuard;
 
 const Fixture = fx.Fixture;
+const big_value = "v" ** 60; // Larger than any space a full node has left.
 const Tree = tree_mod.Tree;
 
 /// Root page type and level, read through the pool.
@@ -224,13 +226,14 @@ test "split: PoolExhausted and NoSpaceLeft are returned before any existing page
 }
 
 /// Fills `page` (an internal or leaf node already formatted) with ascending cells until full.
-fn fill_internal(page: []u8, child: header.Id) !void {
+fn fill_internal(page: []u8, child: header.Id, prefix: u8) !void {
     assert(page[node.offset_type] == @intFromEnum(header.Type.btree_internal));
     assert(child != .file_header);
     var n: u32 = 0;
     while (n < 100_000) : (n += 1) {
         var key_buf: [8]u8 = undefined;
-        const key = fx.key_of(&key_buf, n)[1..]; // 5 digits: a 10 byte cell.
+        const key = fx.key_of(&key_buf, n)[1..]; // 5 bytes: a 10 byte cell.
+        key_buf[1] = prefix; // Deeper levels get larger prefixes, so separators nest in order.
         internal.internal_insert(page, @intCast(n), key, child) catch |err| switch (err) {
             error.NodeFull => return,
             else => return err,
@@ -246,6 +249,7 @@ fn fill_leaf(page: []u8) !void {
     while (n < 100_000) : (n += 1) {
         var key_buf: [8]u8 = undefined;
         const key = fx.key_of(&key_buf, n); // 6 bytes: wider than an internal key.
+        key_buf[0] = 'r'; // Above the prefix of every internal level.
         node.leaf_insert(page, @intCast(n), key, .{ .bytes = "v" }) catch |err| switch (err) {
             error.NodeFull => return,
             else => return err,
@@ -257,9 +261,8 @@ fn fill_leaf(page: []u8) !void {
 /// Hand-builds a chain of `height_max` levels whose nodes are all full on the right edge, so a
 /// split of the leaf cascades to the root. Children of cells are dummies: only the right edge
 /// is descended by the keys used below.
-fn build_full_chain(f: *Fixture) !void {
-    const height = node.height_max(f.pool.page_size);
-    assert(height >= 7);
+fn build_full_chain(f: *Fixture, height: u8) !void {
+    assert(height >= 2 and height <= node.height_max(f.pool.page_size));
     assert(f.pm.page_count == 2); // Page 0 and the root.
     const dummy: header.Id = @enumFromInt(2); // The leaf: a valid id that is no internal node's.
     var child: header.Id = undefined;
@@ -278,7 +281,7 @@ fn build_full_chain(f: *Fixture) !void {
             try fill_leaf(page);
         } else {
             internal.format_internal(page, id, level, child, 0);
-            try fill_internal(page, dummy);
+            try fill_internal(page, dummy, @intCast('a' + height - level));
         }
         node.seal(page, id, 0);
         child = id;
@@ -293,17 +296,17 @@ test "split: HeightLimit at the deepest tree is returned in prepare, nothing cha
         try f.start(testing.allocator, size, 2 * node.height_max(size) + 4, 64);
         defer f.stop(testing.allocator);
 
-        try build_full_chain(&f);
+        try build_full_chain(&f, node.height_max(size));
         const count_before = f.pm.page_count;
         const total = @as(usize, count_before) * size;
-        const snapshot = try testing.allocator.alloc(u8, total);
-        defer testing.allocator.free(snapshot);
+        const saved = try testing.allocator.alloc(u8, total);
+        defer testing.allocator.free(saved);
 
         for (1..count_before) |id| {
             var guard = try f.pool.fetch(testing.io, @enumFromInt(id));
             defer guard.release();
 
-            @memcpy(snapshot[id * size ..][0..size], guard.bytes());
+            @memcpy(saved[id * size ..][0..size], guard.bytes());
         }
         const err = f.tree.insert(testing.io, "zzzzzz", "v");
         try testing.expectError(error.HeightLimit, err);
@@ -312,11 +315,11 @@ test "split: HeightLimit at the deepest tree is returned in prepare, nothing cha
             var guard = try f.pool.fetch(testing.io, @enumFromInt(id));
             defer guard.release();
 
-            try testing.expectEqualSlices(u8, snapshot[id * size ..][0..size], guard.bytes());
+            try testing.expectEqualSlices(u8, saved[id * size ..][0..size], guard.bytes());
         }
         try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
         try fx.expect_get(&f.tree, "zzzzzz", null);
-        try fx.expect_get(&f.tree, "k00000", "v");
+        try fx.expect_get(&f.tree, "r00000", "v");
     }
 }
 
@@ -340,4 +343,225 @@ test "split: a cascade that stops below the root splits only the full levels" {
     try fx.model_compare(&f.tree, &model);
     const shape = try root_shape(&f);
     try testing.expect(shape.level >= 2); // At least two internal levels were built.
+}
+
+/// Copies pages `1 ..< page_count` as the pool sees them into `out` (`page_count * 512` bytes).
+fn snapshot(f: *Fixture, out: []u8) !void {
+    assert(f.pool.page_size == 512);
+    assert(out.len == @as(usize, f.pm.page_count) * 512);
+    for (1..f.pm.page_count) |id| {
+        var guard = try f.pool.fetch(testing.io, @enumFromInt(id));
+        defer guard.release();
+
+        @memcpy(out[id * 512 ..][0..512], guard.bytes());
+    }
+}
+
+fn expect_unchanged(f: *Fixture, before: []const u8) !void {
+    assert(before.len == @as(usize, f.pm.page_count) * 512);
+    assert(f.pool.pinned_count() == 0);
+    for (1..f.pm.page_count) |id| {
+        var guard = try f.pool.fetch(testing.io, @enumFromInt(id));
+        defer guard.release();
+
+        try testing.expectEqualSlices(u8, before[id * 512 ..][0..512], guard.bytes());
+    }
+}
+
+/// A 512 B tree of two levels whose right-most leaf is full of keys `kb####` (above every
+/// separator), so inserting `kzzzzz` splits that leaf. Returns the right leaf's id.
+fn prepare_full_right(f: *Fixture) !header.Id {
+    assert(f.pool.page_size == 512);
+    var key_buf: [8]u8 = undefined;
+    for (0..80) |n| try f.tree.insert(testing.io, fx.key_of(&key_buf, @intCast(n)), "vvvvvvvv");
+    try testing.expectEqual(@as(u8, 1), (try root_shape(f)).level);
+    var path: descend.Path = undefined;
+    var guard = try descend.descend(&f.pool, testing.io, f.tree.root, "kzzzzz", true, &path);
+    defer guard.release();
+
+    var n: u32 = 0;
+    while (n < 1000) : (n += 1) {
+        var buf: [8]u8 = undefined;
+        const key = fx.key_of(&buf, n);
+        buf[1] = 'b';
+        const count = (try node.parse_leaf(guard.bytes())).count;
+        const value: node.Value = .{ .bytes = "vvvvvvvv" };
+        node.leaf_insert(guard.bytes_mut(), count, key, value) catch |err| switch (err) {
+            error.NodeFull => break,
+            else => return err,
+        };
+    }
+    try testing.expect(n > 5 and n < 1000);
+    return path.leaf;
+}
+
+/// Inserting `kzzzzz` must be `Corrupted`, leave every page byte-identical, and pin nothing.
+fn expect_insert_corrupted(f: *Fixture) !void {
+    assert(f.pool.pinned_count() == 0);
+    const total = @as(usize, f.pm.page_count) * 512;
+    const before = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(before);
+
+    try snapshot(f, before);
+    try testing.expectError(error.Corrupted, f.tree.insert(testing.io, "kzzzzz", big_value));
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+    try expect_unchanged(f, before);
+}
+
+/// Page offset of the key bytes of root cell `index`.
+fn root_key_offset(f: *Fixture, index: u16) !u32 {
+    var guard = try f.pool.fetch(testing.io, f.tree.root);
+    defer guard.release();
+
+    const page = guard.bytes();
+    const view = try internal.parse_internal(page, 1);
+    const key = (try view.entry(index)).key;
+    assert(key.len >= 2);
+    return @intCast(@intFromPtr(key.ptr) - @intFromPtr(page.ptr));
+}
+
+test "split: a full leaf with a bad cell away from the slot is Corrupted, nothing changes" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 8, 64);
+    defer f.stop(testing.allocator);
+
+    var key_buf: [8]u8 = undefined;
+    var n: u32 = 0;
+    while (n < 1000) : (n += 1) {
+        var guard = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+        defer guard.release();
+
+        const count = (try node.parse_leaf(guard.bytes())).count;
+        const key = fx.key_of(&key_buf, n);
+        node.leaf_insert(guard.bytes_mut(), count, key, .{ .bytes = "vv" }) catch break;
+    }
+    try testing.expect(n > 5 and n < 1000);
+    var guard = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+    const page = guard.bytes_mut();
+    page[page.len - 3] = 'z'; // Cell 0's key now sorts after cell 1: far from the new slot.
+    guard.release();
+    try testing.expectError(error.Corrupted, f.tree.insert(testing.io, "kzzzzz", big_value));
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+    var after: [512]u8 = undefined;
+    try root_bytes(&f, &after);
+    try testing.expectEqual(@as(u8, 'z'), after[after.len - 3]); // Left as it was, not rebuilt.
+    try testing.expectEqual(@as(u32, 2), f.pm.page_count); // No page was allocated.
+}
+
+test "split: a root leaf with a next link is Corrupted before any split" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 8, 64);
+    defer f.stop(testing.allocator);
+
+    var key_buf: [8]u8 = undefined;
+    var n: u32 = 0;
+    while (n < 1000) : (n += 1) {
+        var guard = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+        defer guard.release();
+
+        const count = (try node.parse_leaf(guard.bytes())).count;
+        const key = fx.key_of(&key_buf, n);
+        node.leaf_insert(guard.bytes_mut(), count, key, .{ .bytes = "vv" }) catch break;
+    }
+    var guard = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+    node.set_next(guard.bytes_mut(), @enumFromInt(1 + 1));
+    guard.release();
+    var before: [512]u8 = undefined;
+    var after: [512]u8 = undefined;
+    try root_bytes(&f, &before);
+    try testing.expectError(error.Corrupted, f.tree.insert(testing.io, "kzzzzz", big_value));
+    try root_bytes(&f, &after);
+    try testing.expectEqualSlices(u8, &before, &after);
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+    try testing.expectEqual(@as(u32, 2), f.pm.page_count);
+}
+
+test "split: a parent whose neighbour does not bound the new separator is Corrupted" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 8, 256);
+    defer f.stop(testing.allocator);
+
+    _ = try prepare_full_right(&f);
+    const at = try root_key_offset(&f, (try root_count(&f)) - 1);
+    var guard = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+    guard.bytes_mut()[at + 1] = 'z'; // Last separator `kz0...`: above the new separator `kb...`.
+    guard.release();
+    try expect_insert_corrupted(&f);
+}
+
+fn root_count(f: *Fixture) !u16 {
+    assert(f.pool.pinned_count() == 0);
+    var guard = try f.pool.fetch(testing.io, f.tree.root);
+    defer guard.release();
+
+    const view = try internal.parse_internal(guard.bytes(), 1);
+    assert(view.count >= 1);
+    return view.count;
+}
+
+test "split: an ancestor with a cell child equal to itself is Corrupted" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 8, 256);
+    defer f.stop(testing.allocator);
+
+    _ = try prepare_full_right(&f);
+    var guard = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+    const page = guard.bytes_mut();
+    std.mem.writeInt(u32, page[page.len - 4 ..][0..4], @intFromEnum(f.tree.root), .little);
+    guard.release();
+    try expect_insert_corrupted(&f);
+}
+
+test "split: prepare failures on a two-level tree change nothing and the tree still validates" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 5, 256);
+    defer f.stop(testing.allocator);
+
+    _ = try prepare_full_right(&f);
+    const total = @as(usize, f.pm.page_count) * 512;
+    const before = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(before);
+
+    try snapshot(&f, before);
+    var held: [3]buffer_pool_guard = undefined;
+    for (&held) |*slot| {
+        const id = try f.pm.allocate(testing.io);
+        slot.* = try f.pool.fetchNew(testing.io, id);
+        node.format_leaf(slot.bytes_mut(), id, null, 0);
+    }
+    // Two frames left: leaf and parent are pinned, the new page has none.
+    try testing.expectError(error.PoolExhausted, f.tree.insert(testing.io, "kzzzzz", big_value));
+    for (&held) |*slot| slot.release();
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+    try expect_unchanged_prefix(&f, before);
+    try f.tree.validate(testing.io, testing.allocator);
+}
+
+fn expect_unchanged_prefix(f: *Fixture, before: []const u8) !void {
+    assert(before.len % 512 == 0);
+    assert(f.pool.pinned_count() == 0);
+    for (1..@divExact(before.len, 512)) |id| {
+        var guard = try f.pool.fetch(testing.io, @enumFromInt(id));
+        defer guard.release();
+
+        try testing.expectEqualSlices(u8, before[id * 512 ..][0..512], guard.bytes());
+    }
+}
+
+test "split: NoSpaceLeft on the second fresh page of a cascade changes no existing page" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 12, 4); // Page 0, root, leaf, plus one spare id.
+    defer f.stop(testing.allocator);
+
+    try build_full_chain(&f, 2);
+    try testing.expectEqual(@as(u32, 3), f.pm.page_count);
+    const before = try testing.allocator.alloc(u8, 3 * 512);
+    defer testing.allocator.free(before);
+
+    try snapshot(&f, before);
+    try testing.expectError(error.NoSpaceLeft, f.tree.insert(testing.io, "zzzzzz", "v"));
+    try testing.expectEqual(@as(u32, 4), f.pm.page_count); // The first fresh id leaked.
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+    try expect_unchanged_prefix(&f, before);
+    try fx.expect_get(&f.tree, "r00000", "v");
 }

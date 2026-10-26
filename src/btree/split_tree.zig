@@ -6,12 +6,15 @@
 //! change, plan every split by bytes (`split.split_point`, working on a copy of the node), check
 //! `HeightLimit`, then allocate and pin the new pages. A failure here (`HeightLimit`,
 //! `PoolExhausted`, `NoSpaceLeft`, a read error, `Corrupted`) leaves every existing page as it
-//! was; new pages already allocated are formatted as empty leaves, unreachable and leaked, which
-//! ADR-0002 calls safe. Apply: rebuild each split node from the work copy, bottom up, then edit
-//! the parent or the root. Everything it reads was verified in prepare, so a `Corrupted` or
-//! `NodeFull` there means a page lied after its checks passed; it is reported as `Corrupted`
-//! and is the one place an unlogged split can fail half way (a lost WAL frame, ADR section 9,
-//! is what makes that atomic later). Pins: up to `2 * height_max + 1`, the ADR's pool floor.
+//! was (prepare runs `check_invariants` on the leaf and on every ancestor it will rebuild or
+//! edit, and checks that each separator sorts strictly between its future neighbours, so apply
+//! has no data-dependent failure left); new pages already allocated are formatted as empty
+//! leaves, unreachable and leaked, which ADR-0002 calls safe.
+//! Apply: rebuild each split node from the work copy, bottom up, then edit
+//! the parent or the root. Everything it reads was verified in prepare, so its `Corrupted`
+//! returns are defensive only (a page changing under a held pin, which cannot happen); they
+//! are the one place an unlogged split could fail half way.
+//! Pins: up to `2 * height_max + 1`, the ADR's pool floor.
 //! Allocation: none (state lives on the stack, about 90 KiB); ids come from the page manager.
 //! Page lsns are carried over unchanged: this stage is unlogged.
 
@@ -148,6 +151,7 @@ fn plan_leaf(s: *Split) SplitError!void {
     const view = try node.parse_leaf(page);
     if (s.path.len == 0 and view.next != null) return error.Corrupted; // The root has no peer.
     assert(s.at_leaf <= view.count);
+    try view.check_invariants(); // Every cell and the order of all of them, not just near the slot.
     const work = s.work[0..page_size];
     @memcpy(work, page);
     if (s.found) try node.leaf_remove(work, s.at_leaf);
@@ -183,11 +187,20 @@ fn plan_internal(s: *Split, j: u32) SplitError!bool {
     const level = page[node.offset_level];
     const view = try internal.parse_internal(page, level);
     try view.check_children(s.path.ids[index]);
+    try view.check_invariants(); // All cells and their order: apply re-inserts every one.
     const below = s.sep(@intCast(j - 1));
     const below_len: u32 = @intCast(below.len);
     const size: u32 = codec.varint.encoded_size(below_len) + below_len + 4;
     const at: u32 = s.path.slots[index];
     assert(at <= view.count);
+    // The separator must sort strictly between the cells that will border it, else the
+    // insert (or the rebuild) would fail after the first byte moved.
+    if (at > 0 and std.mem.order(u8, (try view.entry(@intCast(at - 1))).key, below) != .lt) {
+        return error.Corrupted;
+    }
+    if (at < view.count and std.mem.order(u8, below, (try view.entry(@intCast(at))).key) != .lt) {
+        return error.Corrupted;
+    }
     const used = view.used_bytes() + size + node.slot_size;
     if (view.count < node.cell_count_max(page_size) and used <= node.usable(page_size)) {
         return false;

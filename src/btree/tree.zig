@@ -22,9 +22,9 @@
 //! error, `Corrupted` found while planning) changes no byte of an existing page; a split needs
 //! `2 * height + 1` pins at most, and a pool too small for that gives `PoolExhausted` up front.
 //! Pages allocated before such a failure are leaked as empty leaves, which ADR-0002 calls safe.
-//! Once the first byte of a split moves there is no log to roll back with: a page that was
-//! verified and then fails a re-check (`Corrupted`) can leave a half split, with leaked ids and
-//! the old nodes rebuilt; that window closes when the WAL item lands (one frame per op).
+//! Prepare fully validates every node apply will touch, so a split cannot fail after its first
+//! byte moves on any page content; the apply-phase `Corrupted` returns are defensive only. There
+//! is still no log to roll back with, so the WAL item (one frame per op) owns crash atomicity.
 //! Borrowing: `get` returns a slice into a pool frame, see its doc for the lifetime.
 
 const std = @import("std");
