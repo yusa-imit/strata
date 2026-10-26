@@ -1,30 +1,44 @@
-//! B+Tree over the buffer pool (ADR-0004), root-leaf stage: `create` allocates the fixed root
-//! page (section 8), `get` and `insert` work on that one leaf. A leaf that cannot take the edit
-//! is `error.NodeFull`; splitting, internal nodes, overflow values and logging arrive in later
-//! plan 005 items, so this stage is unlogged (page `lsn`s are kept as they are).
+//! B+Tree over the buffer pool (ADR-0004): `create` allocates the fixed root page (section 8),
+//! `get` descends from it through internal nodes to a leaf, `insert` edits a leaf in place or
+//! splits it (and full ancestors, up to a root split that keeps the root id, in
+//! `split_tree.zig`), `check_invariants` and `validate` walk the whole tree (`validate.zig`).
+//! Overflow values, delete and logging arrive in later plan 005 items, so this stage is
+//! unlogged (page `lsn`s are kept as they are).
 //!
-//! Invariants: `root` is a page id allocated by `create`, never 0 and never changed; the root
-//! page is a leaf (type 16, level 0) whose cells are strictly ascending (section 7); every byte
-//! read from the page is untrusted data, so a malformed page is `Corrupted` (the page layer's
-//! `Unwritten`, `ChecksumMismatch` and `TornWrite` pass through) and never an assert.
-//! Allocation: none. The tree stores a borrowed `*BufferPool` and the root id, takes no `gpa`
-//! (the pool allocated every frame at its own `init`) and never stores an `Io`: `io` is the
-//! first parameter after the receiver of every method that can touch the file (ADR-0001).
+//! Invariants: `root` is a page id allocated by `create`, never 0 and never changed, even by a
+//! root split; the root is a leaf (type 16, level 0) or an internal node (type 17) whose level
+//! is the tree height minus one, at most `height_max(page_size) - 1`; every node's cells are
+//! strictly ascending (section 7); every byte read from a page is untrusted data, so a
+//! malformed page is `Corrupted` (the page layer's `Unwritten`, `ChecksumMismatch` and
+//! `TornWrite` pass through) and never an assert.
+//! Allocation: `create` and splits take page ids from the page manager (never `gpa`); the pool
+//! allocated every frame at its own `init`. Only `validate` takes a `gpa`, for a visited bitmap
+//! it frees before returning. The tree never stores an `Io`: `io` is the first parameter after
+//! the receiver of every method that can touch the file (ADR-0001).
 //! Ownership: the tree does not own the pool or the page manager; both must outlive it and no
 //! guard of the tree outlives a call. The caller persists `root` (there is no meta page).
-//! Atomicity: an insert that fails (`KeyTooLarge`, `ValueTooLarge`, `NodeFull`, a typed read
-//! error) changes no byte of the page; the only checks that happen after the first byte moves
-//! cannot fail because the same facts were verified before (section 9 prepare/apply split).
+//! Atomicity (section 9, prepare then apply): an insert that fails before it mutates anything
+//! (`KeyTooLarge`, `ValueTooLarge`, `HeightLimit`, `PoolExhausted`, `NoSpaceLeft`, a typed read
+//! error, `Corrupted` found while planning) changes no byte of an existing page; a split needs
+//! `2 * height + 1` pins at most, and a pool too small for that gives `PoolExhausted` up front.
+//! Pages allocated before such a failure are leaked as empty leaves, which ADR-0002 calls safe.
+//! Prepare fully validates every node apply will touch, so a split cannot fail after its first
+//! byte moves on any page content; the apply-phase `Corrupted` returns are defensive only. There
+//! is still no log to roll back with, so the WAL item (one frame per op) owns crash atomicity.
 //! Borrowing: `get` returns a slice into a pool frame, see its doc for the lifetime.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
+const Allocator = std.mem.Allocator;
 const codec = @import("../codec.zig");
 const header = @import("../page/header.zig");
 const manager = @import("../page/manager.zig");
 const buffer_pool = @import("../cache/buffer_pool.zig");
 const node = @import("node.zig");
+const descend = @import("descend.zig");
+const split_tree = @import("split_tree.zig");
+const validate_mod = @import("validate.zig");
 
 const BufferPool = buffer_pool.BufferPool;
 const Id = header.Id;
@@ -36,16 +50,21 @@ pub const CreateError = manager.AllocateError || buffer_pool.FetchNewError;
 /// A persisted root id outside `1 ..< page_count`.
 pub const OpenError = node.ParseError;
 
-/// Read-only failures: the page layer's typed errors, plus `Corrupted` for a root page whose
-/// checksum is right but whose layout is not a valid leaf.
+/// Read-only failures: the page layer's typed errors, plus `Corrupted` for a page whose
+/// checksum is right but whose layout, level, child id or key order is not valid.
 pub const CheckError = buffer_pool.FetchError || node.ParseError;
+
+/// `validate` adds the `gpa` allocation of its visited bitmap.
+pub const ValidateError = CheckError || error{OutOfMemory};
 
 /// `KeyTooLarge`: the key is longer than `node.key_len_max(page_size)`.
 pub const GetError = CheckError || error{KeyTooLarge};
 
 /// `ValueTooLarge`: over `node.value_len_max`, or not inline at this page size (overflow values
-/// are a later item). `NodeFull`: the leaf has no room (no split yet).
-pub const InsertError = GetError || error{ ValueTooLarge, NodeFull };
+/// are a later item). `HeightLimit`: the split would raise the tree past `height_max`; nothing
+/// changed. A split also allocates (`manager.AllocateError`) and pins new pages
+/// (`FetchNewError`). `NodeFull` is gone: a full leaf splits.
+pub const InsertError = GetError || split_tree.SplitError || error{ValueTooLarge};
 
 pub const Tree = struct {
     pool: *BufferPool,
@@ -83,17 +102,19 @@ pub const Tree = struct {
 
     /// The value stored under `key`, or null when absent. The slice borrows a pool frame: it
     /// stays valid until the next call on this tree or any fetch on its pool (a fetch may evict
-    /// the frame), and is overwritten by the next write to the root; copy it to keep it. A key
-    /// longer than `key_len_max` is `KeyTooLarge` (no such key can exist). Cost: one fetch of the
-    /// root and a binary search that checks only the cells it touches.
+    /// the frame), and is overwritten by the next write to that leaf; copy it to keep it. A key
+    /// longer than `key_len_max` is `KeyTooLarge` (no such key can exist). Cost: one fetch per
+    /// level (at most `height_max`) and a binary search per node that checks only the cells it
+    /// touches; a bad level, type or child id on the way is `Corrupted`.
     pub fn get(self: *Tree, io: Io, key: []const u8) GetError!?[]const u8 {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
         if (key.len > node.key_len_max(self.page_size)) return error.KeyTooLarge;
-        var guard = try self.pool.fetch(io, self.root);
+        var path: descend.Path = undefined;
+        var guard = try descend.descend(self.pool, io, self.root, key, false, &path);
         defer guard.release();
 
-        const leaf = try self.root_leaf(guard.bytes());
+        const leaf = try node.parse_leaf(guard.bytes());
         const slot = try leaf.search(key);
         if (!slot.found) return null;
         const entry = try leaf.entry(slot.index);
@@ -103,11 +124,12 @@ pub const Tree = struct {
         }
     }
 
-    /// Stores `value` under `key`, replacing the value of an existing key. The leaf is edited in
-    /// place and re-sealed (checksum, same `lsn`); nothing is written to the file until the pool
-    /// writes the frame back. Errors are checked before the first byte moves, so a failed insert
-    /// leaves the page as it was. A replacement that grows the cell beyond the free space is
-    /// `NodeFull` too, and the old value stays.
+    /// Stores `value` under `key`, replacing the value of an existing key. A leaf with room is
+    /// edited in place and re-sealed (checksum, same `lsn`); a full leaf splits (see
+    /// `split_tree.zig`, which also says what a failure leaves). Nothing is written to the file
+    /// until the pool writes the frames back. Errors that can be known up front (`KeyTooLarge`,
+    /// `ValueTooLarge`, `HeightLimit`, `PoolExhausted`, `NoSpaceLeft`, `Corrupted`, read errors)
+    /// are returned before the first byte of an existing page moves.
     pub fn insert(self: *Tree, io: Io, key: []const u8, value: []const u8) InsertError!void {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
@@ -117,10 +139,11 @@ pub const Tree = struct {
         const key_len: u32 = @intCast(key.len); // Bounded by `key_len_max` just above.
         if (!node.value_inline(self.page_size, key_len, value_len)) return error.ValueTooLarge;
 
-        var guard = try self.pool.fetchForUpdate(io, self.root);
+        var path: descend.Path = undefined;
+        var guard = try descend.descend(self.pool, io, self.root, key, true, &path);
         defer guard.release();
 
-        const leaf = try self.root_leaf(guard.bytes());
+        const leaf = try node.parse_leaf(guard.bytes());
         const slot = try leaf.search(key);
         try check_neighbours(leaf, slot, key);
         const freed = if (slot.found) try cell_bytes(leaf, slot.index) else 0;
@@ -132,37 +155,56 @@ pub const Tree = struct {
         };
         const slot_added: u32 = if (slot.found) 0 else node.slot_size;
         const used_after = used_kept + added + slot_added;
-        if (grows_count or used_after > node.usable(self.page_size)) return error.NodeFull;
-
-        const lsn = header.peek(guard.bytes()).lsn;
-        const page = guard.bytes_mut();
-        if (slot.found) try node.leaf_remove(page, slot.index);
-        try node.leaf_insert(page, slot.index, key, .{ .bytes = value });
-        node.seal(page, self.root, lsn);
-        const after = try node.parse_leaf(page);
-        assert(after.count == leaf.count + @intFromBool(!slot.found));
+        if (grows_count or used_after > node.usable(self.page_size)) {
+            return split_tree.insert_split(self.pool, io, &path, &guard, slot, key, value, added);
+        }
+        try edit_leaf(&guard, path.leaf, slot, key, value);
     }
 
-    /// Full O(n) check of the root leaf: link, every cell, strict key order, zero gap.
+    /// Full O(n) check without a scratch allocation: every node, strict key order, separator
+    /// bounds, levels, the leaf chain, fill. Sharing is bounded, not named; see `validate`.
     pub fn check_invariants(self: *Tree, io: Io) CheckError!void {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
-        var guard = try self.pool.fetch(io, self.root);
-        defer guard.release();
-
-        const leaf = try self.root_leaf(guard.bytes());
-        try leaf.check_invariants();
+        try validate_mod.run(self.pool, io, self.root, null);
     }
 
-    /// O(1) parse of the root page plus the rule that needs its id (no self link).
-    fn root_leaf(self: *const Tree, page: []const u8) node.ParseError!node.Leaf {
-        assert(page.len == self.page_size);
+    /// `check_invariants` plus a visited bitmap (`page_count` bits from `gpa`, freed before
+    /// return): every page is reached exactly once, so a cycle or a shared child is `Corrupted`.
+    /// This is the only place the tree allocates. Cost: O(pages) fetches.
+    pub fn validate(self: *Tree, io: Io, gpa: Allocator) ValidateError!void {
+        assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
-        const leaf = try node.parse_leaf(page);
-        try leaf.check_link(self.root);
-        return leaf;
+        const bytes_len = @divFloor(@as(usize, self.pool.pages.page_count) + 7, 8);
+        const visited = try gpa.alloc(u8, bytes_len);
+        defer gpa.free(visited);
+
+        @memset(visited, 0);
+        try validate_mod.run(self.pool, io, self.root, visited);
     }
 };
+
+/// The in-place edit: replace or insert the cell and re-seal. Room was proven by the caller.
+fn edit_leaf(
+    guard: *buffer_pool.PageGuard,
+    id: Id,
+    slot: node.Slot,
+    key: []const u8,
+    value: []const u8,
+) InsertError!void {
+    assert(id != .file_header);
+    assert(slot.index <= node.cell_count_max(node.page_size_of(guard.bytes())));
+    const lsn = header.peek(guard.bytes()).lsn;
+    const page = guard.bytes_mut();
+    if (slot.found) try node.leaf_remove(page, slot.index);
+    node.leaf_insert(page, slot.index, key, .{ .bytes = value }) catch |err| switch (err) {
+        error.Corrupted => return error.Corrupted,
+        error.NodeFull => unreachable, // The caller checked count and bytes on this same page.
+    };
+    node.seal(page, id, lsn);
+    const after = try node.parse_leaf(page);
+    assert(after.count >= 1);
+}
 
 /// Total bytes of an inline cell for these lengths (matches `node`'s encoding).
 fn cell_bytes_of(key_len: u32, value_len: u32) u32 {
@@ -202,5 +244,7 @@ fn check_neighbours(leaf: node.Leaf, slot: node.Slot, key: []const u8) node.Pars
 }
 
 test {
-    _ = @import("tree_test.zig"); // Contract tests live in their own file (800-line limit).
+    _ = @import("tree_test.zig"); // Contract tests live in their own files (800-line limit).
+    _ = @import("split_tree_test.zig");
+    _ = @import("validate_test.zig");
 }

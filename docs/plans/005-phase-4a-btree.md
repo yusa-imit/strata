@@ -43,7 +43,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       `fetch` fails on it (memory follow-up, cycle 44: it blocks the tree). `get` borrows until
       the next write. Verify: `fetchNew` on a grown and a reused id; insert/get/overwrite without
       a split; a `FailingAllocator` armed after `init` never trips.
-- [ ] **Split and `validate`** (`src/btree/tree.zig`). Leaf and internal splits up the stack;
+- [x] **Split and `validate`** (`src/btree/tree.zig`). Leaf and internal splits up the stack;
       the root split keeps the root id; height over `height_max` → typed error. `validate(io,
       gpa)` checks order, separator bounds, fill, leaf links and types, walk bounded by
       `page_count`. Verify: 10k sequential and 10k random inserts at 512 B and 4 KiB pass
