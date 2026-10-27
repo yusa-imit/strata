@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- `btree/delete_tree.zig`: `Tree.delete` removes a key, borrows from or merges with a sibling on
+  byte-fill underflow, collapses a one-child root into the fixed root id, and queues freed pages
+  in a bounded `frees_pending` handed to the page manager only by `Tree.release_frees`;
+  `BufferPool.discard` drops a freed page's frame.
 - `btree/split_tree.zig`, `btree/descend.zig`, `btree/validate.zig`: `Tree.insert` splits full
   leaves and internal nodes (root id fixed, `error.HeightLimit`), `get` descends from the root,
   and `Tree.validate(io, gpa)` checks order, separator bounds, levels, leaf links and sharing.

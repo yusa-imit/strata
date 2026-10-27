@@ -29,6 +29,7 @@ const Shape = struct { pages: u32, height: u32, leaves: u32, level1: u32 };
 fn walk(f: *Fixture, live: ?[]bool) !Shape {
     assert(f.pool.pinned_count() == 0);
     assert(f.tree.root != .file_header);
+    assert(live == null or live.?.len == f.pm.page_count);
     var stack: [stack_max]Id = undefined;
     var shape: Shape = .{ .pages = 0, .height = 0, .leaves = 0, .level1 = 0 };
     stack[0] = f.tree.root;
@@ -84,6 +85,7 @@ fn snapshot(f: *Fixture, gpa: Allocator) ![]u8 {
 }
 
 fn fill(f: *Fixture, count: u32) !void {
+    assert(f.tree.frees_len == 0);
     assert(count < 100_000);
     assert(f.pool.pinned_count() == 0);
     var key_buf: [8]u8 = undefined;
@@ -113,11 +115,15 @@ fn account(f: *Fixture, gpa: Allocator) !void {
 }
 
 fn delete_key(f: *Fixture, n: u32) !bool {
+    assert(n < 100_000);
+    assert(f.pool.pinned_count() == 0);
     var key_buf: [8]u8 = undefined;
     return f.tree.delete(testing.io, fx.key_of(&key_buf, n));
 }
 
 fn expect_empty_root_leaf(f: *Fixture) !void {
+    assert(f.pool.pinned_count() == 0);
+    assert(f.tree.frees_len <= f.tree.frees_pending.len);
     var guard = try f.pool.fetch(testing.io, f.tree.root);
     defer guard.release();
 
@@ -129,6 +135,8 @@ fn expect_empty_root_leaf(f: *Fixture) !void {
 const Order = enum { random, ascending, descending };
 
 fn delete_all(size: u32, order: Order, seed: u64, count: u32) !void {
+    assert(header.page_size_valid(size));
+    assert(count > 0 and count < 100_000);
     var f: Fixture = undefined;
     try f.start(testing.allocator, size, 40, 4096);
     defer f.stop(testing.allocator);
@@ -188,6 +196,8 @@ test "delete: absent keys and an empty tree return false and change nothing" {
 }
 
 fn leftmost_count(f: *Fixture) !u16 {
+    assert(f.pool.pinned_count() == 0);
+    assert(f.tree.root != .file_header);
     var path: descend.Path = undefined;
     var guard = try descend.descend(&f.pool, testing.io, f.tree.root, "", false, &path);
     defer guard.release();
@@ -342,6 +352,7 @@ test "delete: PoolExhausted with a two-frame pool leaves the tree unchanged" {
 
 fn snapshot_of(pool: *buffer_pool.BufferPool, page_count: u32) ![]u8 {
     assert(pool.pinned_count() == 0);
+    assert(page_count >= 1);
     const size = pool.page_size;
     const out = try testing.allocator.alloc(u8, @as(usize, page_count) * size);
     errdefer testing.allocator.free(out);
@@ -362,6 +373,7 @@ fn snapshot_of(pool: *buffer_pool.BufferPool, page_count: u32) ![]u8 {
 /// Swaps the first key byte of cell 0 with a larger one so the leaf is out of order, re-sealed.
 fn break_leaf_order(f: *Fixture, id: Id) !void {
     assert(f.pool.pinned_count() == 0);
+    assert(id != .file_header);
     var guard = try f.pool.fetchForUpdate(testing.io, id);
     defer guard.release();
 
@@ -413,6 +425,92 @@ test "delete: a corrupt leaf or sibling is Corrupted and no page changes" {
     try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
 }
 
+/// Inserts keys `prefix` + zero-padded counter of `width` bytes in total, ascending, until the
+/// node is full; returns how many went in.
+fn fill_internal(page: []u8, prefix: u8, width: usize, child: Id) !u16 {
+    assert(width >= 1 and width <= 40);
+    assert(child != .file_header);
+    var key: [40]u8 = undefined;
+    var added: u16 = 0;
+    while (added < 200) : (added += 1) {
+        const view = try internal.parse_internal_raw(page, page[node.offset_level]);
+        @memset(key[0..width], '0');
+        key[0] = prefix;
+        key[width - 1] = '0' + @as(u8, @intCast(added % 10));
+        if (width > 2) key[width - 2] = '0' + @as(u8, @intCast(@divTrunc(added, 10) % 10));
+        internal.internal_insert(page, view.count, key[0..width], child) catch |err| switch (err) {
+            error.NodeFull => return added,
+            error.Corrupted => return err,
+        };
+    }
+    return error.NodeFull; // The bound was reached without filling: a test setup bug.
+}
+
+/// Level 2 root R (full, short separator at cell 0) over an almost empty level-1 node X and a
+/// full level-1 node Y: the delete of X's only key empties X, Y is too full to merge, and the
+/// borrow's longer separator cannot replace the short one in R.
+fn build_no_space_tree(f: *Fixture) !void {
+    assert(f.pool.pinned_count() == 0);
+    assert(f.pm.page_count == 2); // Only the created root leaf exists.
+    const size = f.pool.page_size;
+    var ids: [5]Id = undefined; // leaf a, leaf b, x, y, spare
+    for (&ids) |*slot| slot.* = try f.pm.allocate(testing.io);
+    const leaf_values = [_][]const u8{ "k00000", "k00009" };
+    for (ids[0..2], 0..) |id, n| {
+        var guard = try f.pool.fetchNew(testing.io, id);
+        defer guard.release();
+
+        const page = guard.bytes_mut();
+        node.format_leaf(page, id, if (n == 0) ids[1] else null, 0);
+        try node.leaf_insert(page, 0, leaf_values[n], .{ .bytes = "v" });
+        node.seal(page, id, 0);
+    }
+    var x = try f.pool.fetchNew(testing.io, ids[2]);
+    defer x.release();
+
+    internal.format_internal(x.bytes_mut(), ids[2], 1, ids[1], 0);
+    try internal.internal_insert(x.bytes_mut(), 0, "k00005", ids[0]);
+    node.seal(x.bytes_mut(), ids[2], 0);
+    var y = try f.pool.fetchNew(testing.io, ids[3]);
+    defer y.release();
+
+    internal.format_internal(y.bytes_mut(), ids[3], 1, ids[0], 0);
+    for ([_]struct { u8, usize }{ .{ 'p', 40 }, .{ 'q', 10 }, .{ 'r', 3 }, .{ 's', 1 } }) |kind| {
+        _ = try fill_internal(y.bytes_mut(), kind[0], kind[1], ids[0]);
+    }
+    node.seal(y.bytes_mut(), ids[3], 0);
+    var r = try f.pool.fetchForUpdate(testing.io, f.tree.root);
+    defer r.release();
+
+    const page = r.bytes_mut();
+    internal.format_internal(page, f.tree.root, 2, ids[4], 0);
+    try internal.internal_insert(page, 0, "k5", ids[2]);
+    try internal.internal_insert(page, 1, "k6", ids[3]);
+    for ([_]struct { u8, usize }{ .{ 'm', 40 }, .{ 'n', 10 }, .{ 'o', 3 }, .{ 'p', 1 } }) |kind| {
+        _ = try fill_internal(page, kind[0], kind[1], ids[4]);
+    }
+    node.seal(page, f.tree.root, 0);
+    assert(size == 512);
+}
+
+test "delete: NoSpaceLeft when a forced borrow cannot fit its separator in the parent" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 16, 64);
+    defer f.stop(testing.allocator);
+
+    try build_no_space_tree(&f);
+    const before = try snapshot(&f, testing.allocator);
+    defer testing.allocator.free(before);
+
+    try testing.expectError(error.NoSpaceLeft, delete_key(&f, 0));
+    const after = try snapshot(&f, testing.allocator);
+    defer testing.allocator.free(after);
+
+    try testing.expectEqualSlices(u8, before, after);
+    try testing.expectEqual(@as(u32, 0), f.tree.frees_len);
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+}
+
 test "delete: no allocation after init" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var f: Fixture = undefined;
@@ -421,7 +519,10 @@ test "delete: no allocation after init" {
 
     failing.fail_index = failing.alloc_index; // Armed: the next allocation fails.
     try fill(&f, 1500);
-    for (0..1500) |n| try testing.expect(try delete_key(&f, @intCast(n)));
+    for (0..1500) |n| {
+        try testing.expect(try delete_key(&f, @intCast(n)));
+        if (f.tree.frees_len >= 32) _ = try f.tree.release_frees(testing.io);
+    }
     _ = try f.tree.release_frees(testing.io);
     try expect_empty_root_leaf(&f);
     try testing.expect(!failing.has_induced_failure);
@@ -450,6 +551,7 @@ test "delete: model test with interleaved insert, delete and get" {
                 2, 3 => {
                     const present = model.contains(key);
                     try testing.expectEqual(present, try f.tree.delete(testing.io, key));
+                    try f.tree.validate(testing.io, testing.allocator);
                     if (present) {
                         const removed = model.fetchRemove(key).?;
                         testing.allocator.free(removed.key);
