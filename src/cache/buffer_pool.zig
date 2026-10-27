@@ -306,6 +306,26 @@ pub const BufferPool = struct {
         self.check_invariants();
     }
 
+    /// Drops page `id` from the pool without writing it back: its frame becomes empty and a
+    /// dirty change is lost on purpose (for a page being freed; a stale tree page must never
+    /// overwrite a freelist page). A page that is not resident is a no-op. Precondition: `id`
+    /// is not pinned (a plain assert, like `discardAll`). Never does I/O, never fails.
+    pub fn discard(self: *BufferPool, id: Id) void {
+        const raw = @intFromEnum(id);
+        assert(raw >= 1);
+        assert(self.frames.len == self.frames_max);
+        const index = self.table.get(raw) orelse return;
+        const frame = &self.frames[index];
+        assert(frame.pin_count == 0);
+        assert(frame.page_id == raw);
+        if (frame.dirty) self.dirty_count -= 1;
+        frame.* = frame_empty;
+        _ = self.table.remove(raw);
+        self.empty_count += 1;
+        assert(self.empty_count <= self.frames_max);
+        assert(self.table.get(raw) == null);
+    }
+
     /// Frames with at least one pin. O(frames_max); for tests, `deinit` and monitoring.
     pub fn pinned_count(self: *const BufferPool) u32 {
         assert(self.frames.len == self.frames_max);

@@ -23,6 +23,7 @@ const tfx = @import("tree_fixtures.zig");
 const PageManager = manager.PageManager;
 const BufferPool = buffer_pool.BufferPool;
 const Tree = tree_mod.Tree;
+var no_frees: [1]header.Id = undefined; // Storage for trees that never delete.
 const Edit = *const fn ([]u8) anyerror!void;
 
 /// One construction path: a temp dir, a page file, a pool and a created tree, built in place.
@@ -31,6 +32,7 @@ const Fixture = struct {
     pm: PageManager,
     pool: BufferPool,
     tree: Tree,
+    frees: [8]header.Id,
 
     fn start(self: *Fixture, gpa: Allocator, size: u32, frames: u32) !void {
         assert(header.page_size_valid(size));
@@ -45,7 +47,7 @@ const Fixture = struct {
         try BufferPool.init(&self.pool, gpa, &self.pm, options);
         errdefer self.pool.deinit(gpa);
 
-        try Tree.create(&self.tree, testing.io, &self.pool);
+        try Tree.create(&self.tree, testing.io, &self.pool, &self.frees);
     }
 
     fn stop(self: *Fixture, gpa: Allocator) void {
@@ -136,7 +138,7 @@ test "create: the root is the first allocated id and an empty valid leaf, not ye
         try f.cold();
         try testing.expectEqual(@as(u16, 0), try leaf_count(&f)); // Durable after the flush.
         var reopened: Tree = undefined;
-        try Tree.open(&reopened, &f.pool, f.tree.root);
+        try Tree.open(&reopened, &f.pool, f.tree.root, &no_frees);
         try expect_get(&reopened, "x", null);
     }
 }
@@ -159,7 +161,7 @@ test "create: a full file is NoSpaceLeft and leaves the pool clean" {
     defer pool.deinit(testing.allocator);
 
     var t: Tree = undefined;
-    try testing.expectError(error.NoSpaceLeft, Tree.create(&t, testing.io, &pool));
+    try testing.expectError(error.NoSpaceLeft, Tree.create(&t, testing.io, &pool, &no_frees));
     try testing.expectEqual(@as(u32, 0), pool.dirty_count);
     try testing.expectEqual(@as(u32, 1), pm.page_count);
 }
@@ -227,10 +229,10 @@ test "open: a persisted root outside the file is Corrupted and leaves the target
     var t: Tree = f.tree;
     const before = t;
     const past: header.Id = @enumFromInt(f.pm.page_count);
-    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, .file_header));
-    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, past));
+    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, .file_header, &no_frees));
+    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, past, &no_frees));
     try testing.expectEqual(before.root, t.root);
-    try Tree.open(&t, &f.pool, f.tree.root);
+    try Tree.open(&t, &f.pool, f.tree.root, &no_frees);
     try expect_get(&t, "none", null);
 }
 
@@ -248,14 +250,20 @@ test "create: PoolExhausted (id leaked, target untouched) and InvalidHeader (dir
 
     const first = try pm.allocate(testing.io);
     var pin = try pool.fetchNew(testing.io, first);
-    var t: Tree = .{ .pool = &pool, .root = first, .page_size = 512 };
+    var t: Tree = .{
+        .pool = &pool,
+        .root = first,
+        .page_size = 512,
+        .frees_pending = &no_frees,
+        .frees_len = 0,
+    };
     const count_before = pm.page_count;
-    try testing.expectError(error.PoolExhausted, Tree.create(&t, testing.io, &pool));
+    try testing.expectError(error.PoolExhausted, Tree.create(&t, testing.io, &pool, &no_frees));
     try testing.expectEqual(first, t.root);
     try testing.expectEqual(count_before + 1, pm.page_count); // The allocated id leaks.
     pin.release();
     // The victim is dirty and unformatted (type byte 0), so evicting it for the root fails.
-    try testing.expectError(error.InvalidHeader, Tree.create(&t, testing.io, &pool));
+    try testing.expectError(error.InvalidHeader, Tree.create(&t, testing.io, &pool, &no_frees));
     try testing.expectEqual(first, t.root);
     try testing.expectEqual(@as(u32, 0), pool.pinned_count());
     pool.discardAll();
@@ -483,7 +491,7 @@ test "corruption: an unwritten or foreign root page gives the page layer's typed
 
     const grown = try f.pm.allocate(testing.io); // Reads Unwritten.
     var stray: Tree = undefined;
-    try Tree.open(&stray, &f.pool, grown);
+    try Tree.open(&stray, &f.pool, grown, &no_frees);
     try testing.expectError(error.Unwritten, stray.get(testing.io, "a"));
     try testing.expectError(error.Unwritten, stray.insert(testing.io, "a", "1"));
     var buf: [512]u8 = undefined;
