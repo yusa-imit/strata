@@ -1,9 +1,12 @@
 //! B+Tree over the buffer pool (ADR-0004): `create` allocates the fixed root page (section 8),
 //! `get` descends from it through internal nodes to a leaf, `insert` edits a leaf in place or
 //! splits it (and full ancestors, up to a root split that keeps the root id, in
-//! `split_tree.zig`), `check_invariants` and `validate` walk the whole tree (`validate.zig`).
-//! Overflow values, delete and logging arrive in later plan 005 items, so this stage is
-//! unlogged (page `lsn`s are kept as they are).
+//! `split_tree.zig`), `delete` removes a key, merging or borrowing from siblings and collapsing
+//! a one-child root (`delete_tree.zig`), `check_invariants` and `validate` walk the whole tree
+//! (`validate.zig`). Pages a delete unlinks wait in the caller-provided `frees_pending` (not
+//! persisted) until `release_frees` hands them to the page manager. Overflow values and
+//! logging arrive in later plan 005 items, so this stage is unlogged (page `lsn`s are kept as
+//! they are).
 //!
 //! Invariants: `root` is a page id allocated by `create`, never 0 and never changed, even by a
 //! root split; the root is a leaf (type 16, level 0) or an internal node (type 17) whose level
@@ -38,6 +41,7 @@ const buffer_pool = @import("../cache/buffer_pool.zig");
 const node = @import("node.zig");
 const descend = @import("descend.zig");
 const split_tree = @import("split_tree.zig");
+const delete_tree = @import("delete_tree.zig");
 const validate_mod = @import("validate.zig");
 
 const BufferPool = buffer_pool.BufferPool;
@@ -60,6 +64,14 @@ pub const ValidateError = CheckError || error{OutOfMemory};
 /// `KeyTooLarge`: the key is longer than `node.key_len_max(page_size)`.
 pub const GetError = CheckError || error{KeyTooLarge};
 
+/// `FreesPendingLimit`: `frees_pending` has no room for the ids this delete would unlink;
+/// nothing changed. `NoSpaceLeft`: a forced borrow whose new separator does not fit in its
+/// parent (nothing changed).
+pub const DeleteError = delete_tree.DeleteError;
+
+/// The page manager's own error set: `release_frees` frees through it.
+pub const FreeError = manager.FreeError;
+
 /// `ValueTooLarge`: over `node.value_len_max`, or not inline at this page size (overflow values
 /// are a later item). `HeightLimit`: the split would raise the tree past `height_max`; nothing
 /// changed. A split also allocates (`manager.AllocateError`) and pins new pages
@@ -70,11 +82,17 @@ pub const Tree = struct {
     pool: *BufferPool,
     root: Id,
     page_size: u32,
+    /// Caller-provided storage for ids unlinked by `delete`; its length is `frees_pending_max`.
+    frees_pending: []Id,
+    /// Ids in `frees_pending[0..frees_len]` wait for `release_frees`.
+    frees_len: u32,
 
     /// Allocates the root id from the page manager and writes an empty leaf there, in the pool
     /// (dirty, not yet on disk: `flushAll` and the caller's `sync` make it durable). The root
-    /// id is persisted by the caller. On error nothing in `target` is set.
-    pub fn create(target: *Tree, io: Io, pool: *BufferPool) CreateError!void {
+    /// id is persisted by the caller. On error nothing in `target` is set. `frees` is the
+    /// storage of the pending-free list (its length is `frees_pending_max`) and must outlive
+    /// the tree.
+    pub fn create(target: *Tree, io: Io, pool: *BufferPool, frees: []Id) CreateError!void {
         assert(pool.page_size == pool.pages.page_size);
         assert(header.page_size_valid(pool.page_size));
         const id = try pool.pages.allocate(io);
@@ -82,7 +100,13 @@ pub const Tree = struct {
         defer guard.release();
 
         node.format_leaf(guard.bytes_mut(), id, null, 0);
-        target.* = .{ .pool = pool, .root = id, .page_size = pool.page_size };
+        target.* = .{
+            .pool = pool,
+            .root = id,
+            .page_size = pool.page_size,
+            .frees_pending = frees,
+            .frees_len = 0,
+        };
         assert(target.root != .file_header);
         assert(@intFromEnum(target.root) < pool.pages.page_count);
     }
@@ -91,12 +115,18 @@ pub const Tree = struct {
     /// root page surfaces from the first `get` or `insert`. The id itself is data from outside
     /// (the caller's own storage), so a root of 0 or at or past `page_count` is `Corrupted` and
     /// `target` is left untouched.
-    pub fn open(target: *Tree, pool: *BufferPool, root: Id) OpenError!void {
+    pub fn open(target: *Tree, pool: *BufferPool, root: Id, frees: []Id) OpenError!void {
         assert(pool.page_size == pool.pages.page_size);
         assert(pool.pages.page_count >= 1);
         if (root == .file_header) return error.Corrupted;
         if (@intFromEnum(root) >= pool.pages.page_count) return error.Corrupted;
-        target.* = .{ .pool = pool, .root = root, .page_size = pool.page_size };
+        target.* = .{
+            .pool = pool,
+            .root = root,
+            .page_size = pool.page_size,
+            .frees_pending = frees,
+            .frees_len = 0,
+        };
         assert(target.root != .file_header);
     }
 
@@ -159,6 +189,34 @@ pub const Tree = struct {
             return split_tree.insert_split(self.pool, io, &path, &guard, slot, key, value, added);
         }
         try edit_leaf(&guard, path.leaf, slot, key, value);
+    }
+
+    /// Removes `key`, merging or redistributing underfull nodes (see `delete_tree.zig`). True
+    /// when the key was present. Unlinked pages wait in `frees_pending` for `release_frees`.
+    pub fn delete(self: *Tree, io: Io, key: []const u8) DeleteError!bool {
+        assert(self.page_size == self.pool.page_size);
+        assert(self.root != .file_header);
+        if (key.len > node.key_len_max(self.page_size)) return error.KeyTooLarge;
+        return delete_tree.delete(self, io, key);
+    }
+
+    /// Hands every pending id to the page manager, after dropping its pool frame without a
+    /// write-back (a stale tree page must never overwrite a freelist page). Returns how many
+    /// ids were freed, last pending id first. An id whose `free` fails stays pending, together
+    /// with every id before it in `frees_pending` (those not yet attempted).
+    pub fn release_frees(self: *Tree, io: Io) FreeError!u32 {
+        assert(self.frees_len <= self.frees_pending.len);
+        assert(self.root != .file_header);
+        var freed: u32 = 0;
+        while (self.frees_len > 0) {
+            const id = self.frees_pending[self.frees_len - 1];
+            self.pool.discard(id);
+            try self.pool.pages.free(io, id);
+            self.frees_len -= 1;
+            freed += 1;
+        }
+        assert(self.frees_len == 0);
+        return freed;
     }
 
     /// Full O(n) check without a scratch allocation: every node, strict key order, separator
@@ -246,5 +304,6 @@ fn check_neighbours(leaf: node.Leaf, slot: node.Slot, key: []const u8) node.Pars
 test {
     _ = @import("tree_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("split_tree_test.zig");
+    _ = @import("delete_tree_test.zig");
     _ = @import("validate_test.zig");
 }

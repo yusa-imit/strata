@@ -14,6 +14,10 @@ const tree_mod = @import("tree.zig");
 const PageManager = manager.PageManager;
 const BufferPool = buffer_pool.BufferPool;
 const Tree = tree_mod.Tree;
+const Id = header.Id;
+
+/// Capacity of the fixture tree's pending-free list.
+pub const frees_max: u32 = 64;
 
 pub const sizes_all = [_]u32{ 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
 
@@ -22,6 +26,7 @@ pub const Fixture = struct {
     pm: PageManager,
     pool: BufferPool,
     tree: Tree,
+    frees: [frees_max]Id,
 
     pub fn start(self: *Fixture, gpa: Allocator, size: u32, frames: u32, pages_max: u32) !void {
         assert(header.page_size_valid(size));
@@ -41,7 +46,7 @@ pub const Fixture = struct {
         try BufferPool.init(&self.pool, gpa, &self.pm, pool_options);
         errdefer self.pool.deinit(gpa);
 
-        try Tree.create(&self.tree, testing.io, &self.pool);
+        try Tree.create(&self.tree, testing.io, &self.pool, &self.frees);
     }
 
     pub fn stop(self: *Fixture, gpa: Allocator) void {

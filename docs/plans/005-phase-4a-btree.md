@@ -48,7 +48,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       gpa)` checks order, separator bounds, fill, leaf links and types, walk bounded by
       `page_count`. Verify: 10k sequential and 10k random inserts at 512 B and 4 KiB pass
       `validate`; a hand-broken separator → `Corrupted`.
-- [ ] **Delete, merge, rebalance** (`src/btree/tree.zig`). Byte-fill underflow borrows from or
+- [x] **Delete, merge, rebalance** (`src/btree/tree.zig`). Byte-fill underflow borrows from or
       merges with a sibling; a one-child root collapses into the root id. Freed ids go to a
       bounded `frees_pending` (`frees_pending_max`), handed to `PageManager.free` only by
       `release_frees(io)`. Verify: insert all, delete all in seeded order → empty root leaf,

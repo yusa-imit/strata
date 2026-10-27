@@ -18,6 +18,7 @@ const buffer_pool_guard = @import("../cache/buffer_pool.zig").PageGuard;
 const Fixture = fx.Fixture;
 const big_value = "v" ** 60; // Larger than any space a full node has left.
 const Tree = tree_mod.Tree;
+var no_frees: [1]header.Id = undefined; // Storage for trees that never delete.
 
 /// Root page type and level, read through the pool.
 fn root_shape(f: *Fixture) !struct { page_type: header.Type, level: u8 } {
@@ -145,7 +146,7 @@ test "split: the root id is fixed across root splits, which raise its level by o
     try testing.expect(raises >= 2); // A leaf root became internal, then that root split.
     var reopened: Tree = undefined;
     try f.cold();
-    try Tree.open(&reopened, &f.pool, root);
+    try Tree.open(&reopened, &f.pool, root, &no_frees);
     try fx.expect_get(&reopened, "k02999", "vvvvvvvv");
 }
 
