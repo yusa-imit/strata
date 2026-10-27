@@ -1,9 +1,12 @@
 //! B+Tree over the buffer pool (ADR-0004): `create` allocates the fixed root page (section 8),
 //! `get` descends from it through internal nodes to a leaf, `insert` edits a leaf in place or
 //! splits it (and full ancestors, up to a root split that keeps the root id, in
-//! `split_tree.zig`), `check_invariants` and `validate` walk the whole tree (`validate.zig`).
-//! Overflow values, delete and logging arrive in later plan 005 items, so this stage is
-//! unlogged (page `lsn`s are kept as they are).
+//! `split_tree.zig`), `delete` removes a key, merging or borrowing from siblings and collapsing
+//! a one-child root (`delete_tree.zig`), `check_invariants` and `validate` walk the whole tree
+//! (`validate.zig`). Pages a delete unlinks wait in the caller-provided `frees_pending` (not
+//! persisted) until `release_frees` hands them to the page manager. Overflow values and
+//! logging arrive in later plan 005 items, so this stage is unlogged (page `lsn`s are kept as
+//! they are).
 //!
 //! Invariants: `root` is a page id allocated by `create`, never 0 and never changed, even by a
 //! root split; the root is a leaf (type 16, level 0) or an internal node (type 17) whose level
@@ -199,10 +202,11 @@ pub const Tree = struct {
 
     /// Hands every pending id to the page manager, after dropping its pool frame without a
     /// write-back (a stale tree page must never overwrite a freelist page). Returns how many
-    /// ids were freed. An id whose `free` fails stays pending, with the ones after it.
+    /// ids were freed, last pending id first. An id whose `free` fails stays pending, together
+    /// with every id before it in `frees_pending` (those not yet attempted).
     pub fn release_frees(self: *Tree, io: Io) FreeError!u32 {
         assert(self.frees_len <= self.frees_pending.len);
-        assert(self.pool.pinned_count() == 0);
+        assert(self.root != .file_header);
         var freed: u32 = 0;
         while (self.frees_len > 0) {
             const id = self.frees_pending[self.frees_len - 1];

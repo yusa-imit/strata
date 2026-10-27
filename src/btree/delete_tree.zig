@@ -126,6 +126,12 @@ pub fn delete(t: *Tree, io: Io, key: []const u8) DeleteError!bool {
     defer d.sibs.release_all();
 
     try plan(&d, io, view, slot.index);
+    for (d.frees[0..d.frees_len]) |id| {
+        // A page already waiting to be freed must not be unlinked again: shared page.
+        if (std.mem.findScalar(Id, t.frees_pending[0..t.frees_len], id) != null) {
+            return error.Corrupted;
+        }
+    }
     if (t.frees_len + d.frees_len > t.frees_pending.len) return error.FreesPendingLimit;
     try apply(&d, slot.index);
     for (d.frees[0..d.frees_len]) |id| {
@@ -313,11 +319,28 @@ fn plan_borrow(d: *Del, j: u32, parent: internal.Internal, must: bool) DeleteErr
     const old_len = step.sep_len;
     step.kind = .borrow;
     step.k = if (j == 0) try borrow_leaf(d, j) else try borrow_internal(d, j);
+    if (step.k > 0) try check_sep_bounds(d, j, parent);
     const grown = internal_cell_bytes(step.sep_len) + parent.used_bytes();
     const fits = step.k > 0 and grown - internal_cell_bytes(old_len) <= node.usable(page_size);
     if (fits) return;
     if (must) return error.NoSpaceLeft;
     d.steps_len = j; // Skipped: the node stays underfull, which is valid.
+}
+
+/// The new separator must stay strictly between the parent's neighbouring separators.
+fn check_sep_bounds(d: *Del, j: u32, parent: internal.Internal) DeleteError!void {
+    assert(j < d.steps_len);
+    assert(d.steps[j].k > 0);
+    const pair = d.steps[j].pair;
+    const new = d.sep(j);
+    if (pair > 0) {
+        const below = (try parent.entry(pair - 1)).key;
+        if (std.mem.order(u8, below, new) != .lt) return error.Corrupted;
+    }
+    if (pair + 1 < parent.count) {
+        const above = (try parent.entry(pair + 1)).key;
+        if (std.mem.order(u8, new, above) != .lt) return error.Corrupted;
+    }
 }
 
 fn borrow_leaf(d: *Del, j: u32) DeleteError!u16 {

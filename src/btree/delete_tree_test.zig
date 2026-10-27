@@ -485,8 +485,8 @@ fn build_no_space_tree(f: *Fixture) !void {
     const page = r.bytes_mut();
     internal.format_internal(page, f.tree.root, 2, ids[4], 0);
     try internal.internal_insert(page, 0, "k5", ids[2]);
-    try internal.internal_insert(page, 1, "k6", ids[3]);
-    for ([_]struct { u8, usize }{ .{ 'm', 40 }, .{ 'n', 10 }, .{ 'o', 3 }, .{ 'p', 1 } }) |kind| {
+    try internal.internal_insert(page, 1, "t", ids[3]);
+    for ([_]struct { u8, usize }{ .{ 'u', 40 }, .{ 'v', 10 }, .{ 'w', 3 }, .{ 'x', 1 } }) |kind| {
         _ = try fill_internal(page, kind[0], kind[1], ids[4]);
     }
     node.seal(page, f.tree.root, 0);
@@ -508,6 +508,104 @@ test "delete: NoSpaceLeft when a forced borrow cannot fit its separator in the p
 
     try testing.expectEqualSlices(u8, before, after);
     try testing.expectEqual(@as(u32, 0), f.tree.frees_len);
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+}
+
+/// Rewrites the leaf `id` with every key's first byte replaced by `lead` (same length, so it
+/// fits), re-sealed: a CRC-valid page whose keys lie outside the range its parent promises.
+fn rekey_leaf(f: *Fixture, id: Id, lead: u8) !void {
+    assert(f.pool.pinned_count() == 0);
+    assert(lead != 'k');
+    var guard = try f.pool.fetchForUpdate(testing.io, id);
+    defer guard.release();
+
+    const page = guard.bytes_mut();
+    var copy: [512]u8 = undefined;
+    @memcpy(&copy, page);
+    const old = try node.parse_leaf(&copy);
+    node.format_leaf(page, id, old.next, header.peek(&copy).lsn);
+    for (0..old.count) |index| {
+        const entry = try old.entry(@intCast(index));
+        var key: [8]u8 = undefined;
+        @memcpy(key[0..entry.key.len], entry.key);
+        key[0] = lead;
+        try node.leaf_insert(page, @intCast(index), key[0..entry.key.len], entry.value);
+    }
+    node.seal(page, id, header.peek(&copy).lsn);
+}
+
+test "delete: a borrow separator outside the parent's bounds is Corrupted, nothing changes" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 16, 64);
+    defer f.stop(testing.allocator);
+
+    try fill(&f, 45);
+    try testing.expectEqual(@as(u32, 3), (try walk(&f, null)).leaves);
+    const first_count = try leftmost_count(&f);
+    for (first_count + 1..first_count + 9) |n| { // Fatten leaf 1 so a merge cannot fit.
+        var raw: [8]u8 = undefined;
+        const key = try std.fmt.bufPrint(&raw, "k{d:0>5}a", .{n});
+        try f.tree.insert(testing.io, key, "12345678");
+    }
+    try testing.expectEqual(@as(u32, 3), (try walk(&f, null)).leaves);
+    var path: descend.Path = undefined;
+    var probe: [8]u8 = undefined;
+    const second_key = fx.key_of(&probe, try leftmost_count(&f)); // First key of leaf 1.
+    var guard = try descend.descend(&f.pool, testing.io, f.tree.root, second_key, false, &path);
+    const middle = path.leaf; // Right sibling of the leftmost leaf, with a right neighbour.
+    guard.release();
+    try rekey_leaf(&f, middle, 'z'); // Keys now sort above the parent's next separator.
+    var hit = false;
+    for (0..20) |n| {
+        const before = try snapshot(&f, testing.allocator);
+        defer testing.allocator.free(before);
+
+        _ = delete_key(&f, @intCast(n)) catch |err| switch (err) {
+            error.Corrupted => {
+                const after = try snapshot(&f, testing.allocator);
+                defer testing.allocator.free(after);
+
+                try testing.expectEqualSlices(u8, before, after);
+                hit = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try testing.expect(hit);
+    try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
+}
+
+test "delete: an id already pending in frees_pending is Corrupted, nothing changes" {
+    var f: Fixture = undefined;
+    try f.start(testing.allocator, 512, 8, 64);
+    defer f.stop(testing.allocator);
+
+    try fill(&f, 27);
+    var path: descend.Path = undefined;
+    var guard = try descend.descend(&f.pool, testing.io, f.tree.root, "k99999", false, &path);
+    f.tree.frees_pending[0] = path.leaf; // The right leaf, which the merge would unlink.
+    f.tree.frees_len = 1;
+    guard.release();
+    var hit = false;
+    for (0..10) |n| {
+        const before = try snapshot(&f, testing.allocator);
+        defer testing.allocator.free(before);
+
+        _ = delete_key(&f, @intCast(n)) catch |err| switch (err) {
+            error.Corrupted => {
+                const after = try snapshot(&f, testing.allocator);
+                defer testing.allocator.free(after);
+
+                try testing.expectEqualSlices(u8, before, after);
+                try testing.expectEqual(@as(u32, 1), f.tree.frees_len);
+                hit = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try testing.expect(hit);
     try testing.expectEqual(@as(u32, 0), f.pool.pinned_count());
 }
 

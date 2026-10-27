@@ -30,6 +30,11 @@ All notable changes to this project are documented in this file. The format foll
   until splits land. `cache`: `BufferPool.fetchNew(io, id)` pins a just-allocated page
   zero-filled and dirty without reading it (`FetchNewError`).
 
+### Changed
+- `Tree.create` and `Tree.open` take a required `frees: []Id` (caller-provided storage for the
+  pending-free list). Pending frees are not persisted: ids still pending when the process
+  stops are lost until a later recovery item, so call `Tree.release_frees` first.
+
 ## [0.5.0] - 2026-10-20
 
 WAL format v1 (`docs/adr/0003-wal-format.md`) is on-disk API from this tag: `wal-NNNNNNNN.log`
