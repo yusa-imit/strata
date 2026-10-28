@@ -8,6 +8,9 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- `btree/cursor.zig`: `Cursor` iterates a `Tree` in key order with `seek` (lower bound), `first`,
+  `last`, `next` and `prev`; it pins at most one leaf, keeps a bounded descent stack, `release`
+  cannot fail, and a link cycle, shared leaf or bad level is `error.Corrupted`.
 - `btree/delete_tree.zig`: `Tree.delete` removes a key, borrows from or merges with a sibling on
   byte-fill underflow, collapses a one-child root into the fixed root id, and queues freed pages
   in a bounded `frees_pending` handed to the page manager only by `Tree.release_frees`;

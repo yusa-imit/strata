@@ -53,14 +53,15 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       bounded `frees_pending` (`frees_pending_max`), handed to `PageManager.free` only by
       `release_frees(io)`. Verify: insert all, delete all in seeded order → empty root leaf,
       `validate` every 100 ops; every allocated page freed exactly once (counter model).
-- [ ] **`btree/cursor.zig` — seek, next, prev** (`src/btree/`). The cursor keeps its bounded
+- [x] **`btree/cursor.zig` — seek, next, prev** (`src/btree/`). The cursor keeps its bounded
       descent stack, pins at most one leaf, `release` cannot fail; an entry borrows until the next
       step or write. Verify: forward and backward full scans equal the sorted model; seek to an
       absent, the first and a past-last key; an empty tree → null both ways.
 - [ ] **`btree/overflow.zig` — large values** (`src/btree/`). Values over the inline limit go to
       a chain bounded by `value_len_max`, freed via `frees_pending`; `get` assembles into a buffer
       allocated at `init`. Verify: 1 MiB value at 512 B and 64 KiB; a chain cycle or bad length
-      → `Corrupted`; page count balances after delete.
+      → `Corrupted`; page count balances after delete. `Cursor` returns `Corrupted` on an
+      overflow cell today (`cursor.zig` `entry_of`); give it the assembled value here.
 - [ ] **WAL integration: tree edits recover** (`src/btree/`, `src/wal/redo.zig`). With a
       `wal.Writer` attached, an op appends one frame imaging every page it dirtied, then
       `set_lsn`s them; `release_frees` waits for `durable_lsn`; `PageRedo` applies each image iff
