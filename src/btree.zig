@@ -25,6 +25,8 @@ pub const split_tree = @import("btree/split_tree.zig");
 pub const validate = @import("btree/validate.zig");
 pub const tree = @import("btree/tree.zig");
 pub const Tree = tree.Tree;
+pub const cursor = @import("btree/cursor.zig");
+pub const Cursor = cursor.Cursor;
 
 /// Module-level error set. Extend as functionality lands; keep names descriptive
 /// (`error.ChecksumMismatch`, not `error.Invalid`).
