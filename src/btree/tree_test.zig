@@ -23,6 +23,7 @@ const tfx = @import("tree_fixtures.zig");
 const PageManager = manager.PageManager;
 const BufferPool = buffer_pool.BufferPool;
 const Tree = tree_mod.Tree;
+const vbuf = &tfx.value_buf; // Value storage for the trees these tests build by hand.
 var no_frees: [1]header.Id = undefined; // Storage for trees that never delete.
 const Edit = *const fn ([]u8) anyerror!void;
 
@@ -47,7 +48,7 @@ const Fixture = struct {
         try BufferPool.init(&self.pool, gpa, &self.pm, options);
         errdefer self.pool.deinit(gpa);
 
-        try Tree.create(&self.tree, testing.io, &self.pool, &self.frees);
+        try Tree.create(&self.tree, testing.io, &self.pool, &self.frees, vbuf);
     }
 
     fn stop(self: *Fixture, gpa: Allocator) void {
@@ -138,7 +139,7 @@ test "create: the root is the first allocated id and an empty valid leaf, not ye
         try f.cold();
         try testing.expectEqual(@as(u16, 0), try leaf_count(&f)); // Durable after the flush.
         var reopened: Tree = undefined;
-        try Tree.open(&reopened, &f.pool, f.tree.root, &no_frees);
+        try Tree.open(&reopened, &f.pool, f.tree.root, &no_frees, vbuf);
         try expect_get(&reopened, "x", null);
     }
 }
@@ -161,7 +162,10 @@ test "create: a full file is NoSpaceLeft and leaves the pool clean" {
     defer pool.deinit(testing.allocator);
 
     var t: Tree = undefined;
-    try testing.expectError(error.NoSpaceLeft, Tree.create(&t, testing.io, &pool, &no_frees));
+    try testing.expectError(
+        error.NoSpaceLeft,
+        Tree.create(&t, testing.io, &pool, &no_frees, vbuf),
+    );
     try testing.expectEqual(@as(u32, 0), pool.dirty_count);
     try testing.expectEqual(@as(u32, 1), pm.page_count);
 }
@@ -229,10 +233,10 @@ test "open: a persisted root outside the file is Corrupted and leaves the target
     var t: Tree = f.tree;
     const before = t;
     const past: header.Id = @enumFromInt(f.pm.page_count);
-    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, .file_header, &no_frees));
-    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, past, &no_frees));
+    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, .file_header, &no_frees, vbuf));
+    try testing.expectError(error.Corrupted, Tree.open(&t, &f.pool, past, &no_frees, vbuf));
     try testing.expectEqual(before.root, t.root);
-    try Tree.open(&t, &f.pool, f.tree.root, &no_frees);
+    try Tree.open(&t, &f.pool, f.tree.root, &no_frees, vbuf);
     try expect_get(&t, "none", null);
 }
 
@@ -256,14 +260,17 @@ test "create: PoolExhausted (id leaked, target untouched) and InvalidHeader (dir
         .page_size = 512,
         .frees_pending = &no_frees,
         .frees_len = 0,
+        .value_buf = vbuf,
     };
     const count_before = pm.page_count;
-    try testing.expectError(error.PoolExhausted, Tree.create(&t, testing.io, &pool, &no_frees));
+    const created = Tree.create(&t, testing.io, &pool, &no_frees, vbuf);
+    try testing.expectError(error.PoolExhausted, created);
     try testing.expectEqual(first, t.root);
     try testing.expectEqual(count_before + 1, pm.page_count); // The allocated id leaks.
     pin.release();
     // The victim is dirty and unformatted (type byte 0), so evicting it for the root fails.
-    try testing.expectError(error.InvalidHeader, Tree.create(&t, testing.io, &pool, &no_frees));
+    const again = Tree.create(&t, testing.io, &pool, &no_frees, vbuf);
+    try testing.expectError(error.InvalidHeader, again);
     try testing.expectEqual(first, t.root);
     try testing.expectEqual(@as(u32, 0), pool.pinned_count());
     pool.discardAll();
@@ -294,11 +301,11 @@ test "boundaries: empty key, longest key, longest inline value, and one past eac
         @memset(value, 'v');
         try f.tree.insert(testing.io, "four", value[0..vmax]);
         try expect_get(&f.tree, "four", value[0..vmax]);
-        const big = f.tree.insert(testing.io, "four", value[0 .. vmax + 1]);
-        try testing.expectError(error.ValueTooLarge, big);
-        const huge = f.tree.insert(testing.io, "four", value); // Over the format limit too.
+        const huge = f.tree.insert(testing.io, "four", value); // Over the format limit.
         try testing.expectError(error.ValueTooLarge, huge);
-        try expect_get(&f.tree, "four", value[0..vmax]); // Rejections changed nothing.
+        try expect_get(&f.tree, "four", value[0..vmax]); // The rejection changed nothing.
+        try f.tree.insert(testing.io, "four", value[0 .. vmax + 1]); // One past inline spills.
+        try expect_get(&f.tree, "four", value[0 .. vmax + 1]);
         try testing.expectEqual(@as(u16, 3), try leaf_count(&f));
         try testing.expectError(error.KeyTooLarge, f.tree.get(testing.io, long_key));
     }
@@ -451,14 +458,14 @@ test "corruption: an overwrite whose neighbour breaks key order is Corrupted, pa
     }
 }
 
-test "corruption: an overflow cell is Corrupted for get and for an overwrite (not built yet)" {
+test "corruption: an overflow cell with a dangling head is Corrupted for get and overwrite" {
     var f: Fixture = undefined;
     try f.start(testing.allocator, 512, 2);
     defer f.stop(testing.allocator);
 
     try expect_insert_corrupted(&f, edit_overflow_cell, "k");
     try testing.expectError(error.Corrupted, f.tree.get(testing.io, "k"));
-    try f.tree.check_invariants(testing.io); // The cell itself is well formed.
+    try testing.expectError(error.Corrupted, f.tree.check_invariants(testing.io)); // Dangling head.
 }
 
 test "corruption: well-checksummed but malformed roots are Corrupted, never a panic" {
@@ -491,7 +498,7 @@ test "corruption: an unwritten or foreign root page gives the page layer's typed
 
     const grown = try f.pm.allocate(testing.io); // Reads Unwritten.
     var stray: Tree = undefined;
-    try Tree.open(&stray, &f.pool, grown, &no_frees);
+    try Tree.open(&stray, &f.pool, grown, &no_frees, vbuf);
     try testing.expectError(error.Unwritten, stray.get(testing.io, "a"));
     try testing.expectError(error.Unwritten, stray.insert(testing.io, "a", "1"));
     var buf: [512]u8 = undefined;

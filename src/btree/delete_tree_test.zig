@@ -323,7 +323,7 @@ test "delete: PoolExhausted with a two-frame pool leaves the tree unchanged" {
     defer small.deinit(testing.allocator);
 
     var t: Tree = undefined;
-    try Tree.open(&t, &small, f.tree.root, &f.frees);
+    try Tree.open(&t, &small, f.tree.root, &f.frees, &fx.value_buf);
     var hit = false;
     for (0..10) |n| {
         var key_buf: [8]u8 = undefined;

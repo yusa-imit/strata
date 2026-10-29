@@ -32,6 +32,7 @@ const buffer_pool = @import("../cache/buffer_pool.zig");
 const node = @import("node.zig");
 const internal = @import("internal.zig");
 const descend = @import("descend.zig");
+const overflow = @import("overflow.zig");
 const tree_mod = @import("tree.zig");
 
 const BufferPool = buffer_pool.BufferPool;
@@ -39,14 +40,16 @@ const PageGuard = buffer_pool.PageGuard;
 const Tree = tree_mod.Tree;
 const Id = header.Id;
 
-/// Page-layer fetch errors plus `Corrupted` for a page or link that is not valid.
-pub const Error = buffer_pool.FetchError || node.ParseError;
+/// Page-layer fetch errors plus `Corrupted` for a page, link or overflow chain that is not
+/// valid, and `ValueTooLarge` for a stored value longer than the tree's `value_buf`.
+pub const Error = buffer_pool.FetchError || node.ParseError || error{ValueTooLarge};
 
 /// `KeyTooLarge`: the key is longer than `node.key_len_max(page_size)`; no such key exists.
 pub const SeekError = Error || error{KeyTooLarge};
 
-/// A key and its inline value. Both slices borrow the pinned leaf frame (see the functions
-/// that return one); copy them to keep them.
+/// A key and its value. The key and an inline value borrow the pinned leaf frame (see the
+/// functions that return one); an overflow value borrows `tree.value_buf`, so `Tree.get`
+/// during a scan overwrites it. Copy them to keep them.
 pub const Entry = struct { key: []const u8, value: []const u8 };
 
 const State = enum { unpositioned, on_entry, before_first, after_last };
@@ -142,7 +145,7 @@ pub const Cursor = struct {
             self.state = .before_first;
             return null;
         }
-        return try self.settle(leaf, leaf.count - 1);
+        return try self.settle(io, leaf, leaf.count - 1);
     }
 
     /// Steps to the next larger key; null once past the last (the cursor is then `after_last`
@@ -167,7 +170,7 @@ pub const Cursor = struct {
         if (following >= leaf.count) return try self.cross_forward(io);
         const entry = try entry_of(leaf, @intCast(following));
         if (std.mem.order(u8, self.at.key, entry.key) != .lt) return error.Corrupted;
-        return try self.settle(leaf, @intCast(following));
+        return try self.settle(io, leaf, @intCast(following));
     }
 
     /// Steps to the next smaller key; null once before the first (the cursor is then
@@ -191,7 +194,7 @@ pub const Cursor = struct {
         if (self.index > leaf.count) return error.Corrupted; // A write shrank the leaf.
         const entry = try entry_of(leaf, self.index - 1);
         if (std.mem.order(u8, entry.key, self.at.key) != .lt) return error.Corrupted;
-        return try self.settle(leaf, self.index - 1);
+        return try self.settle(io, leaf, self.index - 1);
     }
 
     /// Descends to the leaf for `key` and takes the lower bound in it or, past its end, the
@@ -208,18 +211,28 @@ pub const Cursor = struct {
         if (leaf.count == 0 and self.guard.?.id() != self.tree.root) return error.Corrupted;
         const slot = try leaf.search(key);
         if (slot.index < leaf.count) {
-            _ = try self.settle(leaf, slot.index);
+            _ = try self.settle(io, leaf, slot.index);
             return;
         }
         _ = try self.cross_forward(io);
     }
 
-    /// Records `index` of the pinned `leaf` as the current entry. Overflow values do not exist
-    /// yet, so such a cell is `Corrupted`.
-    fn settle(self: *Cursor, leaf: node.Leaf, index: u16) Error!Entry {
+    /// Records `index` of the pinned `leaf` as the current entry; an overflow value is
+    /// assembled into the tree's `value_buf` (see `Tree.get`), so it is valid only until the
+    /// next call on the cursor or the tree.
+    fn settle(self: *Cursor, io: Io, leaf: node.Leaf, index: u16) Error!Entry {
         assert(self.guard != null);
         assert(index < leaf.count);
-        const entry = try entry_of(leaf, index);
+        const cell = try leaf.entry(index);
+        const value: []const u8 = switch (cell.value) {
+            .bytes => |bytes| bytes,
+            .overflow => |spill| blk: {
+                if (spill.len > self.tree.value_buf.len) return error.ValueTooLarge;
+                const pool = self.tree.pool;
+                break :blk try overflow.read(pool, io, spill, self.tree.value_buf);
+            },
+        };
+        const entry: Entry = .{ .key = cell.key, .value = value };
         self.at = entry;
         self.index = index;
         self.state = .on_entry;
@@ -253,7 +266,7 @@ pub const Cursor = struct {
         if (floor) |bound| {
             if (std.mem.order(u8, bound, entry.key) != .lt) return error.Corrupted;
         }
-        return try self.settle(entered, 0);
+        return try self.settle(io, entered, 0);
     }
 
     /// From slot 0 of the pinned leaf to the last entry of its left neighbour: re-descend with
@@ -278,7 +291,7 @@ pub const Cursor = struct {
         self.guard = try rightmost(pool, io, sibling.child, sibling.level);
         const leaf = try node.parse_leaf(self.guard.?.bytes());
         if (leaf.next != leaf_id or leaf.count == 0) return error.Corrupted;
-        const entry = try self.settle(leaf, leaf.count - 1);
+        const entry = try self.settle(io, leaf, leaf.count - 1);
         if (std.mem.order(u8, entry.key, first_key) != .lt) return error.Corrupted;
         return entry;
     }
@@ -356,15 +369,11 @@ fn rightmost(pool: *BufferPool, io: Io, start: Id, level_first: ?u8) Error!PageG
     return error.Corrupted; // Deeper than any valid tree of this page size.
 }
 
-/// A leaf cell as an `Entry`; a spilled (overflow) value cannot exist at this stage.
-fn entry_of(leaf: node.Leaf, index: u16) node.ParseError!Entry {
+/// A leaf cell with its key checked; the value (inline or spilled) is read by `settle`.
+fn entry_of(leaf: node.Leaf, index: u16) node.ParseError!node.Entry {
     assert(index < leaf.count);
     assert(leaf.count <= node.cell_count_max(node.page_size_of(leaf.page)));
-    const cell = try leaf.entry(index);
-    switch (cell.value) {
-        .bytes => |bytes| return .{ .key = cell.key, .value = bytes },
-        .overflow => return error.Corrupted,
-    }
+    return leaf.entry(index);
 }
 
 /// Copies a parsed key (at most `key_len_cap` bytes) into `buf`; the copy outlives the page.

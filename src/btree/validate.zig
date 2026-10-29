@@ -9,7 +9,7 @@
 //! separators (a key equal to a separator lives right of it, section 5); the leaf `next` chain
 //! equals the in-order leaves and ends in 0; with a visited set, every page is reached once (no
 //! cycle, no shared child). Any violation is `error.Corrupted`; the page layer's typed errors
-//! pass through. Overflow chains are a later item.
+//! pass through. Every overflow chain is walked: type, `len`, `next`, zero tail, once only.
 //! Bounds: the loop runs at most `2 * page_count + 2` steps (one push and one pop per page), so
 //! a cyclic or sharing tree ends in `Corrupted` instead of looping.
 //! Allocation: none here. `run` takes an optional visited bitmap (`page_count` bits, zeroed) from
@@ -23,6 +23,7 @@ const header = @import("../page/header.zig");
 const buffer_pool = @import("../cache/buffer_pool.zig");
 const node = @import("node.zig");
 const internal = @import("internal.zig");
+const overflow = @import("overflow.zig");
 
 const BufferPool = buffer_pool.BufferPool;
 const Id = header.Id;
@@ -168,7 +169,7 @@ fn visit(w: *Walk, io: Io, id: Id, level_want: ?u8) CheckError!void {
 
     const page = pinned.bytes();
     if (page[node.offset_type] == @intFromEnum(header.Type.btree_leaf)) {
-        return visit_leaf(w, id, page, level_want);
+        return visit_leaf(w, io, id, page, level_want);
     }
     const level = page[node.offset_level];
     if (level_want) |want| {
@@ -189,7 +190,7 @@ fn visit(w: *Walk, io: Io, id: Id, level_want: ?u8) CheckError!void {
     assert(w.frames[w.depth - 1].count == view.count);
 }
 
-fn visit_leaf(w: *Walk, id: Id, page: []const u8, level_want: ?u8) CheckError!void {
+fn visit_leaf(w: *Walk, io: Io, id: Id, page: []const u8, level_want: ?u8) CheckError!void {
     assert(id != .file_header);
     assert(page.len == w.pool.page_size);
     if (level_want) |want| {
@@ -205,10 +206,26 @@ fn visit_leaf(w: *Walk, id: Id, page: []const u8, level_want: ?u8) CheckError!vo
         const last = (try leaf.entry(leaf.count - 1)).key;
         if (!w.pending.contains(first) or !w.pending.contains(last)) return error.Corrupted;
     }
+    try check_chains(w, io, leaf);
     if (w.have_prev) {
         if (w.prev_next != id) return error.Corrupted; // Chain differs from the in-order leaves.
     }
     w.have_prev = true;
     w.prev_next = leaf.next;
     assert(w.prev_next != id);
+}
+
+/// Walks the overflow chain of every spilled cell of `leaf`: shape, lengths, zero tails, and
+/// (with a bitmap) no page reached twice anywhere in the tree.
+fn check_chains(w: *Walk, io: Io, leaf: node.Leaf) CheckError!void {
+    assert(leaf.count <= node.cell_count_max(w.pool.page_size));
+    assert(w.pool.page_size == leaf.page.len);
+    for (0..leaf.count) |index| {
+        switch ((try leaf.entry(@intCast(index))).value) {
+            .bytes => {},
+            .overflow => |spill| {
+                try overflow.walk(w.pool, io, spill, .{ .visited = w.visited });
+            },
+        }
+    }
 }

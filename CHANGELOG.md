@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- `btree/overflow.zig`: values over the inline limit live in a chain of type-18 pages (`write`,
+  `walk`, `read`, `collect_ids`); `Tree.get`, `insert`, `delete`, `validate` and `Cursor` handle
+  overflow cells, assemble into the caller's `value_buf`, and free chains through
+  `frees_pending`. A cycle, a shared page, a wrong type or a wrong length is `error.Corrupted`.
 - `btree/cursor.zig`: `Cursor` iterates a `Tree` in key order with `seek` (lower bound), `first`,
   `last`, `next` and `prev`; it pins at most one leaf, keeps a bounded descent stack, `release`
   cannot fail, and a link cycle, shared leaf or bad level is `error.Corrupted`.
@@ -34,6 +38,8 @@ All notable changes to this project are documented in this file. The format foll
   zero-filled and dirty without reading it (`FetchNewError`).
 
 ### Changed
+- `Tree.create` and `Tree.open` take a required `value_buf: []u8` (at most `value_len_max`)
+  that bounds the value size (`ValueTooLarge`) and holds assembled overflow values.
 - `Tree.create` and `Tree.open` take a required `frees: []Id` (caller-provided storage for the
   pending-free list). Pending frees are not persisted: ids still pending when the process
   stops are lost until a later recovery item, so call `Tree.release_frees` first.
