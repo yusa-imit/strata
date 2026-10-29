@@ -341,9 +341,40 @@ pub const Writer = struct {
     ) AppendError!Lsn {
         assert(self.buf.len == frame.frame_bytes_max);
         assert(self.next_lsn < frame.lsn_limit);
+        const parts = [_][]const u8{payload};
+        return self.append_parts(io, frame_type, &parts);
+    }
+
+    /// `append` of the concatenation of `parts`, without the caller building it: the parts are
+    /// copied once, straight into the frame buffer (a 1 MiB chain of page images is never
+    /// copied into an intermediate payload). Same results, errors and effects as `append` of
+    /// `std.mem.concat(parts)`: no parts, or only empty ones, is the empty payload, and the sum
+    /// of the part lengths over `payload_bytes_max` is `PayloadTooLarge`. The parts must not
+    /// alias the writer's buffer. A rejected call may overwrite the buffer's scratch bytes but
+    /// leaves the log and the writer's counters unchanged.
+    pub fn append_parts(
+        self: *Writer,
+        io: Io,
+        frame_type: frame.Type,
+        parts: []const []const u8,
+    ) AppendError!Lsn {
+        assert(self.buf.len == frame.frame_bytes_max);
+        assert(self.next_lsn < frame.lsn_limit);
         if (self.failed) return error.Failed;
-        if (payload.len > frame.payload_bytes_max) return error.PayloadTooLarge;
-        const total = frame.frame_header_size + @as(u32, @intCast(payload.len));
+        var length: u64 = 0;
+        for (parts) |part| {
+            length += part.len;
+            if (length > frame.payload_bytes_max) return error.PayloadTooLarge;
+        }
+        const payload_len: u32 = @intCast(length);
+        const total = frame.frame_header_size + payload_len;
+        var gathered: u32 = 0;
+        for (parts) |part| {
+            @memcpy(self.buf[frame.frame_header_size + gathered ..][0..part.len], part);
+            gathered += @intCast(part.len);
+        }
+        assert(gathered == payload_len);
+        const payload = self.buf[frame.frame_header_size..total];
         if (!frame.payload_valid(@intFromEnum(frame_type), self.next_lsn, payload)) {
             return error.InvalidFrame;
         }
@@ -352,7 +383,7 @@ pub const Writer = struct {
         if (full and self.offset > segment.segment_header_size) try self.rotate(io);
 
         const lsn = self.next_lsn;
-        const used = frame.encode(self.buf, lsn, frame_type, payload);
+        const used = frame.seal(self.buf, lsn, frame_type, payload_len);
         assert(used == total);
         self.failed = true; // Cleared below; a failed write may leave a partial frame behind.
         try self.current.append(io, self.buf[0..used], self.offset);
@@ -465,5 +496,6 @@ test {
     _ = @import("writer_tail_test.zig");
     _ = @import("writer_fault_test.zig");
     _ = @import("writer_commit_test.zig");
+    _ = @import("writer_parts_test.zig");
     _ = @import("group_commit.zig");
 }

@@ -221,3 +221,35 @@ pub fn write_log(dir: Io.Dir, size: u32, steps: []const Step, lsns: []frame.Lsn)
     };
     try w.sync(testing.io);
 }
+
+/// One entry of a `page_images` payload: page `id` holding `pattern(seed)`.
+pub const Spec = struct { id: u32, seed: u32 };
+
+const images_prefix_size: u32 = 8;
+
+/// A `page_images` payload for `specs` at page size `size` (ADR-0004 section 9): count, page
+/// size, then each id and an image of type `consumer_type` with a stale header. Owned. The ids
+/// are written as given, so a test can forge unsorted ones.
+pub fn images_payload(size: u32, specs: []const Spec) ![]u8 {
+    assert(header.page_size_valid(size));
+    assert(specs.len >= 1);
+    const entry_size = payload_id_size + size;
+    const payload = try testing.allocator.alloc(u8, images_prefix_size + specs.len * entry_size);
+    errdefer testing.allocator.free(payload);
+
+    @memset(payload, 0);
+    std.mem.writeInt(u32, payload[0..4], @intCast(specs.len), .little);
+    std.mem.writeInt(u32, payload[4..8], size, .little);
+    for (specs, 0..) |spec, index| {
+        const base = images_prefix_size + index * entry_size;
+        std.mem.writeInt(u32, payload[base..][0..4], spec.id, .little);
+        const page = payload[base + payload_id_size ..][0..size];
+        fixtures.pattern(page[header.header_size..], spec.seed);
+        header.encode(page, @enumFromInt(@max(spec.id, 1)), .{
+            .page_type = consumer_type,
+            .lsn = 1,
+        });
+        header.poke_lsn(page, stale_lsn); // The checksum is now stale.
+    }
+    return payload;
+}
