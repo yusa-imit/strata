@@ -146,7 +146,7 @@ test "split: the root id is fixed across root splits, which raise its level by o
     try testing.expect(raises >= 2); // A leaf root became internal, then that root split.
     var reopened: Tree = undefined;
     try f.cold();
-    try Tree.open(&reopened, &f.pool, root, &no_frees);
+    try Tree.open(&reopened, &f.pool, root, &no_frees, &fx.value_buf);
     try fx.expect_get(&reopened, "k02999", "vvvvvvvv");
 }
 

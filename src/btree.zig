@@ -11,7 +11,9 @@
 //! (internal cell codec), `btree/split.zig` (split point by bytes), `btree/descend.zig`
 //! (bounded root-to-leaf walk), `btree/split_tree.zig` (splitting insert, root id fixed),
 //! `btree/validate.zig` (whole-tree checks) and `btree/tree.zig` (`Tree`: create, get, insert
-//! with splits, check_invariants, validate; unlogged, no overflow values or delete yet).
+//! with splits, check_invariants, validate; unlogged), `btree/overflow.zig` (overflow chains:
+//! write, walk and assemble, freed through `frees_pending`; large values up to 1 MiB in
+//! `Tree.insert`, `delete`, `get`, the cursor and `validate`).
 //!
 //! Status: partial. Public declarations are added as PRD phases land.
 
@@ -23,6 +25,7 @@ pub const split = @import("btree/split.zig");
 pub const descend = @import("btree/descend.zig");
 pub const split_tree = @import("btree/split_tree.zig");
 pub const validate = @import("btree/validate.zig");
+pub const overflow = @import("btree/overflow.zig");
 pub const tree = @import("btree/tree.zig");
 pub const Tree = tree.Tree;
 pub const cursor = @import("btree/cursor.zig");

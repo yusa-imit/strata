@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const header = @import("../page/header.zig");
 const manager = @import("../page/manager.zig");
 const buffer_pool = @import("../cache/buffer_pool.zig");
+const node = @import("node.zig");
 const tree_mod = @import("tree.zig");
 
 const PageManager = manager.PageManager;
@@ -17,7 +18,11 @@ const Tree = tree_mod.Tree;
 const Id = header.Id;
 
 /// Capacity of the fixture tree's pending-free list.
-pub const frees_max: u32 = 64;
+pub const frees_max: u32 = 2400; // A full 1 MiB chain at 512 B (2185 pages) plus slack.
+
+/// Value storage shared by every fixture tree (tests run one at a time); 1 MiB, never touched
+/// until a test stores an overflow value.
+pub var value_buf: [node.value_len_max]u8 = undefined;
 
 pub const sizes_all = [_]u32{ 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
 
@@ -46,7 +51,7 @@ pub const Fixture = struct {
         try BufferPool.init(&self.pool, gpa, &self.pm, pool_options);
         errdefer self.pool.deinit(gpa);
 
-        try Tree.create(&self.tree, testing.io, &self.pool, &self.frees);
+        try Tree.create(&self.tree, testing.io, &self.pool, &self.frees, &value_buf);
     }
 
     pub fn stop(self: *Fixture, gpa: Allocator) void {
@@ -98,7 +103,7 @@ pub const Model = std.StringHashMapUnmanaged([]u8);
 
 pub fn model_put(model: *Model, key: []const u8, value: []const u8) !void {
     assert(key.len <= 1024);
-    assert(value.len <= 1024);
+    assert(value.len <= 1 << 20);
     const owned_value = try testing.allocator.dupe(u8, value);
     errdefer testing.allocator.free(owned_value);
 

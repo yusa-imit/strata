@@ -329,7 +329,7 @@ pub fn parse_leaf(page: []const u8) ParseError!Leaf {
 }
 
 /// Bytes a cell takes; asserts the form is the canonical one for the sizes involved.
-fn cell_size(page_size: u32, key: []const u8, value: Value) u32 {
+pub fn cell_size(page_size: u32, key: []const u8, value: Value) u32 {
     assert(key.len <= key_len_max(page_size));
     const key_len: u32 = @intCast(key.len);
     const key_vs = codec.varint.encoded_size(key_len);

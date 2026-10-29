@@ -26,6 +26,7 @@ const buffer_pool = @import("../cache/buffer_pool.zig");
 const node = @import("node.zig");
 const internal = @import("internal.zig");
 const descend = @import("descend.zig");
+const overflow = @import("overflow.zig");
 
 const BufferPool = buffer_pool.BufferPool;
 const PageGuard = buffer_pool.PageGuard;
@@ -113,6 +114,10 @@ pub fn delete(t: *Tree, io: Io, key: []const u8) DeleteError!bool {
     const view = try node.parse_leaf(leaf.bytes());
     const slot = try view.search(key);
     if (!slot.found) return false;
+    const spill: ?node.Overflow = switch ((try view.entry(slot.index)).value) {
+        .bytes => null,
+        .overflow => |found| found,
+    };
     var d: Del = undefined;
     d.pool = t.pool;
     d.path = &path;
@@ -132,27 +137,37 @@ pub fn delete(t: *Tree, io: Io, key: []const u8) DeleteError!bool {
             return error.Corrupted;
         }
     }
-    if (t.frees_len + d.frees_len > t.frees_pending.len) return error.FreesPendingLimit;
+    const chain_n: u32 = if (spill) |found| overflow.chain_len(t.page_size, found.len) else 0;
+    if (t.frees_len + d.frees_len + chain_n > t.frees_pending.len) return error.FreesPendingLimit;
+    if (spill) |found| {
+        // Walked before apply, so a bad chain is `Corrupted` with the tree untouched; the ids
+        // wait just past the node ids in the free slots and are counted once apply is done.
+        const room = t.frees_pending[t.frees_len + d.frees_len ..][0..chain_n];
+        try overflow.collect_ids(t.pool, io, found, room);
+    }
     try apply(&d, slot.index);
     for (d.frees[0..d.frees_len]) |id| {
         t.frees_pending[t.frees_len] = id;
         t.frees_len += 1;
     }
+    t.frees_len += chain_n;
     return true;
 }
 
 fn leaf_cell_bytes(entry: node.Entry) node.ParseError!u32 {
     assert(entry.key.len <= node.key_len_cap);
     assert(entry.key.len <= node.key_len_cap);
-    switch (entry.value) {
-        .bytes => |bytes| {
-            const key_len: u32 = @intCast(entry.key.len);
-            const value_len: u32 = @intCast(bytes.len);
-            return codec.varint.encoded_size(key_len) + codec.varint.encoded_size(value_len) +
-                key_len + value_len;
-        },
-        .overflow => return error.Corrupted, // Never written at this stage.
-    }
+    const key_len: u32 = @intCast(entry.key.len);
+    const value_len: u32 = switch (entry.value) {
+        .bytes => |bytes| @intCast(bytes.len),
+        .overflow => |spill| spill.len,
+    };
+    const tail: u32 = switch (entry.value) {
+        .bytes => value_len,
+        .overflow => 4, // The head id; the chain pages are freed apart from the leaf.
+    };
+    return codec.varint.encoded_size(key_len) + codec.varint.encoded_size(value_len) +
+        key_len + tail;
 }
 
 fn internal_cell_bytes(key_len: usize) u32 {

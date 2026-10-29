@@ -4,9 +4,10 @@
 //! `split_tree.zig`), `delete` removes a key, merging or borrowing from siblings and collapsing
 //! a one-child root (`delete_tree.zig`), `check_invariants` and `validate` walk the whole tree
 //! (`validate.zig`). Pages a delete unlinks wait in the caller-provided `frees_pending` (not
-//! persisted) until `release_frees` hands them to the page manager. Overflow values and
-//! logging arrive in later plan 005 items, so this stage is unlogged (page `lsn`s are kept as
-//! they are).
+//! persisted) until `release_frees` hands them to the page manager. A value that is not inline
+//! (up to `value_buf.len <= node.value_len_max`) goes to an overflow chain (`overflow.zig`);
+//! logging arrives in a later plan 005 item, so this stage is unlogged (page `lsn`s are kept
+//! as they are).
 //!
 //! Invariants: `root` is a page id allocated by `create`, never 0 and never changed, even by a
 //! root split; the root is a leaf (type 16, level 0) or an internal node (type 17) whose level
@@ -28,13 +29,14 @@
 //! Prepare fully validates every node apply will touch, so a split cannot fail after its first
 //! byte moves on any page content; the apply-phase `Corrupted` returns are defensive only. There
 //! is still no log to roll back with, so the WAL item (one frame per op) owns crash atomicity.
-//! Borrowing: `get` returns a slice into a pool frame, see its doc for the lifetime.
+//! Borrowing: `get` returns a slice into a pool frame or into the caller's `value_buf`, see its
+//! doc for the lifetime. `value_buf` is a parameter of `create` and `open` (one construction
+//! path) and its length is the tree's value limit.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const codec = @import("../codec.zig");
 const header = @import("../page/header.zig");
 const manager = @import("../page/manager.zig");
 const buffer_pool = @import("../cache/buffer_pool.zig");
@@ -43,9 +45,14 @@ const descend = @import("descend.zig");
 const split_tree = @import("split_tree.zig");
 const delete_tree = @import("delete_tree.zig");
 const validate_mod = @import("validate.zig");
+const overflow = @import("overflow.zig");
 
 const BufferPool = buffer_pool.BufferPool;
 const Id = header.Id;
+
+/// What a put decided before it touches the leaf: the value as stored, the pages of the new
+/// chain (0 when inline) and of the old one that the put replaces.
+const Put = struct { value: node.Value, chain_n: u32, old_n: u32 };
 
 /// `create` pops or grows an id, then pins it new; an id that was allocated before a later
 /// failure leaks, which ADR-0002 calls safe.
@@ -61,8 +68,10 @@ pub const CheckError = buffer_pool.FetchError || node.ParseError;
 /// `validate` adds the `gpa` allocation of its visited bitmap.
 pub const ValidateError = CheckError || error{OutOfMemory};
 
-/// `KeyTooLarge`: the key is longer than `node.key_len_max(page_size)`.
-pub const GetError = CheckError || error{KeyTooLarge};
+/// `KeyTooLarge`: the key is longer than `node.key_len_max(page_size)`. `ValueTooLarge`: the
+/// stored value is longer than the tree's `value_buf` (the tree was opened with a smaller limit
+/// than the one it was written with).
+pub const GetError = CheckError || error{ KeyTooLarge, ValueTooLarge };
 
 /// `FreesPendingLimit`: `frees_pending` has no room for the ids this delete would unlink;
 /// nothing changed. `NoSpaceLeft`: a forced borrow whose new separator does not fit in its
@@ -72,11 +81,11 @@ pub const DeleteError = delete_tree.DeleteError;
 /// The page manager's own error set: `release_frees` frees through it.
 pub const FreeError = manager.FreeError;
 
-/// `ValueTooLarge`: over `node.value_len_max`, or not inline at this page size (overflow values
-/// are a later item). `HeightLimit`: the split would raise the tree past `height_max`; nothing
-/// changed. A split also allocates (`manager.AllocateError`) and pins new pages
-/// (`FetchNewError`). `NodeFull` is gone: a full leaf splits.
-pub const InsertError = GetError || split_tree.SplitError || error{ValueTooLarge};
+/// `ValueTooLarge`: over `value_buf.len` (at most `node.value_len_max`). `FreesPendingLimit`:
+/// `frees_pending` lacks room for the ids of the old chain plus the new one; nothing changed.
+/// `HeightLimit`: the split would raise the tree past `height_max`; nothing changed. A split
+/// or a chain also allocates (`manager.AllocateError`) and pins new pages (`FetchNewError`).
+pub const InsertError = GetError || split_tree.SplitError || error{FreesPendingLimit};
 
 pub const Tree = struct {
     pool: *BufferPool,
@@ -86,14 +95,24 @@ pub const Tree = struct {
     frees_pending: []Id,
     /// Ids in `frees_pending[0..frees_len]` wait for `release_frees`.
     frees_len: u32,
+    /// Caller-provided storage for one value: `get` and the cursor assemble an overflow value
+    /// here, and its length is the tree's value limit (`insert` over it is `ValueTooLarge`).
+    value_buf: []u8,
 
     /// Allocates the root id from the page manager and writes an empty leaf there, in the pool
     /// (dirty, not yet on disk: `flushAll` and the caller's `sync` make it durable). The root
     /// id is persisted by the caller. On error nothing in `target` is set. `frees` is the
     /// storage of the pending-free list (its length is `frees_pending_max`) and must outlive
     /// the tree.
-    pub fn create(target: *Tree, io: Io, pool: *BufferPool, frees: []Id) CreateError!void {
+    pub fn create(
+        target: *Tree,
+        io: Io,
+        pool: *BufferPool,
+        frees: []Id,
+        value_buf: []u8,
+    ) CreateError!void {
         assert(pool.page_size == pool.pages.page_size);
+        assert(value_buf.len <= node.value_len_max);
         assert(header.page_size_valid(pool.page_size));
         const id = try pool.pages.allocate(io);
         var guard = try pool.fetchNew(io, id);
@@ -106,6 +125,7 @@ pub const Tree = struct {
             .page_size = pool.page_size,
             .frees_pending = frees,
             .frees_len = 0,
+            .value_buf = value_buf,
         };
         assert(target.root != .file_header);
         assert(@intFromEnum(target.root) < pool.pages.page_count);
@@ -115,8 +135,15 @@ pub const Tree = struct {
     /// root page surfaces from the first `get` or `insert`. The id itself is data from outside
     /// (the caller's own storage), so a root of 0 or at or past `page_count` is `Corrupted` and
     /// `target` is left untouched.
-    pub fn open(target: *Tree, pool: *BufferPool, root: Id, frees: []Id) OpenError!void {
+    pub fn open(
+        target: *Tree,
+        pool: *BufferPool,
+        root: Id,
+        frees: []Id,
+        value_buf: []u8,
+    ) OpenError!void {
         assert(pool.page_size == pool.pages.page_size);
+        assert(value_buf.len <= node.value_len_max);
         assert(pool.pages.page_count >= 1);
         if (root == .file_header) return error.Corrupted;
         if (@intFromEnum(root) >= pool.pages.page_count) return error.Corrupted;
@@ -126,13 +153,16 @@ pub const Tree = struct {
             .page_size = pool.page_size,
             .frees_pending = frees,
             .frees_len = 0,
+            .value_buf = value_buf,
         };
         assert(target.root != .file_header);
     }
 
-    /// The value stored under `key`, or null when absent. The slice borrows a pool frame: it
+    /// The value stored under `key`, or null when absent. An inline value borrows a pool frame;
+    /// an overflow value is assembled into `value_buf` and borrows that. Either way the slice
     /// stays valid until the next call on this tree or any fetch on its pool (a fetch may evict
-    /// the frame), and is overwritten by the next write to that leaf; copy it to keep it. A key
+    /// the frame, the next `get`, `insert` or cursor step reuses `value_buf`), and is
+    /// overwritten by the next write to that leaf; copy it to keep it. A key
     /// longer than `key_len_max` is `KeyTooLarge` (no such key can exist). Cost: one fetch per
     /// level (at most `height_max`) and a binary search per node that checks only the cells it
     /// touches; a bad level, type or child id on the way is `Corrupted`.
@@ -150,24 +180,28 @@ pub const Tree = struct {
         const entry = try leaf.entry(slot.index);
         switch (entry.value) {
             .bytes => |bytes| return bytes,
-            .overflow => return error.Corrupted, // Overflow cells are never written yet.
+            .overflow => |spill| {
+                if (spill.len > self.value_buf.len) return error.ValueTooLarge;
+                return try overflow.read(self.pool, io, spill, self.value_buf);
+            },
         }
     }
 
-    /// Stores `value` under `key`, replacing the value of an existing key. A leaf with room is
+    /// Stores `value` under `key`, replacing the value of an existing key. A value that does not
+    /// fit inline goes to an overflow chain, written first (ADR rule C); a leaf with room is
     /// edited in place and re-sealed (checksum, same `lsn`); a full leaf splits (see
-    /// `split_tree.zig`, which also says what a failure leaves). Nothing is written to the file
-    /// until the pool writes the frames back. Errors that can be known up front (`KeyTooLarge`,
-    /// `ValueTooLarge`, `HeightLimit`, `PoolExhausted`, `NoSpaceLeft`, `Corrupted`, read errors)
-    /// are returned before the first byte of an existing page moves.
+    /// `split_tree.zig`, which also says what a failure leaves). An old chain is freed into
+    /// `frees_pending`; a new chain whose insert then fails is freed the same way (no leak).
+    /// Nothing is written to the file until the pool writes the frames back. Errors that can
+    /// be known up front (`KeyTooLarge`, `ValueTooLarge`, `FreesPendingLimit`, `HeightLimit`,
+    /// `PoolExhausted`, `NoSpaceLeft`, `Corrupted`, read errors) are returned before the first
+    /// byte of an existing page moves; the chain pages of a failed insert are new pages.
     pub fn insert(self: *Tree, io: Io, key: []const u8, value: []const u8) InsertError!void {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
         if (key.len > node.key_len_max(self.page_size)) return error.KeyTooLarge;
-        if (value.len > node.value_len_max) return error.ValueTooLarge;
-        const value_len: u32 = @intCast(value.len); // Bounded by `value_len_max` just above.
-        const key_len: u32 = @intCast(key.len); // Bounded by `key_len_max` just above.
-        if (!node.value_inline(self.page_size, key_len, value_len)) return error.ValueTooLarge;
+        if (value.len > self.value_buf.len) return error.ValueTooLarge;
+        assert(value.len <= node.value_len_max);
 
         var path: descend.Path = undefined;
         var guard = try descend.descend(self.pool, io, self.root, key, true, &path);
@@ -176,19 +210,102 @@ pub const Tree = struct {
         const leaf = try node.parse_leaf(guard.bytes());
         const slot = try leaf.search(key);
         try check_neighbours(leaf, slot, key);
+        const put = try self.prepare_value(io, leaf, slot, key, value);
         const freed = if (slot.found) try cell_bytes(leaf, slot.index) else 0;
-        const added = cell_bytes_of(key_len, value_len);
+        const added = node.cell_size(self.page_size, key, put.value);
         const grows_count = !slot.found and leaf.count >= node.cell_count_max(self.page_size);
         // `used_bytes` derives from untrusted slots: a cell larger than it reports is a bad page.
         const used_kept = std.math.sub(u32, leaf.used_bytes(), freed) catch {
-            return error.Corrupted;
+            return self.fail_put(put, error.Corrupted);
         };
         const slot_added: u32 = if (slot.found) 0 else node.slot_size;
         const used_after = used_kept + added + slot_added;
         if (grows_count or used_after > node.usable(self.page_size)) {
-            return split_tree.insert_split(self.pool, io, &path, &guard, slot, key, value, added);
+            const pool = self.pool;
+            const split_result = split_tree.insert_split(
+                pool,
+                io,
+                &path,
+                &guard,
+                slot,
+                key,
+                put.value,
+                added,
+            );
+            split_result catch |e| return self.fail_put(put, e);
+        } else {
+            edit_leaf(&guard, path.leaf, slot, key, put.value) catch |err| {
+                return self.fail_put(put, err);
+            };
         }
-        try edit_leaf(&guard, path.leaf, slot, key, value);
+        self.frees_len += put.old_n;
+        assert(self.frees_len <= self.frees_pending.len);
+    }
+
+    /// Prepare for a put: room in `frees_pending` for the old chain and the new one, the old
+    /// chain's ids (walked, so a bad old chain is `Corrupted` before anything changes) and the
+    /// new chain written. Ids wait in the free slots past `frees_len`, uncounted: the old ones
+    /// at the front, the new ones behind them.
+    fn prepare_value(
+        self: *Tree,
+        io: Io,
+        leaf: node.Leaf,
+        slot: node.Slot,
+        key: []const u8,
+        value: []const u8,
+    ) InsertError!Put {
+        assert(self.frees_len <= self.frees_pending.len);
+        assert(value.len <= self.value_buf.len);
+        const value_len: u32 = @intCast(value.len); // Bounded by `value_buf.len` by the caller.
+        const key_len: u32 = @intCast(key.len); // Bounded by `key_len_max` by the caller.
+        var old: ?node.Overflow = null;
+        if (slot.found) {
+            switch ((try leaf.entry(slot.index)).value) {
+                .bytes => {},
+                .overflow => |spill| old = spill,
+            }
+        }
+        const old_n: u32 = if (old) |spill| overflow.chain_len(self.page_size, spill.len) else 0;
+        const is_inline = node.value_inline(self.page_size, key_len, value_len);
+        const new_n: u32 = if (is_inline) 0 else overflow.chain_len(self.page_size, value_len);
+        if (old_n + new_n > self.frees_pending.len - self.frees_len) {
+            return error.FreesPendingLimit;
+        }
+        if (old) |spill| {
+            try overflow.collect_ids(self.pool, io, spill, self.free_slots(0, old_n));
+        }
+        if (is_inline) return .{ .value = .{ .bytes = value }, .chain_n = 0, .old_n = old_n };
+
+        var written: u32 = 0;
+        const ids = self.free_slots(old_n, new_n);
+        const head = overflow.write(self.pool, io, value, ids, &written) catch |err| {
+            self.push_slots(old_n, written);
+            return err;
+        };
+        const spill: node.Overflow = .{ .head = head, .len = value_len };
+        return .{ .value = .{ .overflow = spill }, .chain_n = new_n, .old_n = old_n };
+    }
+
+    /// The `count` uncounted slots that start `skip` past `frees_len`.
+    fn free_slots(self: *Tree, skip: u32, count: u32) []Id {
+        assert(self.frees_len <= self.frees_pending.len);
+        assert(self.frees_len + skip + count <= self.frees_pending.len);
+        return self.frees_pending[self.frees_len + skip ..][0..count];
+    }
+
+    /// Counts `count` ids stored `skip` slots past `frees_len` as pending (moved down to it).
+    fn push_slots(self: *Tree, skip: u32, count: u32) void {
+        assert(self.frees_len + skip + count <= self.frees_pending.len);
+        const from = self.frees_pending[self.frees_len + skip ..][0..count];
+        std.mem.copyForwards(Id, self.frees_pending[self.frees_len..][0..count], from);
+        self.frees_len += count;
+    }
+
+    /// A put failed after its chain was written: the new chain is unreachable, so it waits in
+    /// `frees_pending` (room was reserved up front). Returns `err` for the caller to propagate.
+    fn fail_put(self: *Tree, put: Put, err: InsertError) InsertError {
+        if (put.chain_n > 0) self.push_slots(put.old_n, put.chain_n);
+        return err;
     }
 
     /// Removes `key`, merging or redistributing underfull nodes (see `delete_tree.zig`). True
@@ -248,14 +365,14 @@ fn edit_leaf(
     id: Id,
     slot: node.Slot,
     key: []const u8,
-    value: []const u8,
+    value: node.Value,
 ) InsertError!void {
     assert(id != .file_header);
     assert(slot.index <= node.cell_count_max(node.page_size_of(guard.bytes())));
     const lsn = header.peek(guard.bytes()).lsn;
     const page = guard.bytes_mut();
     if (slot.found) try node.leaf_remove(page, slot.index);
-    node.leaf_insert(page, slot.index, key, .{ .bytes = value }) catch |err| switch (err) {
+    node.leaf_insert(page, slot.index, key, value) catch |err| switch (err) {
         error.Corrupted => return error.Corrupted,
         error.NodeFull => unreachable, // The caller checked count and bytes on this same page.
     };
@@ -264,25 +381,12 @@ fn edit_leaf(
     assert(after.count >= 1);
 }
 
-/// Total bytes of an inline cell for these lengths (matches `node`'s encoding).
-fn cell_bytes_of(key_len: u32, value_len: u32) u32 {
-    assert(key_len <= node.key_len_cap);
-    assert(value_len <= node.value_len_max);
-    return codec.varint.encoded_size(key_len) + codec.varint.encoded_size(value_len) +
-        key_len + value_len;
-}
-
-/// Size of the existing cell at `index`; a spilled (overflow) cell cannot exist at this stage.
+/// Size of the existing cell at `index`, inline or overflow form.
 fn cell_bytes(leaf: node.Leaf, index: u16) node.ParseError!u32 {
     assert(index < leaf.count);
     assert(leaf.count <= node.cell_count_max(node.page_size_of(leaf.page)));
     const entry = try leaf.entry(index);
-    switch (entry.value) {
-        .bytes => |bytes| {
-            return cell_bytes_of(@intCast(entry.key.len), @intCast(bytes.len));
-        },
-        .overflow => return error.Corrupted,
-    }
+    return node.cell_size(node.page_size_of(leaf.page), entry.key, entry.value);
 }
 
 /// The cells that would border `key` after the edit must exist, decode and order around it, so
@@ -306,4 +410,5 @@ test {
     _ = @import("split_tree_test.zig");
     _ = @import("delete_tree_test.zig");
     _ = @import("validate_test.zig");
+    _ = @import("overflow_test.zig");
 }

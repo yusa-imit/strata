@@ -65,7 +65,7 @@ const Split = struct {
     path: *const Path,
     leaf: *PageGuard,
     key: []const u8,
-    value: []const u8,
+    value: node.Value,
     found: bool,
     at_leaf: u16,
     leaf_bytes: u32,
@@ -102,7 +102,7 @@ pub fn insert_split(
     leaf: *PageGuard,
     slot: node.Slot,
     key: []const u8,
-    value: []const u8,
+    value: node.Value,
     leaf_bytes: u32,
 ) SplitError!void {
     assert(leaf_bytes >= 2 and leaf_bytes <= node.cell_bytes_max(pool.page_size));
@@ -279,7 +279,7 @@ fn build_leaf(s: *Split, left: []u8, right: []u8, lsn: u64) SplitError!void {
     assert(total <= node.cell_count_max(s.pool.page_size) + 1);
     for (0..total) |u| {
         const entry: node.Entry = if (u == step.at)
-            .{ .key = s.key, .value = .{ .bytes = s.value } }
+            .{ .key = s.key, .value = s.value }
         else
             try view.entry(@intCast(virtual_index(step.at, @intCast(u))));
         const to_left = u < step.point;
