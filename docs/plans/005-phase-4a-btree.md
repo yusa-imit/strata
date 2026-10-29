@@ -57,7 +57,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       descent stack, pins at most one leaf, `release` cannot fail; an entry borrows until the next
       step or write. Verify: forward and backward full scans equal the sorted model; seek to an
       absent, the first and a past-last key; an empty tree → null both ways.
-- [ ] **`btree/overflow.zig` — large values** (`src/btree/`). Values over the inline limit go to
+- [x] **`btree/overflow.zig` — large values** (`src/btree/`). Values over the inline limit go to
       a chain bounded by `value_len_max`, freed via `frees_pending`; `get` assembles into a buffer
       allocated at `init`. Verify: 1 MiB value at 512 B and 64 KiB; a chain cycle or bad length
       → `Corrupted`; page count balances after delete. `Cursor` returns `Corrupted` on an
