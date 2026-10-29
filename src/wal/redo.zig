@@ -19,6 +19,13 @@
 //! newer page and is left alone. The write is not synced: durability of redo is the caller's
 //! `PageManager.sync` after replay.
 //!
+//! `page_images` frames (frame type 16, ADR-0004 section 9) hold many images. The whole frame is
+//! validated first (`frame.payload_valid`: count, page size, strictly ascending ids, magic,
+//! legal types; and the page size equals the manager's), so a bad entry is `Corrupted` before
+//! anything is grown or written. The file is then grown once to cover the last id (`Failed`
+//! before any write), and each image is redone under the rules above. `Stats` count per image.
+//! An I/O error midway leaves the images already written in place, as for any redo.
+//!
 //! Growth: a `page_id` at or past `page_count` first grows the file with
 //! `PageManager.ensure_page_count`, so the file covers the id (pages in between read as
 //! `Unwritten` and are not on the freelist). Only a page the file lacks meets `page_count_max`:
@@ -45,9 +52,9 @@ const PageManager = manager.PageManager;
 
 /// How many frames of each outcome this target has seen.
 pub const Stats = struct {
-    /// `page_image` frames written to the page file.
+    /// Images (from `page_image` and `page_images` frames) written to the page file.
     applied: u64 = 0,
-    /// `page_image` frames skipped because the page was already at or past the frame's lsn.
+    /// Images skipped because the page was already at or past the frame's lsn.
     skipped: u64 = 0,
     /// Frames of any other type.
     ignored: u64 = 0,
@@ -93,24 +100,70 @@ pub const PageRedo = struct {
         const self: *PageRedo = @ptrCast(@alignCast(ptr));
         assert(self.buf.len == self.pm.page_size);
         assert(f.lsn >= frame.lsn_first);
-        if (f.frame_type != .page_image) {
-            self.stats.ignored += 1;
-            return;
+        switch (f.frame_type) {
+            .page_image => try self.redo_image(io, try self.parse(f.payload), f.lsn),
+            .page_images => try self.apply_images(io, f),
+            .record, .checkpoint, _ => self.stats.ignored += 1,
         }
-        const image = try self.parse(f.payload);
+    }
+
+    /// Applies one validated image: grows the file to cover it, then writes it if the page needs
+    /// redo. Counts `applied` or `skipped`.
+    fn redo_image(self: *PageRedo, io: Io, image: Image, lsn: frame.Lsn) recovery.ApplyError!void {
+        assert(self.buf.len == self.pm.page_size);
+        assert(lsn >= frame.lsn_first);
         const id_raw: u32 = @intFromEnum(image.id);
         if (id_raw >= self.pm.page_count) { // Only a page the file lacks meets the limit.
             const count = std.math.add(u32, id_raw, 1) catch return error.Failed;
             self.pm.ensure_page_count(io, count) catch return error.Failed;
         }
-        if (!try self.needs_redo(io, image.id, f.lsn)) {
+        if (!try self.needs_redo(io, image.id, lsn)) {
             self.stats.skipped += 1;
             return;
         }
         @memcpy(self.buf, image.bytes);
-        const page_header: header.Header = .{ .page_type = image.page_type, .lsn = f.lsn };
+        const page_header: header.Header = .{ .page_type = image.page_type, .lsn = lsn };
         self.pm.write(io, image.id, self.buf, page_header) catch return error.Failed;
         self.stats.applied += 1;
+    }
+
+    /// A `page_images` frame (ADR-0004 section 9): validate every entry first (`Corrupted`
+    /// before any growth or write), grow the file once to cover the last id (`Failed` before any
+    /// write), then redo each image under the `page_image` rules, counting per image.
+    fn apply_images(self: *PageRedo, io: Io, f: frame.Frame) recovery.ApplyError!void {
+        assert(self.buf.len == self.pm.page_size);
+        assert(f.frame_type == .page_images);
+        const count = try self.parse_images(f);
+        assert(count >= 1);
+        assert(count <= frame.images_count_max);
+        const entry_size: u32 = payload_id_size + self.pm.page_size;
+        const last_offset = frame.images_prefix_size + (count - 1) * entry_size;
+        const last_id = std.mem.readInt(u32, f.payload[last_offset..][0..4], .little);
+        if (last_id >= self.pm.page_count) {
+            const grown = std.math.add(u32, last_id, 1) catch return error.Failed;
+            self.pm.ensure_page_count(io, grown) catch return error.Failed;
+        }
+        var offset: u32 = frame.images_prefix_size;
+        for (0..count) |_| {
+            const image = try self.parse(f.payload[offset..][0..entry_size]);
+            try self.redo_image(io, image, f.lsn);
+            offset += entry_size;
+        }
+        assert(offset == f.payload.len);
+    }
+
+    /// Validates a whole `page_images` payload (the frame rules of `frame.payload_valid`, and the
+    /// manager's page size) and returns the image count. Touches no file.
+    fn parse_images(self: *const PageRedo, f: frame.Frame) recovery.ApplyError!u32 {
+        assert(self.buf.len == self.pm.page_size);
+        assert(f.payload.len <= frame.payload_bytes_max);
+        const type_byte: u8 = @intFromEnum(frame.Type.page_images);
+        if (!frame.payload_valid(type_byte, f.lsn, f.payload)) return error.Corrupted;
+        const page_size = std.mem.readInt(u32, f.payload[4..8], .little);
+        if (page_size != self.pm.page_size) return error.Corrupted;
+        const count = std.mem.readInt(u32, f.payload[0..4], .little);
+        assert(count >= 1); // `payload_valid` proved the layout.
+        return count;
     }
 
     /// Validates a `page_image` payload against the manager's page size; touches no file.
@@ -165,4 +218,5 @@ pub const PageRedo = struct {
 test {
     // Contract tests live in their own files (800-line limit).
     _ = @import("redo_test.zig");
+    _ = @import("redo_images_test.zig");
 }

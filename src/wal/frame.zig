@@ -31,8 +31,9 @@ pub const frame_header_size: u32 = 17;
 pub const frame_bytes_max: u32 = 1 << 20;
 pub const payload_bytes_max: u32 = frame_bytes_max - frame_header_size;
 
-/// Frame type byte. 0 is never valid, 4..127 are reserved, 128..255 belong to consumers.
-pub const Type = enum(u8) { record = 1, page_image = 2, checkpoint = 3, _ };
+/// Frame type byte. 0 is never valid, 4..15 and 17..127 are reserved (16 is `page_images`,
+/// ADR-0004 section 9), 128..255 belong to consumers.
+pub const Type = enum(u8) { record = 1, page_image = 2, checkpoint = 3, page_images = 16, _ };
 
 /// `payload` borrows from the decoded image; valid until the caller's buffer is reused.
 pub const Frame = struct { lsn: Lsn, frame_type: Type, payload: []const u8 };
@@ -45,6 +46,11 @@ const offset_lsn: u32 = 8;
 const offset_type: u32 = 16;
 const page_id_size: u32 = 4;
 const checkpoint_payload_size: u32 = 8;
+/// `page_images` payload prefix: `count u32` then `page_size u32`.
+pub const images_prefix_size: u32 = 8;
+/// Most images a `page_images` payload can hold: the smallest page size fills the frame.
+pub const images_count_max: u32 =
+    (payload_bytes_max - images_prefix_size) / (page_id_size + page_header.page_size_min);
 
 comptime {
     assert(frame_header_size == offset_type + 1);
@@ -56,6 +62,7 @@ comptime {
     assert(lsn_limit == std.math.maxInt(i64) + 1);
     // A page image (id plus the largest page) must fit in one frame, many times over.
     assert(page_id_size + page_header.page_size_max <= payload_bytes_max);
+    assert(images_count_max == 2032);
 }
 
 fn get(comptime T: type, bytes: []const u8, offset: u32) T {
@@ -79,19 +86,23 @@ fn put(comptime T: type, bytes: []u8, offset: u32, value: T) void {
 
 /// True when `payload` is legal for `type_byte` in a frame at `lsn` (ADR-0003 section 6):
 /// record and consumer types (128..255) take any payload; `page_image` is a page id then a
-/// valid page size; `checkpoint` is a `redo_lsn` in `[1, lsn]`; 0 and 4..127 never.
+/// valid page size; `checkpoint` is a `redo_lsn` in `[1, lsn]`; `page_images` is the layout of
+/// `page_images_valid`; 0 and the other reserved types 4..127 never.
 pub fn payload_valid(type_byte: u8, lsn: Lsn, payload: []const u8) bool {
     assert(payload.len <= payload_bytes_max);
     assert(lsn < lsn_limit);
     const record: u8 = @intFromEnum(Type.record);
     const page_image: u8 = @intFromEnum(Type.page_image);
     const checkpoint: u8 = @intFromEnum(Type.checkpoint);
+    const page_images: u8 = @intFromEnum(Type.page_images);
     return switch (type_byte) {
         0 => false,
         record => true,
         page_image => page_image_valid(payload),
         checkpoint => checkpoint_valid(lsn, payload),
-        4...127 => false,
+        4...15 => false,
+        page_images => page_images_valid(payload),
+        17...127 => false,
         128...255 => true,
     };
 }
@@ -102,6 +113,37 @@ fn page_image_valid(payload: []const u8) bool {
     if (payload.len < page_id_size) return false;
     const page_len: u32 = @intCast(payload.len - page_id_size);
     return page_header.page_size_valid(page_len);
+}
+
+/// ADR-0004 section 9: `count u32` (at least 1), `page_size u32` (a valid page size), then
+/// `count` entries of `page_id u32` (strictly ascending, so at least 1) and `page_size` bytes
+/// that start with the page magic under a type byte legal at that id. The length is exactly
+/// `8 + count * (4 + page_size)`, computed in `u64` so a hostile `count` cannot overflow.
+fn page_images_valid(payload: []const u8) bool {
+    assert(payload.len <= payload_bytes_max);
+    assert(images_count_max <= payload_bytes_max);
+    if (payload.len < images_prefix_size) return false;
+    const count = get(u32, payload, 0);
+    const page_size = get(u32, payload, 4);
+    if (count < 1) return false;
+    if (!page_header.page_size_valid(page_size)) return false;
+    const entry_size: u64 = @as(u64, page_id_size) + page_size;
+    if (payload.len != images_prefix_size + @as(u64, count) * entry_size) return false;
+    assert(count <= images_count_max); // The exact length fits the frame, so the count does.
+    var id_previous: u32 = 0; // Page 0 is never an image, so 0 also rejects a first id of 0.
+    var offset: u32 = images_prefix_size;
+    for (0..count) |_| {
+        const id = get(u32, payload, offset);
+        if (id <= id_previous) return false;
+        const page = payload[offset + page_id_size ..][0..page_size];
+        if (!std.mem.eql(u8, page[0..page_header.magic.len], &page_header.magic)) return false;
+        const page_type = page_header.peek(page).page_type;
+        if (!page_header.type_valid(@enumFromInt(id), @intFromEnum(page_type))) return false;
+        id_previous = id;
+        offset += @intCast(entry_size);
+    }
+    assert(offset == payload.len);
+    return true;
 }
 
 fn checkpoint_valid(lsn: Lsn, payload: []const u8) bool {
@@ -134,19 +176,29 @@ pub fn checksum(frame_bytes: []const u8, lsn_expected: Lsn) u32 {
 
 /// Writes one frame at the start of `out` and returns the bytes used (`17 + payload.len`);
 /// nothing past them is touched. Preconditions: `lsn` in `[lsn_first, lsn_limit)`; the payload
-/// is legal for `frame_type` (section 6) and at most `payload_bytes_max`; `out` is large enough.
+/// is legal for `frame_type` (section 6) and at most `payload_bytes_max`; `out` is large enough
+/// and does not overlap `payload`.
 pub fn encode(out: []u8, lsn: Lsn, frame_type: Type, payload: []const u8) u32 {
     assert(payload.len <= payload_bytes_max);
+    assert(out.len >= frame_header_size + payload.len);
+    @memcpy(out[frame_header_size..][0..payload.len], payload);
+    return seal(out, lsn, frame_type, @intCast(payload.len));
+}
+
+/// `encode` for a payload already in place at `out[frame_header_size..][0..payload_len]` (a
+/// writer that gathers its parts straight into the frame buffer): writes the header and the
+/// checksum around it and returns the bytes used. Same preconditions as `encode`.
+pub fn seal(out: []u8, lsn: Lsn, frame_type: Type, payload_len: u32) u32 {
+    assert(payload_len <= payload_bytes_max);
     assert(lsn >= lsn_first);
     assert(lsn < lsn_limit);
-    assert(payload_valid(@intFromEnum(frame_type), lsn, payload));
-    const total: u32 = frame_header_size + @as(u32, @intCast(payload.len));
+    const total: u32 = frame_header_size + payload_len;
     assert(out.len >= total);
-    put(u32, out, offset_len, @intCast(payload.len));
+    assert(payload_valid(@intFromEnum(frame_type), lsn, out[frame_header_size..total]));
+    put(u32, out, offset_len, payload_len);
     put(u32, out, offset_crc, 0);
     put(u64, out, offset_lsn, lsn);
     out[offset_type] = @intFromEnum(frame_type);
-    @memcpy(out[frame_header_size..][0..payload.len], payload);
     const sum = checksum(out[0..total], lsn);
     put(u32, out, offset_crc, sum);
     assert(get(u32, out, offset_crc) == sum);
@@ -205,5 +257,6 @@ pub fn intact(image: []const u8, lsn_expected: Lsn) bool {
 }
 
 test {
-    _ = @import("frame_test.zig"); // Contract tests live in their own file (800-line limit).
+    _ = @import("frame_test.zig"); // Contract tests live in their own files (800-line limit).
+    _ = @import("frame_images_test.zig");
 }

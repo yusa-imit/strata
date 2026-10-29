@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- `wal.frame.Type.page_images` (16): one frame images several pages (ADR-0004 §9). `PageRedo`
+  validates the whole frame before writing and applies each image iff its page is older;
+  `PageManager.free_at(io, id, lsn)` stamps trunks with `max(wal_lsn, lsn)`;
+  `Writer.append_parts` appends a gathered payload. v0.5.0 readers reject type 16 as `Corrupted`.
 - `btree/overflow.zig`: values over the inline limit live in a chain of type-18 pages (`write`,
   `walk`, `read`, `collect_ids`); `Tree.get`, `insert`, `delete`, `validate` and `Cursor` handle
   overflow cells, assemble into the caller's `value_buf`, and free chains through

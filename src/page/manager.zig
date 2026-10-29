@@ -1,7 +1,8 @@
 //! Page manager (ADR-0002 §5, §7): owns one `file.File` of fixed-size, checksummed pages, moves
 //! whole pages between a caller buffer and the file, and hands out page ids through the trunk
 //! freelist: `allocate` pops (or grows the file, bounded by `Options.page_count_max`), `free`
-//! pushes, `ensure_page_count` grows the file without touching the freelist (WAL redo of a page
+//! pushes (`free_at` also stamps the trunks it writes with a caller lsn, ADR-0004 rule B),
+//! `ensure_page_count` grows the file without touching the freelist (WAL redo of a page
 //! the file does not have yet), `set_wal_lsn` records the checkpoint LSN in page 0 (ADR-0003
 //! section 10), `sync` makes completed writes durable per the file's `SyncPolicy`.
 //!
@@ -222,6 +223,19 @@ pub const PageManager = struct {
     pub fn free(self: *PageManager, io: Io, id: Id) FreeError!void {
         assert(@intFromEnum(id) >= 1);
         assert(@intFromEnum(id) < self.page_count);
+        return self.free_at(io, id, 0); // `max(wal_lsn, 0)` is `wal_lsn`: the plain free.
+    }
+
+    /// `free`, but every trunk page it writes carries `max(wal_lsn, lsn)` as its header lsn.
+    /// WAL redo skips a page whose lsn is not below the frame's, so a trunk stamped at or past
+    /// the durable lsn outranks every older image of that page (ADR-0004 rule B, path (c)).
+    /// A `lsn` at or below `wal_lsn` is exactly `free`. Same preconditions, errors and
+    /// on-error guarantee as `free`.
+    pub fn free_at(self: *PageManager, io: Io, id: Id, lsn: u64) FreeError!void {
+        assert(@intFromEnum(id) >= 1);
+        assert(@intFromEnum(id) < self.page_count);
+        const stamp = @max(self.wal_lsn, lsn);
+        assert(stamp >= self.wal_lsn);
         var head_buf = [_]u8{0} ** header.page_size_max;
         var freed_buf = [_]u8{0} ** header.page_size_max;
         const head_page = self.head_slice(&head_buf);
@@ -232,7 +246,7 @@ pub const PageManager = struct {
             head_page,
             id,
             freed_page,
-            self.wal_lsn,
+            stamp,
         ) catch |err| return trunk_error(err);
 
         switch (released.written) {
@@ -406,4 +420,5 @@ test {
     _ = @import("manager_alloc_test.zig");
     _ = @import("manager_grow_test.zig");
     _ = @import("manager_wal_lsn_test.zig");
+    _ = @import("manager_free_at_test.zig");
 }

@@ -62,11 +62,15 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       allocated at `init`. Verify: 1 MiB value at 512 B and 64 KiB; a chain cycle or bad length
       → `Corrupted`; page count balances after delete. `Cursor` returns `Corrupted` on an
       overflow cell today (`cursor.zig` `entry_of`); give it the assembled value here.
-- [ ] **WAL integration: tree edits recover** (`src/btree/`, `src/wal/redo.zig`). With a
-      `wal.Writer` attached, an op appends one frame imaging every page it dirtied, then
-      `set_lsn`s them; `release_frees` waits for `durable_lsn`; `PageRedo` applies each image iff
-      its page is older. No writer = unlogged. Verify: crash before write-back → replay → same
-      `get`s; a cut frame restores the pre-op tree, never half a split; replay twice = once.
+- [x] **WAL integration, log side** (`src/wal/`, `src/page/manager.zig`). Frame type 16
+      `page_images` with `payload_valid`, `PageRedo` applying it whole-frame-validated and
+      idempotent, `PageManager.free_at`, `Writer.append_parts`. Split out of the item below
+      (Risks: item size). Verify: negative test per ADR-0004 §9 rule; replay twice = once.
+- [ ] **WAL integration, tree side** (`src/btree/`). With a `wal.Writer` attached, an op
+      appends one `page_images` frame imaging every page it dirtied, then `set_lsn`s them;
+      `release_frees` waits for `durable_lsn` (rules A–C). No writer = unlogged. Verify: crash
+      before write-back → replay → same `get`s; a cut frame restores the pre-op tree, never
+      half a split; replay twice = once.
 - [ ] **4E seeded model tests** (`src/testing/btree_model_test.zig`). Random get/insert/delete/
       seek/scan against a sorted bounded-array reference, 3 page sizes × fixed seeds, `validate`
       every N ops, `flushAll` mid-run (it cleans pinned frames, cycle 44); a crash variant on
