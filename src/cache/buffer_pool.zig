@@ -129,6 +129,12 @@ pub const BufferPool = struct {
     /// is never written back. Off until the first `set_durable_lsn`.
     gate_on: bool,
     durable_lsn: u64,
+    /// Op tracker (`track_begin`): caller storage for the raw ids dirtied since the last reset.
+    /// A tracked page is never a victim, so it stays resident until the op is logged.
+    track: []u32,
+    track_len: u32,
+    track_on: bool,
+    track_overflow: bool,
     counters: Stats,
 
     /// Allocates every buffer the pool will ever use and builds it in place at `target`. The
@@ -170,6 +176,10 @@ pub const BufferPool = struct {
             .dirty_count = 0,
             .gate_on = false,
             .durable_lsn = 0,
+            .track = &.{},
+            .track_len = 0,
+            .track_on = false,
+            .track_overflow = false,
             .counters = .{ .hits = 0, .misses = 0, .evictions = 0, .writebacks = 0, .gated = 0 },
         };
         assert(target.frames.len == options.frames_max);
@@ -326,6 +336,49 @@ pub const BufferPool = struct {
         assert(self.table.get(raw) == null);
     }
 
+    /// Starts recording the id of every page marked dirty into `ids` (its length is the bound),
+    /// and keeps those pages resident: they are never evicted while tracked. A page that does
+    /// not fit sets the overflow flag instead (`track_ids` callers must check it). Precondition:
+    /// not already tracking. Pure bookkeeping; the pool does not own `ids`.
+    pub fn track_begin(self: *BufferPool, ids: []u32) void {
+        assert(!self.track_on);
+        assert(ids.len <= self.frames_max);
+        self.track = ids;
+        self.track_len = 0;
+        self.track_on = true;
+        self.track_overflow = false;
+    }
+
+    /// The ids recorded so far, in first-dirtied order; empty and `false` flag are not reset.
+    pub fn track_ids(self: *const BufferPool) []const u32 {
+        assert(self.track_on);
+        assert(self.track_len <= self.track.len);
+        return self.track[0..self.track_len];
+    }
+
+    /// Forgets the recorded ids (they were logged) but keeps tracking. Clears the overflow flag.
+    pub fn track_reset(self: *BufferPool) void {
+        assert(self.track_on);
+        assert(self.track_len <= self.track.len);
+        self.track_len = 0;
+        self.track_overflow = false;
+    }
+
+    /// Stops tracking; the pages become evictable again. Precondition: tracking.
+    pub fn track_end(self: *BufferPool) void {
+        assert(self.track_on);
+        assert(self.track_len <= self.track.len);
+        self.track_on = false;
+        self.track = &.{};
+        self.track_len = 0;
+        self.track_overflow = false;
+    }
+
+    fn track_has(self: *const BufferPool, raw: u32) bool {
+        assert(self.track_len <= self.track.len);
+        return std.mem.findScalar(u32, self.track[0..self.track_len], raw) != null;
+    }
+
     /// Frames with at least one pin. O(frames_max); for tests, `deinit` and monitoring.
     pub fn pinned_count(self: *const BufferPool) u32 {
         assert(self.frames.len == self.frames_max);
@@ -398,6 +451,14 @@ pub const BufferPool = struct {
         const frame = &self.frames[index];
         assert(frame.pin_count > 0);
         assert(frame.page_id != 0);
+        if (self.track_on and !self.track_has(frame.page_id)) {
+            if (self.track_len < self.track.len) {
+                self.track[self.track_len] = frame.page_id;
+                self.track_len += 1;
+            } else {
+                self.track_overflow = true;
+            }
+        }
         if (frame.dirty) return;
         frame.dirty = true;
         self.dirty_count += 1;
@@ -486,6 +547,7 @@ pub const BufferPool = struct {
             self.hand = if (index + 1 == self.frames_max) 0 else index + 1;
             const frame = &self.frames[index];
             if (frame.pin_count > 0) continue;
+            if (self.track_on and self.track_has(frame.page_id)) continue; // Op not logged yet.
             if (self.gate_blocks(index)) continue; // Cannot be written back yet: not a victim.
             if (frame.referenced) {
                 frame.referenced = false;
@@ -536,4 +598,5 @@ test {
     _ = @import("buffer_pool_dirty_test.zig");
     _ = @import("buffer_pool_gate_test.zig");
     _ = @import("buffer_pool_new_test.zig");
+    _ = @import("buffer_pool_track_test.zig");
 }

@@ -421,4 +421,5 @@ test {
     _ = @import("manager_grow_test.zig");
     _ = @import("manager_wal_lsn_test.zig");
     _ = @import("manager_free_at_test.zig");
+    _ = @import("freelist_lsn_test.zig");
 }

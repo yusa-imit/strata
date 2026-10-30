@@ -46,6 +46,8 @@ const split_tree = @import("split_tree.zig");
 const delete_tree = @import("delete_tree.zig");
 const validate_mod = @import("validate.zig");
 const overflow = @import("overflow.zig");
+const wal_writer = @import("../wal/writer.zig");
+const wal_frame = @import("../wal/frame.zig");
 
 const BufferPool = buffer_pool.BufferPool;
 const Id = header.Id;
@@ -85,7 +87,18 @@ pub const FreeError = manager.FreeError;
 /// `frees_pending` lacks room for the ids of the old chain plus the new one; nothing changed.
 /// `HeightLimit`: the split would raise the tree past `height_max`; nothing changed. A split
 /// or a chain also allocates (`manager.AllocateError`) and pins new pages (`FetchNewError`).
-pub const InsertError = GetError || split_tree.SplitError || error{FreesPendingLimit};
+/// `Failed`: the tree is latched after a log append, sync or pin failure (ADR-0004 section 9);
+/// recover by replaying the log into a fresh pool.
+pub const InsertError = GetError || split_tree.SplitError || error{ FreesPendingLimit, Failed };
+
+/// What logging an op can return: a pin, the rule A sync, the append, or `Failed` for a tracker
+/// that overflowed or does not match the op. Every one of them latches the tree.
+const LogError = buffer_pool.FetchError || manager.SyncError || wal_writer.AppendError ||
+    error{Failed};
+
+/// Most pages one `page_images` frame of the tree carries: `2 * height_max + 1` at the largest
+/// height (checked in `attach`).
+const images_chunk_max: u32 = 64;
 
 pub const Tree = struct {
     pool: *BufferPool,
@@ -98,6 +111,14 @@ pub const Tree = struct {
     /// Caller-provided storage for one value: `get` and the cursor assemble an overflow value
     /// here, and its length is the tree's value limit (`insert` over it is `ValueTooLarge`).
     value_buf: []u8,
+    /// The attached log (`attach`), or null for an unlogged tree. Not owned.
+    writer: ?*wal_writer.Writer = null,
+    /// Caller storage for the pool's op tracker; its length bounds the pages one op may dirty.
+    track: []u32 = &.{},
+    /// Latched by a failed log append or sync: every later `insert` is `error.Failed`.
+    failed: bool = false,
+    /// True while a logged op may have popped ids from the freelist (rule A: sync first).
+    op_popped: bool = false,
 
     /// Allocates the root id from the page manager and writes an empty leaf there, in the pool
     /// (dirty, not yet on disk: `flushAll` and the caller's `sync` make it durable). The root
@@ -131,6 +152,29 @@ pub const Tree = struct {
         };
         assert(target.root != .file_header);
         assert(@intFromEnum(target.root) < pool.pages.page_count);
+    }
+
+    /// Attaches the log: from now on `insert` follows ADR-0004 section 9 (one `page_images`
+    /// frame per op, an overflow chain logged first). Preconditions: no op in flight, no guard
+    /// outstanding, not attached yet; `track.len` is at least `2 * height_max + 1` and it also
+    /// bounds a chain (a longer one is `ValueTooLarge`); the tree does not own `writer` or
+    /// `track`; the pool has at least `track.len + 2 * height_max + 2` frames, so tracked pages
+    /// alone can never pin it into a self-latch (`PoolExhausted` becomes `Failed`).
+    /// The caller turns the pool's WAL gate on (`set_durable_lsn`) and commits.
+    /// Temporary: an attached tree is insert-only (`delete` and `release_frees` assert) until the
+    /// next plan 005 item.
+    pub fn attach(self: *Tree, writer: *wal_writer.Writer, track: []u32) void {
+        const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
+        assert(self.writer == null);
+        assert(self.pool.pinned_count() == 0);
+        assert(ops_max <= images_chunk_max);
+        assert(track.len >= ops_max);
+        assert(track.len <= self.pool.frames_max);
+        assert(self.pool.frames_max >= track.len + ops_max + 1); // Else: self-latch possible.
+        self.writer = writer;
+        self.track = track;
+        self.failed = false;
+        self.op_popped = false;
     }
 
     /// Attaches to an existing tree whose root id the caller persisted. Reads no page: a bad
@@ -203,6 +247,106 @@ pub const Tree = struct {
     pub fn insert(self: *Tree, io: Io, key: []const u8, value: []const u8) InsertError!void {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
+        const writer = self.writer orelse return self.insert_core(io, key, value);
+        if (self.failed) return error.Failed;
+        assert(!self.pool.track_on);
+        self.op_popped = self.pool.pages.freelist_head != null;
+        self.pool.track_begin(self.track);
+        const result = self.insert_core(io, key, value);
+        return self.insert_finish(io, writer, result);
+    }
+
+    /// Logged tail of `insert`: on success one frame with every dirtied page, then stamp. Any
+    /// failure with unlogged pages in the pool drops the whole pool and latches the tree.
+    fn insert_finish(
+        self: *Tree,
+        io: Io,
+        writer: *wal_writer.Writer,
+        result: InsertError!void,
+    ) InsertError!void {
+        const pool = self.pool;
+        assert(pool.track_on);
+        const clean = pool.track_len == 0 and !pool.track_overflow;
+        if (result) |_| {
+            const logged = self.log_op(io, writer);
+            pool.track_end();
+            if (logged) |_| return else |_| {} // Any log failure latches below.
+        } else |err| {
+            pool.track_end();
+            if (clean and !self.failed) return err; // Nothing unlogged: stay usable.
+        }
+        self.failed = true;
+        pool.discardAll();
+        return error.Failed;
+    }
+
+    /// Appends the op frame for the tracked pages (after the rule A sync) and stamps them.
+    fn log_op(self: *Tree, io: Io, writer: *wal_writer.Writer) LogError!void {
+        const pool = self.pool;
+        assert(pool.track_on);
+        if (pool.track_overflow or pool.track_len == 0) return error.Failed;
+        if (self.op_popped) try pool.pages.sync(io); // Rule A: pops durable before a frame.
+        const ids = pool.track[0..pool.track_len];
+        std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+        const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
+        if (ids.len > ops_max) return error.Failed;
+        _ = try self.log_images(io, writer, ids);
+    }
+
+    /// Writes one `page_images` frame for `ids` (ascending, at most `images_chunk_max`), pins
+    /// each page, then stamps the frame's lsn on all of them. Returns the lsn.
+    fn log_images(self: *Tree, io: Io, writer: *wal_writer.Writer, ids: []const u32) LogError!u64 {
+        assert(ids.len >= 1 and ids.len <= images_chunk_max);
+        assert(std.sort.isSorted(u32, ids, {}, std.sort.asc(u32)));
+        var guards: [images_chunk_max]buffer_pool.PageGuard = undefined;
+        var pinned: u32 = 0;
+        defer for (guards[0..pinned]) |*pin| pin.release();
+
+        var prefix: [wal_frame.images_prefix_size]u8 = undefined;
+        std.mem.writeInt(u32, prefix[0..4], @intCast(ids.len), .little);
+        std.mem.writeInt(u32, prefix[4..8], self.page_size, .little);
+        var id_bytes: [images_chunk_max][4]u8 = undefined;
+        var parts: [1 + 2 * images_chunk_max][]const u8 = undefined;
+        parts[0] = &prefix;
+        for (ids, 0..) |raw, index| {
+            guards[index] = try self.pool.fetchForUpdate(io, @enumFromInt(raw));
+            pinned += 1;
+            std.mem.writeInt(u32, &id_bytes[index], raw, .little);
+            parts[1 + 2 * index] = &id_bytes[index];
+            parts[2 + 2 * index] = guards[index].bytes();
+        }
+        const lsn = try writer.append_parts(io, .page_images, parts[0 .. 1 + 2 * ids.len]);
+        for (guards[0..pinned]) |*pin| pin.set_lsn(lsn);
+        return lsn;
+    }
+
+    /// Logs the overflow chain written by `prepare_value` in its own frames (rule C), in chunks
+    /// of at most `2 * height_max + 1` pages, then forgets them in the tracker.
+    fn log_chain(
+        self: *Tree,
+        io: Io,
+        writer: *wal_writer.Writer,
+        chain_n: u32,
+    ) LogError!void {
+        const pool = self.pool;
+        assert(pool.track_on);
+        if (pool.track_overflow or pool.track_len != chain_n) return error.Failed;
+        if (self.op_popped) try pool.pages.sync(io); // Rule A for the chain's ids.
+        const ids = pool.track[0..pool.track_len];
+        std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+        const chunk_max: usize = 2 * @as(usize, node.height_max(self.page_size)) + 1;
+        var from: usize = 0;
+        while (from < ids.len) { // Bounded by `ids.len / chunk_max + 1` iterations.
+            const upto = @min(from + chunk_max, ids.len);
+            _ = try self.log_images(io, writer, ids[from..upto]);
+            from = upto;
+        }
+        pool.track_reset();
+    }
+
+    fn insert_core(self: *Tree, io: Io, key: []const u8, value: []const u8) InsertError!void {
+        assert(self.page_size == self.pool.page_size);
+        assert(self.root != .file_header);
         if (key.len > node.key_len_max(self.page_size)) return error.KeyTooLarge;
         if (value.len > self.value_buf.len) return error.ValueTooLarge;
         assert(value.len <= node.value_len_max);
@@ -215,6 +359,12 @@ pub const Tree = struct {
         const slot = try leaf.search(key);
         try check_neighbours(leaf, slot, key);
         const put = try self.prepare_value(io, leaf, slot, key, value);
+        if (self.writer) |writer| if (put.chain_n > 0) {
+            self.log_chain(io, writer, put.chain_n) catch {
+                self.failed = true; // The caller drops the pool once the guards are released.
+                return error.Failed;
+            };
+        };
         const freed = (if (slot.found) cell_bytes(leaf, slot.index) else 0) catch |err| {
             return self.fail_put(put, err);
         };
@@ -277,6 +427,7 @@ pub const Tree = struct {
         if (old_n + new_n > self.frees_pending.len - self.frees_len) {
             return error.FreesPendingLimit;
         }
+        if (self.writer != null and new_n > self.track.len) return error.ValueTooLarge;
         if (old) |spill| {
             const old_ids = self.free_slots(0, old_n);
             try overflow.collect_ids(self.pool, io, spill, old_ids);
@@ -335,6 +486,7 @@ pub const Tree = struct {
     pub fn delete(self: *Tree, io: Io, key: []const u8) DeleteError!bool {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
+        assert(self.writer == null); // Temporary: attach is insert-only until the next 005 item.
         if (key.len > node.key_len_max(self.page_size)) return error.KeyTooLarge;
         return delete_tree.delete(self, io, key);
     }
@@ -343,7 +495,10 @@ pub const Tree = struct {
     /// write-back (a stale tree page must never overwrite a freelist page). Returns how many
     /// ids were freed, last pending id first. An id whose `free` fails stays pending, together
     /// with every id before it in `frees_pending` (those not yet attempted).
+    /// Temporary: an attached tree has no delete, so nothing to release (rule B, ADR-0004
+    /// section 9, is not enforced yet); it asserts until the next plan 005 item.
     pub fn release_frees(self: *Tree, io: Io) FreeError!u32 {
+        assert(self.writer == null); // Temporary: attach is insert-only until the next 005 item.
         assert(self.frees_len <= self.frees_pending.len);
         assert(self.root != .file_header);
         var freed: u32 = 0;
@@ -434,4 +589,5 @@ test {
     _ = @import("validate_test.zig");
     _ = @import("overflow_test.zig");
     _ = @import("overflow_fail_test.zig");
+    _ = @import("tree_wal_test.zig");
 }
