@@ -66,7 +66,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       `page_images` with `payload_valid`, `PageRedo` applying it whole-frame-validated and
       idempotent, `PageManager.free_at`, `Writer.append_parts`. Split out of the item below
       (Risks: item size). Verify: negative test per ADR-0004 §9 rule; replay twice = once.
-- [ ] **WAL integration, tree side, insert** (`src/btree/`, `src/page/freelist.zig`).
+- [x] **WAL integration, tree side, insert** (`src/btree/`, `src/page/freelist.zig`).
       `freelist.allocate` must not lower a trunk stamped by `free_at`. `Tree.attach(writer)`; with
       a writer attached, `insert` appends one `page_images` frame imaging every page it dirtied
       (splits included), then `set_lsn`s them; ids are reserved with a sync first (rule A);
