@@ -163,7 +163,8 @@ pub fn free(
     }
     put(page, slot_offset(trunk.count), @intFromEnum(freed));
     put(page, offset_count, trunk.count + 1);
-    header.encode(page, head_id, .{ .page_type = .free_trunk, .lsn = lsn });
+    const stamp_push = @max(lsn, header.peek(page).lsn); // Never lower a stamped trunk.
+    header.encode(page, head_id, .{ .page_type = .free_trunk, .lsn = stamp_push });
     return .{ .head = head_id, .written = .head_page };
 }
 
@@ -187,7 +188,9 @@ pub fn allocate(head: ?Id, head_page: ?[]u8, lsn: u64) DecodeError!Allocation {
     assert(popped != .file_header);
     put(page, last_slot, 0);
     put(page, offset_count, trunk.count - 1);
-    header.encode(page, head_id, .{ .page_type = .free_trunk, .lsn = lsn });
+    // Never lower a trunk stamped by `free_at(L)`: redo skips images older than the page.
+    const stamp_pop = @max(lsn, header.peek(page).lsn);
+    header.encode(page, head_id, .{ .page_type = .free_trunk, .lsn = stamp_pop });
     return .{ .id = popped, .head = head_id, .head_dirty = true };
 }
 

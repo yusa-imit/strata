@@ -66,11 +66,18 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       `page_images` with `payload_valid`, `PageRedo` applying it whole-frame-validated and
       idempotent, `PageManager.free_at`, `Writer.append_parts`. Split out of the item below
       (Risks: item size). Verify: negative test per ADR-0004 §9 rule; replay twice = once.
-- [ ] **WAL integration, tree side** (`src/btree/`). With a `wal.Writer` attached, an op
-      appends one `page_images` frame imaging every page it dirtied, then `set_lsn`s them;
-      `release_frees` waits for `durable_lsn` (rules A–C). No writer = unlogged. Verify: crash
-      before write-back → replay → same `get`s; a cut frame restores the pre-op tree, never
-      half a split; replay twice = once.
+- [ ] **WAL integration, tree side, insert** (`src/btree/`, `src/page/freelist.zig`).
+      `freelist.allocate` must not lower a trunk stamped by `free_at`. `Tree.attach(writer)`; with
+      a writer attached, `insert` appends one `page_images` frame imaging every page it dirtied
+      (splits included), then `set_lsn`s them; ids are reserved with a sync first (rule A);
+      an overflow chain is logged first in its own frames (rule C); an append failure
+      discards the pool and latches `Failed`. No writer = unlogged. Split out of the item
+      below (cycle 73). Verify: crash before write-back → replay → same `get`s; a cut frame
+      restores the pre-op tree, never half a split; replay twice = once.
+- [ ] **WAL integration, tree side, delete and frees** (`src/btree/`). Logged `delete`
+      (merge, borrow, root collapse), `release_frees` waits for `durable_lsn` and frees through
+      `free_at` (rule B). Verify: same crash/replay checks on delete; a freed id is not reused
+      before its frame is durable.
 - [ ] **4E seeded model tests** (`src/testing/btree_model_test.zig`). Random get/insert/delete/
       seek/scan against a sorted bounded-array reference, 3 page sizes × fixed seeds, `validate`
       every N ops, `flushAll` mid-run (it cleans pinned frames, cycle 44); a crash variant on
