@@ -91,6 +91,11 @@ pub const FreeError = manager.FreeError;
 /// recover by replaying the log into a fresh pool.
 pub const InsertError = GetError || split_tree.SplitError || error{ FreesPendingLimit, Failed };
 
+/// What logging an op can return: a pin, the rule A sync, the append, or `Failed` for a tracker
+/// that overflowed or does not match the op. Every one of them latches the tree.
+const LogError = buffer_pool.FetchError || manager.SyncError || wal_writer.AppendError ||
+    error{Failed};
+
 /// Most pages one `page_images` frame of the tree carries: `2 * height_max + 1` at the largest
 /// height (checked in `attach`).
 const images_chunk_max: u32 = 64;
@@ -151,11 +156,13 @@ pub const Tree = struct {
 
     /// Attaches the log: from now on `insert` follows ADR-0004 section 9 (one `page_images`
     /// frame per op, an overflow chain logged first). Preconditions: no op in flight, no guard
-    /// outstanding, not attached yet; `track.len` is at least `2 * height_max + 1` and at most
-    /// the pool's frames; it also bounds a chain (a longer one is `ValueTooLarge`); the tree
-    /// does not own `writer` or `track`; the pool has at least `2 * height_max + 2` frames.
-    /// The caller turns the pool's WAL gate on (`set_durable_lsn`) and commits. Temporary: an
-    /// attached tree is insert-only (`delete` asserts) until the next plan 005 item.
+    /// outstanding, not attached yet; `track.len` is at least `2 * height_max + 1` and it also
+    /// bounds a chain (a longer one is `ValueTooLarge`); the tree does not own `writer` or
+    /// `track`; the pool has at least `track.len + 2 * height_max + 2` frames, so tracked pages
+    /// alone can never pin it into a self-latch (`PoolExhausted` becomes `Failed`).
+    /// The caller turns the pool's WAL gate on (`set_durable_lsn`) and commits.
+    /// Temporary: an attached tree is insert-only (`delete` and `release_frees` assert) until the
+    /// next plan 005 item.
     pub fn attach(self: *Tree, writer: *wal_writer.Writer, track: []u32) void {
         const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
         assert(self.writer == null);
@@ -163,7 +170,7 @@ pub const Tree = struct {
         assert(ops_max <= images_chunk_max);
         assert(track.len >= ops_max);
         assert(track.len <= self.pool.frames_max);
-        assert(self.pool.frames_max >= ops_max + 1);
+        assert(self.pool.frames_max >= track.len + ops_max + 1); // Else: self-latch possible.
         self.writer = writer;
         self.track = track;
         self.failed = false;
@@ -260,10 +267,13 @@ pub const Tree = struct {
         const pool = self.pool;
         assert(pool.track_on);
         const clean = pool.track_len == 0 and !pool.track_overflow;
-        const logged: anyerror!void = if (result) |_| self.log_op(io, writer) else |err| err;
-        pool.track_end();
-        if (logged) |_| return else |err| {
-            if (clean and !self.failed) return @errorCast(err); // Nothing unlogged: stay usable.
+        if (result) |_| {
+            const logged = self.log_op(io, writer);
+            pool.track_end();
+            if (logged) |_| return else |_| {} // Any log failure latches below.
+        } else |err| {
+            pool.track_end();
+            if (clean and !self.failed) return err; // Nothing unlogged: stay usable.
         }
         self.failed = true;
         pool.discardAll();
@@ -271,7 +281,7 @@ pub const Tree = struct {
     }
 
     /// Appends the op frame for the tracked pages (after the rule A sync) and stamps them.
-    fn log_op(self: *Tree, io: Io, writer: *wal_writer.Writer) anyerror!void {
+    fn log_op(self: *Tree, io: Io, writer: *wal_writer.Writer) LogError!void {
         const pool = self.pool;
         assert(pool.track_on);
         if (pool.track_overflow or pool.track_len == 0) return error.Failed;
@@ -285,7 +295,7 @@ pub const Tree = struct {
 
     /// Writes one `page_images` frame for `ids` (ascending, at most `images_chunk_max`), pins
     /// each page, then stamps the frame's lsn on all of them. Returns the lsn.
-    fn log_images(self: *Tree, io: Io, writer: *wal_writer.Writer, ids: []const u32) !u64 {
+    fn log_images(self: *Tree, io: Io, writer: *wal_writer.Writer, ids: []const u32) LogError!u64 {
         assert(ids.len >= 1 and ids.len <= images_chunk_max);
         assert(std.sort.isSorted(u32, ids, {}, std.sort.asc(u32)));
         var guards: [images_chunk_max]buffer_pool.PageGuard = undefined;
@@ -312,7 +322,12 @@ pub const Tree = struct {
 
     /// Logs the overflow chain written by `prepare_value` in its own frames (rule C), in chunks
     /// of at most `2 * height_max + 1` pages, then forgets them in the tracker.
-    fn log_chain(self: *Tree, io: Io, writer: *wal_writer.Writer, chain_n: u32) anyerror!void {
+    fn log_chain(
+        self: *Tree,
+        io: Io,
+        writer: *wal_writer.Writer,
+        chain_n: u32,
+    ) LogError!void {
         const pool = self.pool;
         assert(pool.track_on);
         if (pool.track_overflow or pool.track_len != chain_n) return error.Failed;
@@ -480,7 +495,10 @@ pub const Tree = struct {
     /// write-back (a stale tree page must never overwrite a freelist page). Returns how many
     /// ids were freed, last pending id first. An id whose `free` fails stays pending, together
     /// with every id before it in `frees_pending` (those not yet attempted).
+    /// Temporary: an attached tree has no delete, so nothing to release (rule B, ADR-0004
+    /// section 9, is not enforced yet); it asserts until the next plan 005 item.
     pub fn release_frees(self: *Tree, io: Io) FreeError!u32 {
+        assert(self.writer == null); // Temporary: attach is insert-only until the next 005 item.
         assert(self.frees_len <= self.frees_pending.len);
         assert(self.root != .file_header);
         var freed: u32 = 0;

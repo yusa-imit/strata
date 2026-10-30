@@ -598,4 +598,5 @@ test {
     _ = @import("buffer_pool_dirty_test.zig");
     _ = @import("buffer_pool_gate_test.zig");
     _ = @import("buffer_pool_new_test.zig");
+    _ = @import("buffer_pool_track_test.zig");
 }

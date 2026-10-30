@@ -15,6 +15,8 @@ const redo = @import("../wal/redo.zig");
 const wfx = @import("../wal/writer_fixtures.zig");
 const sfx = @import("../wal/segment_fixtures.zig");
 const fault_io = @import("../testing/fault_io.zig");
+const node = @import("node.zig");
+const overflow = @import("overflow.zig");
 const tfx = @import("tree_fixtures.zig");
 const tree_mod = @import("tree.zig");
 
@@ -302,4 +304,56 @@ test "ids popped from the freelist are synced before the frame is appended" {
     try testing.expectError(error.Failed, env.tree.insert(faults.io(), "k1", "v1"));
     try testing.expect(faults.sync_calls >= 1); // The sync was tried ...
     try testing.expectEqual(lsn_before, env.writer.last_lsn); // ... and no frame went out.
+}
+
+test "a chain longer than the tracker is ValueTooLarge and leaves the tree usable" {
+    var env: Env = undefined;
+    try env.start(512, .none);
+    defer env.stop();
+
+    const ops_max: u32 = 2 * @as(u32, node.height_max(512)) + 1;
+    env.tree.track = env.track[0..ops_max]; // A tracker just big enough for a tree path.
+    const len: u32 = (ops_max + 1) * 512;
+    try testing.expect(overflow.chain_len(512, len) > ops_max);
+    try testing.expect(overflow.chain_len(512, len) <= env.frees.len);
+    const big = try testing.allocator.alloc(u8, len);
+    defer testing.allocator.free(big);
+
+    @memset(big, 0x5a);
+    const lsn_before = env.writer.last_lsn;
+    try testing.expectError(error.ValueTooLarge, env.tree.insert(testing.io, "big", big));
+    try testing.expect(!env.tree.failed); // Rejected up front: nothing was dirtied.
+    try testing.expectEqual(lsn_before, env.writer.last_lsn);
+    try env.tree.insert(testing.io, "k1", "v1");
+    try tfx.expect_get(&env.tree, "k1", "v1");
+    try tfx.expect_get(&env.tree, "big", null);
+}
+
+test "a failed chain append latches the tree and drops the pool" {
+    var env: Env = undefined;
+    try env.start(512, .fsync);
+    defer env.stop();
+
+    const spare = try env.pm.allocate(testing.io);
+    try env.pm.free(testing.io, spare); // A popped id makes the chain log sync first.
+    try testing.expect(env.pm.freelist_head != null);
+    const big = try testing.allocator.alloc(u8, 512 * 3);
+    defer testing.allocator.free(big);
+
+    @memset(big, 0x33);
+    var faults: fault_io.FaultIo = undefined;
+    fault_io.FaultIo.init(&faults, testing.io, .{
+        .write = .none,
+        .read = .none,
+        .after_calls = 0,
+        .sync_fail_after = 0,
+    });
+    const lsn_before = env.writer.last_lsn;
+    try testing.expectError(error.Failed, env.tree.insert(faults.io(), "big", big));
+    try testing.expect(env.tree.failed);
+    try testing.expect(faults.sync_calls >= 1);
+    try testing.expectEqual(lsn_before, env.writer.last_lsn); // No frame, not even the chain's.
+    try testing.expectEqual(@as(u32, 0), env.pool.dirty_count);
+    try testing.expectError(error.Failed, env.tree.insert(testing.io, "k2", "v2"));
+    env.pool.check_invariants();
 }
