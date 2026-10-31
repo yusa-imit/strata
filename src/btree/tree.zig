@@ -160,7 +160,8 @@ pub const Tree = struct {
         assert(@intFromEnum(target.root) < pool.pages.page_count);
     }
 
-    /// Attaches the log: from now on `insert` and `delete` follow ADR-0004 section 9 (one
+    /// Attaches the log (`frees_pending` must be empty: release it first). From now on `insert`
+    /// and `delete` follow ADR-0004 section 9 (one
     /// `page_images` frame per op, an overflow chain logged first). Preconditions: no op in
     /// flight, no guard outstanding, not attached yet; `track.len` is at least
     /// `2 * height_max + 1` and it also bounds a chain (a longer one is `ValueTooLarge`); the
@@ -171,6 +172,7 @@ pub const Tree = struct {
     pub fn attach(self: *Tree, writer: *wal_writer.Writer, track: []u32) void {
         const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
         assert(self.writer == null);
+        assert(self.frees_len == 0); // Ids queued unlogged have no lsn to wait for (rule B).
         assert(self.pool.pinned_count() == 0);
         assert(ops_max <= images_chunk_max);
         assert(track.len >= ops_max);
@@ -289,6 +291,7 @@ pub const Tree = struct {
             pool.track_end();
             if (logged) |lsn| {
                 self.note_frees(frees_from, lsn);
+                self.discard_unlinked(frees_from);
                 return .done;
             } else |_| {} // Any log failure latches below.
         } else {
@@ -308,6 +311,15 @@ pub const Tree = struct {
         assert(from <= self.frees_len);
         assert(lsn >= self.frees_lsn);
         if (self.frees_len > from) self.frees_lsn = lsn;
+    }
+
+    /// Drops the pool frames of the ids queued from `frees_from` on, dirty or not: an unlinked
+    /// page left dirty with its old lsn would pass the WAL gate and could reach the file before
+    /// the frame that unlinks it is durable. Nothing is pinned after the op.
+    fn discard_unlinked(self: *Tree, frees_from: u32) void {
+        assert(!self.pool.track_on);
+        assert(frees_from <= self.frees_len);
+        for (self.frees_pending[frees_from..self.frees_len]) |id| self.pool.discard(id);
     }
 
     /// Takes the pages queued from `frees_from` on out of the tracked set: they are unlinked, so
@@ -545,19 +557,26 @@ pub const Tree = struct {
         const frees_from = self.frees_len;
         self.pool.track_begin(self.track);
         const result = self.delete_core(io, key);
-        if (result) |found| {
-            if (!found and self.pool.track_len == 0 and !self.pool.track_overflow) {
-                self.pool.track_end(); // Absent key: nothing dirtied, nothing to log.
-                return false;
-            }
-        } else |_| {}
         const ok = if (result) |_| true else |_| false;
+        if (self.delete_was_noop(result)) {
+            self.pool.track_end(); // Absent key: nothing dirtied, nothing to log.
+            return false;
+        }
         switch (self.finish(io, writer, ok, frees_from)) {
             .done, .rejected => return result,
             .latched => return error.Failed,
         }
     }
 
+    /// True when a delete that returned `result` dirtied nothing: an absent key.
+    fn delete_was_noop(self: *const Tree, result: DeleteError!bool) bool {
+        assert(self.pool.track_on);
+        assert(self.pool.track_len <= self.pool.track.len);
+        const found = result catch return false;
+        return !found and self.pool.track_len == 0 and !self.pool.track_overflow;
+    }
+
+    /// The unlogged delete: key limit check, then `delete_tree.delete`.
     fn delete_core(self: *Tree, io: Io, key: []const u8) DeleteError!bool {
         assert(self.page_size == self.pool.page_size);
         assert(self.frees_len <= self.frees_pending.len);
@@ -574,6 +593,8 @@ pub const Tree = struct {
     /// frees nothing and returns 0, so the caller commits the writer and calls again. Each id is
     /// freed with `free_at(durable_lsn)`, so the trunk it writes outranks every older image in
     /// replay. A `failed` tree frees nothing and keeps its ids (recover by replaying the log).
+    /// `frees_lsn` is one scalar, the conservative form of rule B's per-entry lsn: an id queued
+    /// by an older op also waits for the latest queuing op's frame.
     pub fn release_frees(self: *Tree, io: Io) FreeError!u32 {
         assert(self.frees_len <= self.frees_pending.len);
         assert(self.root != .file_header);

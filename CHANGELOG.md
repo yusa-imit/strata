@@ -13,8 +13,13 @@ All notable changes to this project are documented in this file. The format foll
   frames, and syncs popped freelist ids before the frame (ADR-0004 rules A and C). A failed
   append drops the pool and latches `error.Failed`. `BufferPool.track_begin/track_ids/track_reset/
   track_end` record and pin the pages of an op. `freelist.allocate` and `free` never lower a
-  trunk stamped by `free_at`. An attached tree is insert-only (`delete` and `release_frees`
-  assert) until logged `delete` lands.
+  trunk stamped by `free_at`.
+- Logged `Tree.delete`: with a writer attached a delete appends one `page_images` frame with the
+  live pages it dirtied (merge, borrow and root collapse together; unlinked pages are not logged
+  and leave the pool), an absent key logs nothing, and `DeleteError` gains `Failed`.
+  `Tree.release_frees` follows ADR-0004 rule B: ids are freed through `free_at(durable_lsn)`
+  only once `writer.durable_lsn >= Tree.frees_lsn` (the lsn of the latest frame that queued
+  ids), else it returns 0. `Tree.attach` requires an empty `frees_pending`.
 - `wal.frame.Type.page_images` (16): one frame images several pages (ADR-0004 §9). `PageRedo`
   validates the whole frame before writing and applies each image iff its page is older;
   `PageManager.free_at(io, id, lsn)` stamps trunks with `max(wal_lsn, lsn)`;

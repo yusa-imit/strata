@@ -17,17 +17,18 @@ const wal_test = @import("tree_wal_test.zig");
 const Env = wal_test.Env;
 const Rebuilt = wal_test.Rebuilt;
 const Tree = tree_mod.Tree;
+const BufferPool = @import("../cache/buffer_pool.zig").BufferPool;
 const Id = header.Id;
 
 const sizes = [_]u32{ 512, 4096 };
 
-/// Deletes `from ..< to` that match `step` (every `step`-th key), validating after each op.
-fn delete_checked(t: *Tree, from: u32, to: u32, step: u32, odd: bool) !void {
+/// Deletes the keys `from ..< to` whose parity is `odd`, validating after each op.
+fn delete_parity(t: *Tree, from: u32, to: u32, odd: bool) !void {
     assert(from <= to);
-    assert(step >= 1);
+    assert(t.writer != null);
     var key_buf: [16]u8 = undefined;
     for (from..to) |n| {
-        if (step == 2 and (n % 2 == 1) != odd) continue;
+        if ((n % 2 == 1) != odd) continue;
         const key = tfx.key_of(&key_buf, @intCast(n));
         try testing.expect(try t.delete(testing.io, key));
         try t.validate(testing.io, testing.allocator);
@@ -67,6 +68,15 @@ fn page_lsn(t: *Tree, id: Id) !u64 {
     return header.peek(guard.bytes()).lsn;
 }
 
+/// An unlinked page must not stay dirty in the pool: the WAL gate lets a page with an old lsn
+/// out before the delete's frame is durable.
+fn expect_not_dirty(pool: *BufferPool, id: Id) !void {
+    assert(id != .file_header);
+    assert(pool.frames.len == pool.frames_max);
+    const index = pool.table.get(@intFromEnum(id)) orelse return; // Not resident: fine.
+    try testing.expect(!pool.frames[index].dirty);
+}
+
 test "logged deletes with merges, borrows and a root collapse replay into an equal tree" {
     for (sizes) |size| {
         var env: Env = undefined;
@@ -77,8 +87,8 @@ test "logged deletes with merges, borrows and a root collapse replay into an equ
         const keep_from = count - 8;
         try wal_test.insert_range(&env.tree, 0, count);
         try env.tree.validate(testing.io, testing.allocator);
-        try delete_checked(&env.tree, 0, count, 2, true); // Scattered: borrows and some merges.
-        try delete_checked(&env.tree, 0, keep_from, 2, false); // Then merges up to the root.
+        try delete_parity(&env.tree, 0, count, true); // Scattered: borrows and some merges.
+        try delete_parity(&env.tree, 0, keep_from, false); // Then merges up to the root.
         try expect_survivors(&env.tree, keep_from, count);
         var root_guard = try env.pool.fetch(testing.io, env.tree.root);
         const root_type = header.peek(root_guard.bytes()).page_type;
@@ -197,6 +207,8 @@ test "the page a delete unlinks is not in its frame" {
         const last_lsn = env.writer.last_lsn;
         try testing.expectEqual(last_lsn, env.tree.frees_lsn);
         for (env.tree.frees_pending[pending..env.tree.frees_len]) |id| {
+            try expect_not_dirty(&env.pool, id); // Else eviction could write it too early.
+            if (env.pool.table.get(@intFromEnum(id)) == null) continue; // Dropped: fine.
             try testing.expect(try page_lsn(&env.tree, id) < last_lsn); // Never stamped.
         }
         try testing.expect(try page_lsn(&env.tree, env.tree.root) <= last_lsn);
@@ -281,4 +293,48 @@ test "overflow chains of an overwrite and a delete are freed only after durabili
         try wal_test.expect_range(&env.tree, 0, 5, true);
         try env.tree.validate(testing.io, testing.allocator);
     }
+}
+
+test "a second delete moves frees_lsn and release_frees waits for the second sync" {
+    var env: Env = undefined;
+    try env.start(512, .none);
+    defer env.stop();
+
+    try wal_test.insert_range(&env.tree, 0, 300);
+    try delete_plain(&env.tree, 0, 100);
+    try env.writer.sync(testing.io);
+    const first_lsn = env.tree.frees_lsn;
+    try delete_plain(&env.tree, 100, 250); // Merges queue more ids behind a newer frame.
+    try testing.expect(env.tree.frees_lsn > first_lsn);
+    try testing.expect(env.writer.durable_lsn < env.tree.frees_lsn);
+    const pending = env.tree.frees_len;
+    try testing.expectEqual(@as(u32, 0), try env.tree.release_frees(testing.io));
+    try testing.expectEqual(pending, env.tree.frees_len);
+    try env.writer.sync(testing.io);
+    try testing.expectEqual(pending, try env.tree.release_frees(testing.io));
+}
+
+test "FreesPendingLimit with a writer leaves the tree usable and logs nothing" {
+    var env: Env = undefined;
+    try env.start(512, .none);
+    defer env.stop();
+
+    try wal_test.insert_range(&env.tree, 0, 300);
+    const big = try testing.allocator.alloc(u8, 512 * 3);
+    defer testing.allocator.free(big);
+
+    @memset(big, 0x77);
+    try env.tree.insert(testing.io, "big", big);
+    env.tree.frees_pending = env.frees[0..2]; // Too small for the chain of "big".
+    const lsn_before = env.writer.last_lsn;
+    const frees_lsn = env.tree.frees_lsn;
+    try testing.expectError(error.FreesPendingLimit, env.tree.delete(testing.io, "big"));
+    try testing.expect(!env.tree.failed);
+    try testing.expect(!env.pool.track_on);
+    try testing.expectEqual(lsn_before, env.writer.last_lsn);
+    try testing.expectEqual(@as(u32, 0), env.tree.frees_len);
+    try testing.expectEqual(frees_lsn, env.tree.frees_lsn);
+    env.tree.frees_pending = env.frees[0..];
+    try testing.expect(try env.tree.delete(testing.io, "big")); // The tree still works.
+    try tfx.expect_get(&env.tree, "big", null);
 }
