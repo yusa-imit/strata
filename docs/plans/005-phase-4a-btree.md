@@ -74,7 +74,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       discards the pool and latches `Failed`. No writer = unlogged. Split out of the item
       below (cycle 73). Verify: crash before write-back → replay → same `get`s; a cut frame
       restores the pre-op tree, never half a split; replay twice = once.
-- [ ] **WAL integration, tree side, delete and frees** (`src/btree/`). Logged `delete`
+- [x] **WAL integration, tree side, delete and frees** (`src/btree/`). Logged `delete`
       (merge, borrow, root collapse), `release_frees` waits for `durable_lsn` and frees through
       `free_at` (rule B). Verify: same crash/replay checks on delete; a freed id is not reused
       before its frame is durable.
