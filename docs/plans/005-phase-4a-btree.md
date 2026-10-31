@@ -78,7 +78,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       (merge, borrow, root collapse), `release_frees` waits for `durable_lsn` and frees through
       `free_at` (rule B). Verify: same crash/replay checks on delete; a freed id is not reused
       before its frame is durable.
-- [ ] **4E seeded model tests** (`src/testing/btree_model_test.zig`). Random get/insert/delete/
+- [x] **4E seeded model tests** (`src/testing/btree_model_test.zig`). Random get/insert/delete/
       seek/scan against a sorted bounded-array reference, 3 page sizes × fixed seeds, `validate`
       every N ops, `flushAll` mid-run (it cleans pinned frames, cycle 44); a crash variant on
       plan 004's `FaultIo`/`CrashSink` fixtures recovers to the last durable op. Verify: green

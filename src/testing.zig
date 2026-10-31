@@ -14,6 +14,8 @@
 //!   - `testing/wal_recovery_test.zig` (+ `wal_recovery_fixtures.zig`; landed, test-only: seeded
 //!     crash-recovery property over the real WAL writer, pool, checkpoint and redo at three
 //!     page sizes, with `FaultIo` stops and `CrashSink` tail cuts)
+//!   - `testing/btree_model_test.zig` (+ `btree_model_fixtures.zig`; landed, test-only: seeded
+//!     B+Tree op streams against a sorted-array model, unlogged and logged with crash replay)
 //!   - `testing/model.zig` (planned)
 //!
 //! Status: crash and fault_io have landed; model is added as its PRD phase lands. Neither
@@ -30,6 +32,7 @@ test {
     _ = @import("testing/truncation_matrix_test.zig");
     _ = @import("testing/page_matrix_test.zig");
     _ = @import("testing/wal_recovery_test.zig");
+    _ = @import("testing/btree_model_test.zig");
 }
 
 test "testing: module compiles" {
