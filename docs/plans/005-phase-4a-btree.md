@@ -80,8 +80,10 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       before its frame is durable.
 - [x] **4E seeded model tests** (`src/testing/btree_model_test.zig`). Random get/insert/delete/
       seek/scan against a sorted bounded-array reference, 3 page sizes × fixed seeds, `validate`
-      every N ops, `flushAll` mid-run (it cleans pinned frames, cycle 44); a crash variant on
-      plan 004's `FaultIo`/`CrashSink` fixtures recovers to the last durable op. Verify: green
+      every N ops, `flushAll` mid-run (it cleans pinned frames, cycle 44); a crash variant
+      (pool dropped, WAL replayed into a fresh file, last op cut mid-frame) recovers to the last
+      complete op. Landed on `Env`/`Rebuilt` with `.none` sync; a `FaultIo`/`CrashSink` variant
+      that drops unsynced bytes is a follow-up for the next plan. Verify: green
       in `zig build test`; mutants (split drops the separator, redo ignores lsn) fail.
 - [ ] **B+Tree bench** (`bench/btree.zig`). PRD §5 floors, 4 KiB, ReleaseFast, unlogged: point
       get on a hot pool ≥ 5M ops/s (pool hit is 197M), sequential insert ≥ 1M ops/s; a logged

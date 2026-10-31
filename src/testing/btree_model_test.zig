@@ -29,6 +29,7 @@ const pages_max: u32 = 2048;
 const release_every: u32 = 37;
 const scan_every: u32 = 50;
 const validate_every: u32 = 100;
+const extra_ops_max: u32 = 64; // Bound on steps taken to find an op that logs a frame.
 const seeds_unlogged = [_]u64{ 0x5eed_0001, 0x5eed_0002, 0x5eed_0003 };
 const seeds_logged = [_]u64{ 0x1091_c001, 0x1091_c002 };
 
@@ -151,13 +152,29 @@ fn run_logged(size: u32, seed: u64, ops: u32, torn: bool) !void {
         if (done % release_every == 0) try release(&env.tree);
         if (done % validate_every == 0) try env.tree.validate(testing.io, testing.allocator);
     }
+    // A torn run needs a last op that logged a frame, else the cut would be a no-op.
+    if (torn) {
+        for (0..extra_ops_max) |_| {
+            if (env.writer.position().lsn != before_pos.lsn) break;
+            before = d.model;
+            before_root = env.tree.root;
+            before_pos = env.writer.position();
+            try d.step(&env.tree, testing.io);
+        }
+        try testing.expect(env.writer.position().lsn != before_pos.lsn);
+    }
     try testing.expect(d.large_puts > 0);
     var root = env.tree.root;
     try d.expect_equal(&env.tree, testing.io);
+    const end_pos = env.writer.position();
     env.crash();
     if (torn) {
+        // Cut inside the last op's bytes: its frame is incomplete and recovery must drop it.
+        try testing.expectEqual(before_pos.segment_index, end_pos.segment_index);
+        try testing.expect(end_pos.offset > before_pos.offset + 1);
+        const cut_offset = before_pos.offset + @divFloor(end_pos.offset - before_pos.offset, 2);
         const cut = try sfx.raw_open(env.tmp.dir, before_pos.segment_index);
-        try cut.setLength(testing.io, before_pos.offset);
+        try cut.setLength(testing.io, cut_offset);
         cut.close(testing.io);
         d.model = before;
         root = before_root;
