@@ -30,17 +30,17 @@ const pages_max: u32 = 4096;
 const segment_bytes_max: u64 = 1 << 24;
 
 /// A logged tree in a temp dir: page file, pool, tree, writer. Initialised in place.
-const Env = struct {
+pub const Env = struct {
     tmp: testing.TmpDir,
     pm: PageManager,
     pool: BufferPool,
     tree: Tree,
     writer: wfx.Writer,
-    frees: [64]Id,
+    frees: [512]Id,
     track: [64]u32,
     log_open: bool,
 
-    fn start(self: *Env, size: u32, policy: file_mod.SyncPolicy) !void {
+    pub fn start(self: *Env, size: u32, policy: file_mod.SyncPolicy) !void {
         assert(header.page_size_valid(size));
         self.tmp = testing.tmpDir(.{ .iterate = true });
         errdefer self.tmp.cleanup();
@@ -66,7 +66,7 @@ const Env = struct {
         assert(!self.tree.failed);
     }
 
-    fn stop(self: *Env) void {
+    pub fn stop(self: *Env) void {
         assert(self.pool.pinned_count() == 0);
         assert(self.track.len == 64);
         if (self.log_open) self.writer.deinit(testing.io, testing.allocator);
@@ -77,7 +77,7 @@ const Env = struct {
     }
 
     /// Closes the log (releases the segment lock) and drops the pool without flushing.
-    fn crash(self: *Env) void {
+    pub fn crash(self: *Env) void {
         assert(self.pool.pinned_count() == 0);
         assert(self.log_open);
         self.pool.discardAll();
@@ -89,14 +89,14 @@ const Env = struct {
 };
 
 /// A fresh file rebuilt from the log.
-const Rebuilt = struct {
+pub const Rebuilt = struct {
     pm: PageManager,
     pool: BufferPool,
     redo: redo.PageRedo,
     tree: Tree,
     frees: [8]Id,
 
-    fn start(self: *Rebuilt, env: *Env, size: u32, root: Id) !void {
+    pub fn start(self: *Rebuilt, env: *Env, size: u32, root: Id) !void {
         assert(header.page_size_valid(size));
         assert(root != .file_header);
         assert(!env.log_open);
@@ -119,7 +119,7 @@ const Rebuilt = struct {
         try Tree.open(&self.tree, &self.pool, root, &self.frees, &tfx.value_buf);
     }
 
-    fn replay(self: *Rebuilt, env: *Env) !void {
+    pub fn replay(self: *Rebuilt, env: *Env) !void {
         assert(!env.log_open);
         assert(self.pm.page_count >= 1);
         const segment_options = wfx.opts(2, segment_bytes_max);
@@ -141,7 +141,7 @@ const Rebuilt = struct {
         assert(self.redo.stats.applied >= 1);
     }
 
-    fn stop(self: *Rebuilt) void {
+    pub fn stop(self: *Rebuilt) void {
         assert(self.pool.pinned_count() == 0);
         assert(self.redo.buf.len == self.pm.page_size);
         self.pool.discardAll();
@@ -151,14 +151,14 @@ const Rebuilt = struct {
     }
 };
 
-fn value_of(buf: []u8, n: u32) []const u8 {
+pub fn value_of(buf: []u8, n: u32) []const u8 {
     assert(buf.len >= 40);
     @memset(buf[0..40], @as(u8, @truncate(n)) +% 1);
     std.mem.writeInt(u32, buf[0..4], n, .little);
     return buf[0..40];
 }
 
-fn expect_range(t: *Tree, from: u32, to: u32, present: bool) !void {
+pub fn expect_range(t: *Tree, from: u32, to: u32, present: bool) !void {
     assert(from <= to);
     var key_buf: [16]u8 = undefined;
     var value_buf: [40]u8 = undefined;
@@ -169,7 +169,7 @@ fn expect_range(t: *Tree, from: u32, to: u32, present: bool) !void {
     }
 }
 
-fn insert_range(t: *Tree, from: u32, to: u32) !void {
+pub fn insert_range(t: *Tree, from: u32, to: u32) !void {
     assert(from <= to);
     var key_buf: [16]u8 = undefined;
     var value_buf: [40]u8 = undefined;

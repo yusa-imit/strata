@@ -5,9 +5,11 @@
 //! a one-child root (`delete_tree.zig`), `check_invariants` and `validate` walk the whole tree
 //! (`validate.zig`). Pages a delete unlinks wait in the caller-provided `frees_pending` (not
 //! persisted) until `release_frees` hands them to the page manager. A value that is not inline
-//! (up to `value_buf.len <= node.value_len_max`) goes to an overflow chain (`overflow.zig`);
-//! logging arrives in a later plan 005 item, so this stage is unlogged (page `lsn`s are kept
-//! as they are).
+//! (up to `value_buf.len <= node.value_len_max`) goes to an overflow chain (`overflow.zig`).
+//! Logging (`attach`): with a `wal.Writer` attached every `insert` and `delete` appends one
+//! `page_images` frame with the live pages it dirtied (a page the op unlinked is not logged) and
+//! stamps them; `release_frees` then follows rule B and frees an id only once the log that
+//! unlinked it is durable. Without a writer the tree is unlogged (page `lsn`s are kept as is).
 //!
 //! Invariants: `root` is a page id allocated by `create`, never 0 and never changed, even by a
 //! root split; the root is a leaf (type 16, level 0) or an internal node (type 17) whose level
@@ -77,8 +79,8 @@ pub const GetError = CheckError || error{ KeyTooLarge, ValueTooLarge };
 
 /// `FreesPendingLimit`: `frees_pending` has no room for the ids this delete would unlink;
 /// nothing changed. `NoSpaceLeft`: a forced borrow whose new separator does not fit in its
-/// parent (nothing changed).
-pub const DeleteError = delete_tree.DeleteError;
+/// parent (nothing changed). `Failed`: the tree is latched (as for `InsertError`).
+pub const DeleteError = delete_tree.DeleteError || error{Failed};
 
 /// The page manager's own error set: `release_frees` frees through it.
 pub const FreeError = manager.FreeError;
@@ -115,10 +117,14 @@ pub const Tree = struct {
     writer: ?*wal_writer.Writer = null,
     /// Caller storage for the pool's op tracker; its length bounds the pages one op may dirty.
     track: []u32 = &.{},
-    /// Latched by a failed log append or sync: every later `insert` is `error.Failed`.
+    /// Latched by a failed log append or sync: every later `insert` and `delete` is
+    /// `error.Failed`, and `release_frees` frees nothing.
     failed: bool = false,
     /// True while a logged op may have popped ids from the freelist (rule A: sync first).
     op_popped: bool = false,
+    /// Lsn of the latest frame that queued ids in `frees_pending` (rule B): the ids wait until
+    /// the writer's `durable_lsn` reaches it. 0 while nothing was queued under a writer.
+    frees_lsn: u64 = 0,
 
     /// Allocates the root id from the page manager and writes an empty leaf there, in the pool
     /// (dirty, not yet on disk: `flushAll` and the caller's `sync` make it durable). The root
@@ -154,15 +160,14 @@ pub const Tree = struct {
         assert(@intFromEnum(target.root) < pool.pages.page_count);
     }
 
-    /// Attaches the log: from now on `insert` follows ADR-0004 section 9 (one `page_images`
-    /// frame per op, an overflow chain logged first). Preconditions: no op in flight, no guard
-    /// outstanding, not attached yet; `track.len` is at least `2 * height_max + 1` and it also
-    /// bounds a chain (a longer one is `ValueTooLarge`); the tree does not own `writer` or
-    /// `track`; the pool has at least `track.len + 2 * height_max + 2` frames, so tracked pages
-    /// alone can never pin it into a self-latch (`PoolExhausted` becomes `Failed`).
+    /// Attaches the log: from now on `insert` and `delete` follow ADR-0004 section 9 (one
+    /// `page_images` frame per op, an overflow chain logged first). Preconditions: no op in
+    /// flight, no guard outstanding, not attached yet; `track.len` is at least
+    /// `2 * height_max + 1` and it also bounds a chain (a longer one is `ValueTooLarge`); the
+    /// tree does not own `writer` or `track`; the pool has at least
+    /// `track.len + 2 * height_max + 2` frames, so tracked pages alone can never pin it into a
+    /// self-latch (`PoolExhausted` becomes `Failed`).
     /// The caller turns the pool's WAL gate on (`set_durable_lsn`) and commits.
-    /// Temporary: an attached tree is insert-only (`delete` and `release_frees` assert) until the
-    /// next plan 005 item.
     pub fn attach(self: *Tree, writer: *wal_writer.Writer, track: []u32) void {
         const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
         assert(self.writer == null);
@@ -251,46 +256,90 @@ pub const Tree = struct {
         if (self.failed) return error.Failed;
         assert(!self.pool.track_on);
         self.op_popped = self.pool.pages.freelist_head != null;
+        const frees_from = self.frees_len;
         self.pool.track_begin(self.track);
         const result = self.insert_core(io, key, value);
-        return self.insert_finish(io, writer, result);
+        const ok = if (result) |_| true else |_| false;
+        switch (self.finish(io, writer, ok, frees_from)) {
+            .done, .rejected => return result,
+            .latched => return error.Failed,
+        }
     }
 
-    /// Logged tail of `insert`: on success one frame with every dirtied page, then stamp. Any
+    /// How a logged op ended: `done` (framed and stamped), `rejected` (failed with nothing
+    /// unlogged, the tree stays usable), `latched` (the tree is `failed`, the pool dropped).
+    const Finish = enum { done, rejected, latched };
+
+    /// Logged tail of `insert` and `delete`: on success one frame with every live page the op
+    /// dirtied, then stamp. Ids the op queued from `frees_from` on are noted with their lsn. Any
     /// failure with unlogged pages in the pool drops the whole pool and latches the tree.
-    fn insert_finish(
+    fn finish(
         self: *Tree,
         io: Io,
         writer: *wal_writer.Writer,
-        result: InsertError!void,
-    ) InsertError!void {
+        ok: bool,
+        frees_from: u32,
+    ) Finish {
         const pool = self.pool;
         assert(pool.track_on);
+        assert(frees_from <= self.frees_len);
         const clean = pool.track_len == 0 and !pool.track_overflow;
-        if (result) |_| {
-            const logged = self.log_op(io, writer);
+        if (ok) {
+            const logged = self.log_op(io, writer, frees_from);
             pool.track_end();
-            if (logged) |_| return else |_| {} // Any log failure latches below.
-        } else |err| {
+            if (logged) |lsn| {
+                self.note_frees(frees_from, lsn);
+                return .done;
+            } else |_| {} // Any log failure latches below.
+        } else {
             pool.track_end();
-            if (clean and !self.failed) return err; // Nothing unlogged: stay usable.
+            if (clean and !self.failed) { // Nothing unlogged: stay usable.
+                self.note_frees(frees_from, writer.last_lsn); // A logged chain may be queued.
+                return .rejected;
+            }
         }
         self.failed = true;
         pool.discardAll();
-        return error.Failed;
+        return .latched;
     }
 
-    /// Appends the op frame for the tracked pages (after the rule A sync) and stamps them.
-    fn log_op(self: *Tree, io: Io, writer: *wal_writer.Writer) LogError!void {
+    /// Records that `frees_pending` grew past `from` under the frame `lsn` (rule B).
+    fn note_frees(self: *Tree, from: u32, lsn: u64) void {
+        assert(from <= self.frees_len);
+        assert(lsn >= self.frees_lsn);
+        if (self.frees_len > from) self.frees_lsn = lsn;
+    }
+
+    /// Takes the pages queued from `frees_from` on out of the tracked set: they are unlinked, so
+    /// their images are dead and replay must not resurrect them.
+    fn drop_unlinked(self: *Tree, frees_from: u32) void {
         const pool = self.pool;
         assert(pool.track_on);
-        if (pool.track_overflow or pool.track_len == 0) return error.Failed;
+        assert(frees_from <= self.frees_len);
+        const unlinked = self.frees_pending[frees_from..self.frees_len];
+        var kept: u32 = 0;
+        for (pool.track[0..pool.track_len]) |raw| {
+            if (std.mem.findScalar(Id, unlinked, @enumFromInt(raw)) != null) continue;
+            pool.track[kept] = raw;
+            kept += 1;
+        }
+        pool.track_len = kept;
+    }
+
+    /// Appends the op frame for the tracked live pages (after the rule A sync) and stamps them.
+    /// Returns the frame's lsn.
+    fn log_op(self: *Tree, io: Io, writer: *wal_writer.Writer, frees_from: u32) LogError!u64 {
+        const pool = self.pool;
+        assert(pool.track_on);
+        if (pool.track_overflow) return error.Failed;
+        self.drop_unlinked(frees_from);
+        if (pool.track_len == 0) return error.Failed;
         if (self.op_popped) try pool.pages.sync(io); // Rule A: pops durable before a frame.
         const ids = pool.track[0..pool.track_len];
         std.mem.sort(u32, ids, {}, std.sort.asc(u32));
         const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
         if (ids.len > ops_max) return error.Failed;
-        _ = try self.log_images(io, writer, ids);
+        return try self.log_images(io, writer, ids);
     }
 
     /// Writes one `page_images` frame for `ids` (ascending, at most `images_chunk_max`), pins
@@ -483,10 +532,35 @@ pub const Tree = struct {
 
     /// Removes `key`, merging or redistributing underfull nodes (see `delete_tree.zig`). True
     /// when the key was present. Unlinked pages wait in `frees_pending` for `release_frees`.
+    /// With a writer attached it mirrors `insert`: one `page_images` frame with every live page
+    /// the delete dirtied (merge, borrow and root collapse together; unlinked pages left out),
+    /// none for an absent key. A failed log append latches the tree (`error.Failed`).
     pub fn delete(self: *Tree, io: Io, key: []const u8) DeleteError!bool {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
-        assert(self.writer == null); // Temporary: attach is insert-only until the next 005 item.
+        const writer = self.writer orelse return self.delete_core(io, key);
+        if (self.failed) return error.Failed;
+        assert(!self.pool.track_on);
+        self.op_popped = false; // A delete allocates nothing: no rule A sync is owed.
+        const frees_from = self.frees_len;
+        self.pool.track_begin(self.track);
+        const result = self.delete_core(io, key);
+        if (result) |found| {
+            if (!found and self.pool.track_len == 0 and !self.pool.track_overflow) {
+                self.pool.track_end(); // Absent key: nothing dirtied, nothing to log.
+                return false;
+            }
+        } else |_| {}
+        const ok = if (result) |_| true else |_| false;
+        switch (self.finish(io, writer, ok, frees_from)) {
+            .done, .rejected => return result,
+            .latched => return error.Failed,
+        }
+    }
+
+    fn delete_core(self: *Tree, io: Io, key: []const u8) DeleteError!bool {
+        assert(self.page_size == self.pool.page_size);
+        assert(self.frees_len <= self.frees_pending.len);
         if (key.len > node.key_len_max(self.page_size)) return error.KeyTooLarge;
         return delete_tree.delete(self, io, key);
     }
@@ -495,17 +569,25 @@ pub const Tree = struct {
     /// write-back (a stale tree page must never overwrite a freelist page). Returns how many
     /// ids were freed, last pending id first. An id whose `free` fails stays pending, together
     /// with every id before it in `frees_pending` (those not yet attempted).
-    /// Temporary: an attached tree has no delete, so nothing to release (rule B, ADR-0004
-    /// section 9, is not enforced yet); it asserts until the next plan 005 item.
+    /// With a writer attached this is rule B (ADR-0004 section 9): ids are freed only when the
+    /// frame that queued them is durable (`writer.durable_lsn >= frees_lsn`); until then it
+    /// frees nothing and returns 0, so the caller commits the writer and calls again. Each id is
+    /// freed with `free_at(durable_lsn)`, so the trunk it writes outranks every older image in
+    /// replay. A `failed` tree frees nothing and keeps its ids (recover by replaying the log).
     pub fn release_frees(self: *Tree, io: Io) FreeError!u32 {
-        assert(self.writer == null); // Temporary: attach is insert-only until the next 005 item.
         assert(self.frees_len <= self.frees_pending.len);
         assert(self.root != .file_header);
+        var lsn: u64 = 0; // 0 is the plain `free` of the unlogged tree.
+        if (self.writer) |writer| {
+            if (self.failed) return 0;
+            if (writer.durable_lsn < self.frees_lsn) return 0;
+            lsn = writer.durable_lsn;
+        }
         var freed: u32 = 0;
         while (self.frees_len > 0) {
             const id = self.frees_pending[self.frees_len - 1];
             self.pool.discard(id);
-            try self.pool.pages.free(io, id);
+            try self.pool.pages.free_at(io, id, lsn);
             self.frees_len -= 1;
             freed += 1;
         }
@@ -590,4 +672,5 @@ test {
     _ = @import("overflow_test.zig");
     _ = @import("overflow_fail_test.zig");
     _ = @import("tree_wal_test.zig");
+    _ = @import("tree_wal_delete_test.zig");
 }
