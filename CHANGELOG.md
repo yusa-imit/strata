@@ -7,6 +7,15 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-02
+
+B+Tree engine (Phase 4a, ADR-0004 format v1) with WAL integration. A log containing the new
+`page_images` frame (type 16) is rejected as `Corrupted` by v0.5.0 readers.
+
+### Changed
+- `btree.Error` (`error.NotImplemented`) is removed; the module is no longer a stub. README
+  btree row is `Landed` (bulk load stays planned).
+
 ### Added
 - `bench/btree.zig`: `btree_get` (hot 4 KiB pool, 100k keys), `btree_insert_seq` and
   `btree_insert_logged` benchmarks; figures recorded in `docs/plans/000-inherited.md`.
