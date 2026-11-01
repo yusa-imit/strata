@@ -8,6 +8,8 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- `bench/btree.zig`: `btree_get` (hot 4 KiB pool, 100k keys), `btree_insert_seq` and
+  `btree_insert_logged` benchmarks; figures recorded in `docs/plans/000-inherited.md`.
 - `Tree.attach(writer, track)`: a logged `insert` appends one `page_images` frame with every page
   it dirtied (splits included), stamps them with its lsn, logs an overflow chain first in its own
   frames, and syncs popped freelist ids before the frame (ADR-0004 rules A and C). A failed

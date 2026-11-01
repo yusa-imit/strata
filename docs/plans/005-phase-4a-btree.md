@@ -85,7 +85,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       complete op. Landed on `Env`/`Rebuilt` with `.none` sync; a `FaultIo`/`CrashSink` variant
       that drops unsynced bytes is a follow-up for the next plan. Verify: green
       in `zig build test`; mutants (split drops the separator, redo ignores lsn) fail.
-- [ ] **B+Tree bench** (`bench/btree.zig`). PRD §5 floors, 4 KiB, ReleaseFast, unlogged: point
+- [x] **B+Tree bench** (`bench/btree.zig`). PRD §5 floors, 4 KiB, ReleaseFast, unlogged: point
       get on a hot pool ≥ 5M ops/s (pool hit is 197M), sequential insert ≥ 1M ops/s; a logged
       insert figure is recorded, not gated (Risks). Figures go into `000-inherited.md`. Verify:
       `zig build bench` prints them; a missed floor is fixed here or split out before release.

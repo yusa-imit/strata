@@ -1,27 +1,33 @@
 //! strata benchmark harness. Run: `zig build bench -- [filter]` (the step builds ReleaseFast).
 //!
 //! Baseline: the codec layer — CRC32C (software, and hardware when the target CPU has the
-//! instruction), xxhash64, and varint encode/decode — and the CLOCK buffer pool (`pool.zig`).
+//! instruction), xxhash64, and varint encode/decode — the CLOCK buffer pool (`pool.zig`) and the
+//! B+Tree (`btree.zig`).
 //! Each benchmark prints one line, `name  GB/s  ops/s  ns/op`, so results can be pasted into
 //! docs/plans/000-inherited.md. An "op" is one kernel call: one buffer pass for the hashes, one
-//! value for varint, one fetch + release of a 4 KiB page for the pool.
+//! value for varint, one fetch + release of a 4 KiB page for the pool, one `get` or `insert`
+//! for the tree.
 //!
 //! Sketch: the hashes stream a 1 MiB buffer (fits L2, so this measures the kernel, not DRAM)
 //! 256 times; varint walks 64 Ki values 256 times. `pool_hit` re-fetches 256 resident pages;
 //! `pool_miss_evict` walks 1024 pages through a 256-frame pool so each fetch reads the page
-//! from a scratch file (in the OS page cache) and evicts a clean frame (see `pool.zig`). Wall
+//! from a scratch file (in the OS page cache) and evicts a clean frame (see `pool.zig`).
+//! `btree_get` looks up 1 Mi seeded-random keys of a 100k-key tree, `btree_insert_seq` builds
+//! such a tree by ascending inserts and `btree_insert_logged` inserts 8192 keys with a WAL
+//! attached; all three run in pools that hold the whole tree (see `btree.zig`). Wall
 //! time per benchmark is about a second or less on a 2020s laptop. Inputs come from a seeded
 //! PRNG, so a run is reproducible from the seed; only the clock is non-deterministic, and it
 //! is read once around each kernel.
 //! Allocation: the fixture is allocated once in `main` and freed there; kernels do not allocate.
-//! The pool benchmarks need a file: `main` creates `strata-bench-<random>.db` in the cwd and
-//! removes it on exit.
+//! The pool and tree benchmarks need files: `main` creates `strata-bench-<random>.db` and the
+//! directory `strata-bench-<random>.db.tree` in the cwd and removes both on exit.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const strata = @import("strata");
 const codec = strata.codec;
 const pool_bench = @import("pool.zig");
+const btree_bench = @import("btree.zig");
 
 /// Everything a run needs, spelled out so no knob hides in a default (Tiger Style 1.15).
 const Options = struct {
@@ -33,6 +39,7 @@ const Options = struct {
     /// Times each kernel repeats over its input.
     pass_count: u32,
     pool: pool_bench.Options,
+    btree: btree_bench.Options,
 };
 
 const options_baseline: Options = .{
@@ -47,10 +54,18 @@ const options_baseline: Options = .{
         .hit_pass_count = 262144,
         .miss_pass_count = 1024,
     },
+    .btree = .{
+        .page_size = 4096,
+        .frames_max = 4096,
+        .key_count = 100_000,
+        .get_count = 1 << 20,
+        .logged_key_count = 8192,
+        .seed = 0x5742_A7A0_5EED,
+    },
 };
 
 const RunError = codec.varint.EncodeError || codec.varint.DecodeError ||
-    strata.cache.FetchError || error{
+    strata.cache.FetchError || btree_bench.RunError || error{
     /// The decoded stream did not end where the encoder said it did.
     StreamLengthMismatch,
 };
@@ -72,6 +87,7 @@ const Bench = struct {
 /// a scratch file); `fixture_deinit` frees them. Built in place: it must not move.
 const Fixture = struct {
     pool: pool_bench.Fixture,
+    btree: btree_bench.Fixture,
     pass_count: u32,
     bytes: []u8,
     values: []u64,
@@ -89,6 +105,9 @@ const benches_always = [_]Bench{
     .{ .name = "varint_decode", .run = varint_decode_run },
     .{ .name = "pool_hit", .run = pool_hit_run },
     .{ .name = "pool_miss_evict", .run = pool_miss_evict_run },
+    .{ .name = "btree_get", .run = btree_get_run },
+    .{ .name = "btree_insert_seq", .run = btree_insert_seq_run },
+    .{ .name = "btree_insert_logged", .run = btree_insert_logged_run },
 };
 
 const benches_hardware = [_]Bench{
@@ -233,6 +252,7 @@ fn fixture_init(
 
     fixture.* = .{
         .pool = undefined, // Built in place below: the pools point at the manager inside it.
+        .btree = undefined, // Likewise.
         .pass_count = options.pass_count,
         .bytes = bytes,
         .values = values,
@@ -241,11 +261,18 @@ fn fixture_init(
         .scratch = scratch,
     };
     try pool_bench.fixture_init(&fixture.pool, gpa, io, dir, pool_sub_path, options.pool);
+    errdefer pool_bench.fixture_deinit(&fixture.pool, gpa);
+
+    // The B+Tree scratch directory sits next to the pool file: `<pool file name>.tree`.
+    var tree_name_buffer: [btree_bench.name_len_max]u8 = undefined;
+    const tree_name = try std.fmt.bufPrint(&tree_name_buffer, "{s}.tree", .{pool_sub_path});
+    try btree_bench.fixture_init(&fixture.btree, gpa, io, dir, tree_name, options.btree);
 }
 
 fn fixture_deinit(fixture: *Fixture, gpa: std.mem.Allocator) void {
     assert(fixture.scratch.len == fixture.encoded.len);
     assert(fixture.encoded_len <= fixture.encoded.len);
+    btree_bench.fixture_deinit(&fixture.btree, gpa);
     pool_bench.fixture_deinit(&fixture.pool, gpa);
     gpa.free(fixture.scratch);
     gpa.free(fixture.encoded);
@@ -359,10 +386,32 @@ fn pool_miss_evict_run(fixture: *Fixture) RunError!Result {
     return pool_bench.miss_run(&fixture.pool);
 }
 
+/// Point `get` of a seeded random order over a hot tree; every page access hits (`btree.zig`).
+fn btree_get_run(fixture: *Fixture) RunError!Result {
+    assert(fixture.btree.get_order.len >= 1);
+    assert(fixture.btree.options.get_count >= 1);
+    return btree_bench.get_run(&fixture.btree);
+}
+
+/// Ascending-key inserts into a fresh unlogged tree whose pool holds all of it (`btree.zig`).
+fn btree_insert_seq_run(fixture: *Fixture) RunError!Result {
+    assert(fixture.btree.name_len >= 1);
+    assert(fixture.btree.options.key_count >= 1);
+    return btree_bench.insert_seq_run(&fixture.btree);
+}
+
+/// The same inserts with a WAL attached: one `page_images` frame per insert (`btree.zig`).
+fn btree_insert_logged_run(fixture: *Fixture) RunError!Result {
+    assert(fixture.btree.name_len >= 1);
+    assert(fixture.btree.options.logged_key_count >= 1);
+    return btree_bench.insert_logged_run(&fixture.btree);
+}
+
 // -- tests ---------------------------------------------------------------------------------
 
 test {
     _ = pool_bench; // The pool kernels' tests live in pool.zig; reference it so they run.
+    _ = btree_bench; // Likewise for the B+Tree kernels.
 }
 
 const options_test: Options = .{
@@ -371,6 +420,7 @@ const options_test: Options = .{
     .value_count = 257,
     .pass_count = 3,
     .pool = pool_bench.options_test,
+    .btree = btree_bench.options_test,
 };
 
 fn test_fixture_init(
@@ -569,6 +619,24 @@ test "every registered benchmark runs on a small fixture and names are unique" {
         }
     }
     try std.testing.expect(benches.len >= benches_always.len);
+}
+
+test "fixture_init fails on an existing tree directory and removes the pool file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(std.testing.io, "pool.db.tree", .default_dir);
+    var fixture: Fixture = undefined;
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        test_fixture_init(&fixture, &tmp, "pool.db", options_test),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, "pool.db", .{}),
+    );
+    const present = try tmp.dir.statFile(std.testing.io, "pool.db.tree", .{});
+    try std.testing.expect(present.kind == .directory);
 }
 
 test "pool file names are well formed, fit the fixture and differ between calls" {

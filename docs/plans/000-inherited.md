@@ -69,3 +69,6 @@
 | 2026-10-04 | varint decode (mixed 1–10 B) | 151.1 M ops/s | — | Apple aarch64, ReleaseFast |
 | 2026-10-12 | pool hit (fetch+release, 4 KiB) | 197.1 M ops/s | — | Apple aarch64, ReleaseFast; floor for PRD §5 B+Tree get 5M ops/s |
 | 2026-10-12 | pool miss + clean evict (4 KiB) | 1.26 M ops/s | — | Apple aarch64, ReleaseFast; pread from OS page cache, 256 frames over 1024 pages |
+| 2026-11-01 | B+Tree get (4 KiB, hot pool, 100k keys) | 5.01 M ops/s | 5 M | Apple aarch64, ReleaseFast; PRD §5 floor met with ~0.2% margin |
+| 2026-11-01 | B+Tree sequential insert (4 KiB, unlogged) | 1.26 M ops/s | 1 M | Apple aarch64, ReleaseFast; 100k ascending keys into a fresh tree |
+| 2026-11-01 | B+Tree logged insert (4 KiB, `page_images` frame per op) | 0.22 M ops/s | — | Apple aarch64, ReleaseFast; recorded, not gated (a whole page image per insert) |
