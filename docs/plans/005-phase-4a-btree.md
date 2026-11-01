@@ -89,7 +89,7 @@ proof. `node.zig` takes no `io`; every tree or cursor method that can fault in a
       get on a hot pool ≥ 5M ops/s (pool hit is 197M), sequential insert ≥ 1M ops/s; a logged
       insert figure is recorded, not gated (Risks). Figures go into `000-inherited.md`. Verify:
       `zig build bench` prints them; a missed floor is fixed here or split out before release.
-- [ ] **Docs, module status, release v0.6.0** (`docs/`, `README.md`, `build.zig.zon`). Drop
+- [x] **Docs, module status, release v0.6.0** (`docs/`, `README.md`, `build.zig.zon`). Drop
       `NotImplemented` from `src/btree.zig`; README btree row `Landed`; tick 4A–4C, 4E; CHANGELOG
       (B+Tree format v1, new page and frame types) + `.version = "0.6.0"` in one PR, then tag.
       Verify: `gh release view v0.6.0` succeeds; `grep NotImplemented src/btree.zig` is empty.

@@ -1,11 +1,5 @@
 //! strata.btree — Page-based B+Tree: slotted nodes, split/merge, overflow pages,
-//! range cursors, bulk load.
-//!
-//! Planned files (see docs/PRD.md):
-//!   - `btree/node.zig`
-//!   - `btree/tree.zig`
-//!   - `btree/cursor.zig`
-//!   - `btree/overflow.zig`
+//! range cursors, WAL integration.
 //!
 //! Landed: `btree/node.zig` (ADR-0004 limits and leaf cell codec), `btree/internal.zig`
 //! (internal cell codec), `btree/split.zig` (split point by bytes), `btree/descend.zig`
@@ -15,7 +9,10 @@
 //! write, walk and assemble, freed through `frees_pending`; large values up to 1 MiB in
 //! `Tree.insert`, `delete`, `get`, the cursor and `validate`).
 //!
-//! Status: partial. Public declarations are added as PRD phases land.
+//! `Tree.attach` logs each insert and delete as one `page_images` WAL frame (ADR-0004 rules A,
+//! B and C); recovery replays it through `wal.PageRedo`. Bulk load is not implemented.
+//!
+//! Status: landed (format v1, ADR-0004).
 
 const std = @import("std");
 
@@ -30,12 +27,6 @@ pub const tree = @import("btree/tree.zig");
 pub const Tree = tree.Tree;
 pub const cursor = @import("btree/cursor.zig");
 pub const Cursor = cursor.Cursor;
-
-/// Module-level error set. Extend as functionality lands; keep names descriptive
-/// (`error.ChecksumMismatch`, not `error.Invalid`).
-pub const Error = error{
-    NotImplemented,
-};
 
 test "btree: module compiles" {
     std.testing.refAllDecls(@This());
