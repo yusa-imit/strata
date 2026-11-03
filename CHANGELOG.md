@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+- `Tree.insert` and `Tree.delete` with a writer attached assert the pool's WAL gate is on.
+
+### Tests
+- Replay onto the live page file after `free_at` trunk stamps (rule B), and a failing `free_at`
+  in `release_frees` keeps ids queued without a double free.
+
 ## [0.6.0] - 2026-11-02
 
 B+Tree engine (Phase 4a, ADR-0004 format v1) with WAL integration. A log containing the new

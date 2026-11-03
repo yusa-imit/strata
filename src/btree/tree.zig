@@ -168,7 +168,8 @@ pub const Tree = struct {
     /// tree does not own `writer` or `track`; the pool has at least
     /// `track.len + 2 * height_max + 2` frames, so tracked pages alone can never pin it into a
     /// self-latch (`PoolExhausted` becomes `Failed`).
-    /// The caller turns the pool's WAL gate on (`set_durable_lsn`) and commits.
+    /// The caller turns the pool's WAL gate on (`set_durable_lsn`, even at 0) before the first
+    /// logged `insert` or `delete` (both assert `pool.gate_on`), and commits.
     pub fn attach(self: *Tree, writer: *wal_writer.Writer, track: []u32) void {
         const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
         assert(self.writer == null);
@@ -251,10 +252,13 @@ pub const Tree = struct {
     /// be known up front (`KeyTooLarge`, `ValueTooLarge`, `FreesPendingLimit`, `HeightLimit`,
     /// `PoolExhausted`, `NoSpaceLeft`, `Corrupted`, read errors) are returned before the first
     /// byte of an existing page moves; the chain pages of a failed insert are new pages.
+    /// With a writer attached the caller must have turned the pool's WAL gate on (asserted):
+    /// without it the pool could write back a page whose frame is not durable.
     pub fn insert(self: *Tree, io: Io, key: []const u8, value: []const u8) InsertError!void {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
         const writer = self.writer orelse return self.insert_core(io, key, value);
+        assert(self.pool.gate_on); // Attach contract: the caller turned the WAL gate on.
         if (self.failed) return error.Failed;
         assert(!self.pool.track_on);
         self.op_popped = self.pool.pages.freelist_head != null;
@@ -547,10 +551,12 @@ pub const Tree = struct {
     /// With a writer attached it mirrors `insert`: one `page_images` frame with every live page
     /// the delete dirtied (merge, borrow and root collapse together; unlinked pages left out),
     /// none for an absent key. A failed log append latches the tree (`error.Failed`).
+    /// With a writer attached the caller must have turned the pool's WAL gate on (asserted).
     pub fn delete(self: *Tree, io: Io, key: []const u8) DeleteError!bool {
         assert(self.page_size == self.pool.page_size);
         assert(self.root != .file_header);
         const writer = self.writer orelse return self.delete_core(io, key);
+        assert(self.pool.gate_on); // Attach contract: the caller turned the WAL gate on.
         if (self.failed) return error.Failed;
         assert(!self.pool.track_on);
         self.op_popped = false; // A delete allocates nothing: no rule A sync is owed.

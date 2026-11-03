@@ -9,6 +9,7 @@ const testing = std.testing;
 const header = @import("../page/header.zig");
 const sfx = @import("../wal/segment_fixtures.zig");
 const fault_io = @import("../testing/fault_io.zig");
+const redo = @import("../wal/redo.zig");
 const overflow = @import("overflow.zig");
 const tfx = @import("tree_fixtures.zig");
 const tree_mod = @import("tree.zig");
@@ -337,4 +338,108 @@ test "FreesPendingLimit with a writer leaves the tree usable and logs nothing" {
     env.tree.frees_pending = env.frees[0..];
     try testing.expect(try env.tree.delete(testing.io, "big")); // The tree still works.
     try tfx.expect_get(&env.tree, "big", null);
+}
+
+/// Fills the tree, deletes all but `keep` keys (pages unlink), commits the log, flushes the pool
+/// and queues nothing more. Returns how many ids wait for `release_frees`.
+fn unlink_and_commit(env: *Env, count: u32, keep: u32) !u32 {
+    assert(count > keep);
+    assert(env.tree.writer != null);
+    try wal_test.insert_range(&env.tree, 0, count);
+    try delete_plain(&env.tree, 0, count - keep);
+    try env.writer.sync(testing.io);
+    env.pool.set_durable_lsn(env.writer.durable_lsn);
+    try env.pool.flushAll(testing.io);
+    try testing.expect(env.tree.frees_len > 0);
+    try testing.expect(env.tree.frees_len <= env.frees.len);
+    return env.tree.frees_len;
+}
+
+test "replay onto the live page file keeps the trunks that release_frees stamped" {
+    for (sizes) |size| {
+        var env: Env = undefined;
+        try env.start(size, .none);
+        defer env.stop();
+
+        const count: u32 = 600;
+        const keep: u32 = 50;
+        const pending = try unlink_and_commit(&env, count, keep);
+        assert(pending > 0);
+        assert(env.pool.gate_on);
+        try testing.expectEqual(pending, try env.tree.release_frees(testing.io));
+        try testing.expect(env.pm.freelist_head != null);
+        // A logged insert pops the head trunk: its lsn must not drop below the durable lsn.
+        try wal_test.insert_range(&env.tree, count, count + 20);
+        try env.writer.sync(testing.io);
+        const pages = env.pm.page_count;
+        const root = env.tree.root;
+        env.crash();
+
+        var page_redo: redo.PageRedo = undefined;
+        try redo.PageRedo.init(&page_redo, testing.allocator, &env.pm);
+        defer page_redo.deinit(testing.allocator);
+
+        try wal_test.replay_log(&env, &page_redo); // Old page images meet the live trunks.
+        var frees: [8]Id = undefined;
+        var live: Tree = undefined;
+        try Tree.open(&live, &env.pool, root, &frees, &tfx.value_buf);
+        try live.validate(testing.io, testing.allocator);
+        try wal_test.expect_range(&live, 0, count - keep, false);
+        try wal_test.expect_range(&live, count - keep, count + 20, true);
+        try testing.expect(env.pm.freelist_head != null);
+        try wal_test.insert_range(&live, count + 20, count + 60); // Allocates from the freelist.
+        try testing.expectEqual(pages, env.pm.page_count); // Freed ids were reused.
+        try live.validate(testing.io, testing.allocator);
+    }
+}
+
+fn id_less(_: void, a: Id, b: Id) bool {
+    assert(a != .file_header);
+    assert(b != .file_header);
+    return @intFromEnum(a) < @intFromEnum(b);
+}
+
+/// Allocating `want.len` times returns exactly the ids in `want` (any order, each once), then
+/// the freelist is empty and the file grows. Sorts `want` in place.
+fn expect_exact_reuse(env: *Env, want: []Id) !void {
+    assert(want.len <= env.frees.len);
+    assert(env.pm.freelist_head != null);
+    var got: [512]Id = undefined;
+    for (got[0..want.len]) |*slot| slot.* = try env.pm.allocate(testing.io);
+    std.mem.sort(Id, want, {}, id_less);
+    std.mem.sort(Id, got[0..want.len], {}, id_less);
+    try testing.expectEqualSlices(Id, want, got[0..want.len]);
+    try testing.expect(env.pm.freelist_head == null);
+    const pages = env.pm.page_count;
+    const grown = try env.pm.allocate(testing.io);
+    try testing.expectEqual(pages, @intFromEnum(grown));
+}
+
+test "a failed free keeps the ids queued and the retry frees each exactly once" {
+    for ([_]u32{ 0, 1, 2, 7 }) |after_calls| {
+        var env: Env = undefined;
+        try env.start(512, .none);
+        defer env.stop();
+
+        const pending = try unlink_and_commit(&env, 600, 50);
+        assert(pending > 0);
+        assert(pending <= env.frees.len);
+        var want: [512]Id = undefined;
+        @memcpy(want[0..pending], env.tree.frees_pending[0..pending]);
+        var faults: fault_io.FaultIo = undefined;
+        fault_io.FaultIo.init(&faults, testing.io, .{
+            .write = .canceled,
+            .read = .none,
+            .after_calls = after_calls,
+        });
+        try testing.expectError(error.Canceled, env.tree.release_frees(faults.io()));
+        const left = env.tree.frees_len;
+        try testing.expect(left > 0); // The failed id and those before it stay queued.
+        try testing.expect(left <= pending);
+        try testing.expectEqualSlices(Id, want[0..left], env.tree.frees_pending[0..left]);
+        try testing.expectEqual(left, try env.tree.release_frees(testing.io));
+        try testing.expectEqual(@as(u32, 0), env.tree.frees_len);
+        try testing.expectEqual(@as(u32, 0), try env.tree.release_frees(testing.io));
+        try expect_exact_reuse(&env, want[0..pending]);
+    }
 }

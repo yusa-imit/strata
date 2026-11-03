@@ -61,6 +61,8 @@ pub const Env = struct {
         try Tree.create(&self.tree, testing.io, &self.pool, &self.frees, vb);
         try wfx.open_ok(&self.writer, self.tmp.dir, wfx.opts(2, segment_bytes_max));
         self.tree.attach(&self.writer, &self.track);
+        self.pool.set_durable_lsn(0); // Attach contract: gate on, nothing durable yet.
+        assert(self.pool.gate_on);
         self.log_open = true;
         assert(self.tree.writer != null);
         assert(!self.tree.failed);
@@ -122,22 +124,7 @@ pub const Rebuilt = struct {
     pub fn replay(self: *Rebuilt, env: *Env) !void {
         assert(!env.log_open);
         assert(self.pm.page_count >= 1);
-        const segment_options = wfx.opts(2, segment_bytes_max);
-        const replay_options: recovery.ReplayOptions = .{
-            .from_lsn = 0,
-            .segment_options = .{
-                .segments_max = segment_options.segments_max,
-                .sync_policy = .none,
-            },
-        };
-        const target = self.redo.apply_target();
-        _ = try recovery.Recovery.replay(
-            testing.io,
-            testing.allocator,
-            env.tmp.dir,
-            target,
-            replay_options,
-        );
+        try replay_log(env, &self.redo);
         assert(self.redo.stats.applied >= 1);
     }
 
@@ -150,6 +137,29 @@ pub const Rebuilt = struct {
         self.pm.close(testing.io);
     }
 };
+
+/// Replays the crashed `env` log from lsn 0 through `page_redo`, onto whichever page file it
+/// was built over (a fresh one for `Rebuilt`, the live one for ADR-0004 rule B path (c)).
+pub fn replay_log(env: *Env, page_redo: *redo.PageRedo) !void {
+    assert(!env.log_open);
+    assert(page_redo.buf.len == env.pm.page_size);
+    const segment_options = wfx.opts(2, segment_bytes_max);
+    const replay_options: recovery.ReplayOptions = .{
+        .from_lsn = 0,
+        .segment_options = .{
+            .segments_max = segment_options.segments_max,
+            .sync_policy = .none,
+        },
+    };
+    const target = page_redo.apply_target();
+    _ = try recovery.Recovery.replay(
+        testing.io,
+        testing.allocator,
+        env.tmp.dir,
+        target,
+        replay_options,
+    );
+}
 
 pub fn value_of(buf: []u8, n: u32) []const u8 {
     assert(buf.len >= 40);

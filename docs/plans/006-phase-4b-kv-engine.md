@@ -21,7 +21,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
 `io-field`); `kv` never branches on `builtin.os.tag`; every `kv` buffer (frames, `frees`,
 `track`, `value_buf`, batch) is allocated in `Db.open`.
 
-- [ ] **B+Tree durability debts** (`src/btree/tree_wal_delete_test.zig`, `src/btree/tree.zig`).
+- [x] **B+Tree durability debts** (`src/btree/tree_wal_delete_test.zig`, `src/btree/tree.zig`).
       kv recovery stands on untested paths: replay onto the *live* page file after `free_at`
       stamped a trunk (rule B, path c); a failing `free_at` in `release_frees` returns the error
       and keeps unfreed ids queued (no double free on retry); attached ops assert
