@@ -337,6 +337,8 @@ pub fn insert_logged_run(fixture: *Fixture) RunError!Result {
     const env = &fixture.logged;
     try Tree.create(&env.tree, fixture.io, &env.pool, &env.frees, fixture.value_buf);
     env.tree.attach(&fixture.writer, &fixture.track);
+    env.pool.set_durable_lsn(0); // Attach contract: the WAL gate is on before the first insert.
+    assert(env.pool.gate_on);
     return insert_run(&env.tree, fixture.io, fixture.options.logged_key_count);
 }
 
