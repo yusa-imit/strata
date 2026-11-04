@@ -392,4 +392,5 @@ fn id_valid(pool: *const BufferPool, id: Id) bool {
 
 test {
     _ = @import("cursor_test.zig"); // Contract tests live in their own file (800-line limit).
+    _ = @import("cursor_corrupt_test.zig"); // Crafted-page `Corrupted` tests.
 }

@@ -695,6 +695,7 @@ test {
     _ = @import("tree_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("split_tree_test.zig");
     _ = @import("delete_tree_test.zig");
+    _ = @import("delete_corrupt_test.zig");
     _ = @import("validate_test.zig");
     _ = @import("overflow_test.zig");
     _ = @import("overflow_fail_test.zig");

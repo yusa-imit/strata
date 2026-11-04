@@ -26,7 +26,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       stamped a trunk (rule B, path c); a failing `free_at` in `release_frees` returns the error
       and keeps unfreed ids queued (no double free on retry); attached ops assert
       `pool.gate_on`. Verify: the new tests fail on a mutant (trunk lsn not kept at max).
-- [ ] **Crafted-page `Corrupted` tests** (`src/btree/delete_tree_test.zig`, `cursor_test.zig`).
+- [x] **Crafted-page `Corrupted` tests** (`src/btree/delete_tree_test.zig`, `cursor_test.zig`).
       Disk bytes are untrusted and cycles 68-70 reviews found real defects here: one sealed
       crafted page per `Corrupted` branch of `plan_merge`, `plan_level`, cursor `next/prev/
       step_back/left_sibling`; scans assert height 3. Verify: one named test per branch.
