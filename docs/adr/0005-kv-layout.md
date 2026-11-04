@@ -5,7 +5,8 @@
 - **Milestone**: plan `docs/plans/006-phase-4b-kv-engine.md`, item "ADR-0005 — kv layout v1"
 - **Applies to**: `docs/PRD.md` §4.8 (`kv`), §4.5 (one new frame type), §4.4 (the pool gate as
   the batch boundary)
-- **Supersedes**: PRD §4.8's `Options` block (default field values; `engine = .lsm`). It also
+- **Supersedes**: PRD §4.8's `Options` block (all field defaults removed; the `lsm` variant is
+  dropped until Phase 5). It also
   supersedes ADR-0004's rejection of a `commit` frame type, for kv logs only (§8).
 - **Depends on**: ADR-0001 (§2: `kv.Db` is the one type that caches an `Io`), ADR-0002 (page 0,
   `wal_lsn`, `Unwritten`, freelist, §6 sector atomicity), ADR-0003 (§1 names, §6 reserved types
@@ -127,14 +128,17 @@ because removing files `kv` cannot prove it made would be data loss.
 1. `PageManager.open(pages.db)`: lock, page 0, `page_size == options.page_size` (else
    `Corrupted`).
 2. `page_count >= 2`, else `Corrupted`.
-3. Open `wal/`, then a `reader.Reader.open` probe: `live_count >= 1`, else `Corrupted`. A
-   missing `wal` is `Corrupted`. This holds **whatever `wal_lsn` is**: by §3, a complete
+3. Open `wal/`, then a `reader.Reader.open` probe: `live_count >= 1`, else `Corrupted`. The
+   probe is `deinit`ed before step 4 (readers take segment locks). A missing `wal` is
+   `Corrupted`. This holds **whatever `wal_lsn` is**: by §3, a complete
    database always has a log, and reclaim never deletes the newest segment. It closes ADR-0003
    OQ3 for `wal_lsn = 0` too.
 4. `R = checkpoint.redo_start(io, gpa, wal_dir, pm.wal_lsn, segment_options)`. `wal_lsn != 0`
    with the frame gone, or not a `checkpoint`, is `Corrupted` (its existing rule).
 5. Commit-bounded replay (§8): pass 1 `Recovery.replay(from = R)` into `CommitScan` finds the
-   last commit point `K` and repairs a torn tail. Then `Recovery.truncate_after(K)`. Pass 2
+   last commit point `K` and repairs a torn tail. Then `Recovery.truncate_after(K)`; with
+   `K = 0` (no commit point) it cuts segment 1 to its header and deletes newer segments, so
+   `Writer.init` reports `last_lsn == 0`. Pass 2
    `Recovery.replay(from = R)` into `PageRedo` (`PageRedo.init` / `apply_target`) applies every
    frame `<= K`.
 6. `PageManager.sync`: redo writes are not synced by `PageRedo`. Then the root check (§2).
@@ -290,15 +294,20 @@ fallback** named in plan 006 Risks.
 - **Group.** A group is one `put`, one `delete`, or one `WriteBatch.commit`. Ops run through the
   unchanged tree: one `page_images` frame per op, overflow chains first (rule C). Then `Db`
   appends one `commit` frame with `first_lsn` = the writer's `next_lsn` at group start, and
-  commits it. An empty batch appends nothing.
+  commits it. A group that appended no `page_images` frame (an absent-key `delete`, an empty
+  or no-op batch) appends no `commit` frame and is not a commit point; `first_lsn < lsn` holds
+  otherwise. A group can still hit `SegmentLimit` mid-way (the §7 headroom is checked once per
+  op, and an open group cannot be reclaimed): that latches the `Db` like `HeightLimit`. Pages
+  popped or grown by an uncommitted group leak after a crash, which is safe (ADR-0002 §7).
 - **Commit points** are `commit` frames and `checkpoint` frames. `Checkpoint.run` runs only
   between groups (asserted), so every frame before a checkpoint is committed.
 - **Log invariant.** Every frame `<= K` (the last commit point) belongs to a committed group.
   Frames after `K` are one unfinished group. Recovery (§4 step 5) applies `<= K` and truncates
   the rest, so the invariant survives the next append.
-- **Validation.** Pass 1 checks each `commit` frame's `first_lsn` against the end of the
-  previous commit point, or `R`'s successor, or `lsn_first`. A mismatch is `Corrupted`
-  (holes, foreign frames).
+- **Validation.** Pass 1 checks each `commit` frame's `first_lsn` against the previous commit
+  point plus one. For the first group after a checkpoint that point is `R`, the checkpoint
+  frame itself (`Checkpoint.run` writes `redo_lsn` = its own lsn); with no checkpoint it is
+  `lsn_first`. A mismatch is `Corrupted` (holes, foreign frames).
 - **No eviction before commit.** The gate (§7) keeps a group's dirty pages, chains included,
   resident. So they bound the pool:
 
