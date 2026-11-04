@@ -71,7 +71,7 @@ fn expect_entry(item: ?Entry, n: ?u32) !void {
     try testing.expectEqualSlices(u8, value_of(&value_buf, num), entry.value);
 }
 
-fn scan_model(size: u32, count: u32, seed: u64) !void {
+fn scan_model(size: u32, count: u32, seed: u64, height: ?u8) !void {
     assert(count > 0 and count < 100_000);
     assert(header.page_size_valid(size));
     var f: Fixture = undefined;
@@ -80,6 +80,12 @@ fn scan_model(size: u32, count: u32, seed: u64) !void {
 
     try fill_shuffled(&f, count, 1, seed);
     try f.tree.validate(testing.io, testing.allocator);
+    if (height) |want| { // Tree height is the root level plus one.
+        var root = try f.pool.fetch(testing.io, f.tree.root);
+        defer root.release();
+
+        try testing.expectEqual(want, root.bytes()[node.offset_level] + 1);
+    }
     var c: Cursor = undefined;
     Cursor.init(&c, &f.tree);
     defer c.release();
@@ -108,15 +114,15 @@ fn scan_model(size: u32, count: u32, seed: u64) !void {
 }
 
 test "cursor: forward and backward scans equal the sorted model at 512 B" {
-    try scan_model(512, 3000, 1);
+    try scan_model(512, 3000, 1, 3); // Height 3: the scan crosses level-1 boundaries.
 }
 
 test "cursor: forward and backward scans equal the sorted model at 4 KiB" {
-    try scan_model(4096, 3000, 2);
+    try scan_model(4096, 3000, 2, 2);
 }
 
 test "cursor: forward and backward scans equal the sorted model at 64 KiB" {
-    try scan_model(65536, 5000, 3);
+    try scan_model(65536, 5000, 3, null);
 }
 
 test "cursor: seek finds the lower bound of absent, first, before-first and past-last keys" {
