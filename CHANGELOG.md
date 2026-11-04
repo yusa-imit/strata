@@ -13,6 +13,8 @@ All notable changes to this project are documented in this file. The format foll
 ### Tests
 - Replay onto the live page file after `free_at` trunk stamps (rule B), and a failing `free_at`
   in `release_frees` keeps ids queued without a double free.
+- One sealed crafted page per `Corrupted` branch of delete (`plan_merge`, `plan_level`) and the
+  cursor (`next`, `prev`, step back, left sibling); cursor scans assert tree height 3 at 512 B.
 
 ## [0.6.0] - 2026-11-02
 
