@@ -290,6 +290,7 @@ pub const Compaction = struct {
 
 ### 4.8 `kv`
 
+- 디렉터리·루트 id·커밋 프레임·복구 순서의 형식은 [ADR-0005](adr/0005-kv-layout.md) (kv layout v1)가 정한다.
 - `Db`는 이 라이브러리에서 **유일하게 `io: Io`를 필드로 캐시하는 타입**이다 — 열려 있는 동안 살아 있는
   서비스 객체이고(`std.http.Client`와 같은 모양), `put` 하나가 내부적으로 WAL append·그룹 커밋·
   페이지 축출·컴팩션을 유발한다. `get/put/delete/scan`에 `io`를 달면 모든 핫 콜사이트와 모든
