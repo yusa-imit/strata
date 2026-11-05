@@ -279,11 +279,16 @@ pub const Db = struct {
 
     /// Checkpoints (unless the database is already clean or latched) and releases everything.
     /// A failed checkpoint is not reported: the log keeps every committed change, and the next
-    /// `open` decides (it replays, or today refuses with `Corrupted`). Frees pending page ids
-    /// nowhere: they leak, which ADR-0002 section 7 calls safe.
+    /// `open` decides (it replays, or today refuses with `Corrupted`). Pending page ids
+    /// are freed first (best effort; an id that stays pending leaks, which ADR-0002 section 7
+    /// calls safe).
     pub fn close(self: *Db) void {
         const state = self.live();
         const io = self.io;
+        if (!state.failed) {
+            // Best effort, like the checkpoint: an id that stays pending leaks, which is safe.
+            if (state.tree.release_frees(io)) |_| {} else |_| {}
+        }
         if (!state.failed and state.writer.last_lsn != state.pm.wal_lsn) {
             if (state.cp.run(io)) |_| {} else |_| {} // See the doc: the log still holds it all.
         }
@@ -298,6 +303,14 @@ pub const Db = struct {
         self.gpa.free(state.value_buf);
         self.gpa.destroy(state);
         self.* = undefined;
+    }
+
+    /// Page ids unlinked by deletes that wait for `release_frees` (a diagnostic): they are
+    /// freed at the start of the next write or `flush`, and by `close`.
+    pub fn pending_frees(self: *const Db) u32 {
+        const state = self.live();
+        assert(state.tree.frees_len <= state.frees.len);
+        return state.tree.frees_len;
     }
 
     /// The effective key limit: `min(options.key_len_max, node.key_len_max(page_size))`.
@@ -440,7 +453,9 @@ fn map_missing(err: anyerror) Error {
     };
 }
 
-/// `RecoveryRequired` from `Writer.init` means another process touched the log: `Corrupted`.
+/// `RecoveryRequired` from `Writer.init` is a torn tail: another process touched the log, or a
+/// crash cut the last frame. Replay and tail repair are item "Recovery on open"; until then
+/// the directory is `Corrupted`.
 fn map_init(err: anyerror) Error {
     assert(@errorName(err).len >= 1);
     assert(@intFromError(err) != 0);
@@ -498,8 +513,9 @@ fn open_runtime(state: *State, gpa: Allocator, fresh: bool) Error!void {
         try create_root(state);
     } else {
         try check_root(state);
-        tree_mod.Tree.open(&state.tree, &state.pool, root_id, state.frees, state.value_buf) catch {
-            return error.Corrupted;
+        const tree = &state.tree;
+        tree_mod.Tree.open(tree, &state.pool, root_id, state.frees, state.value_buf) catch |err| {
+            return map(err);
         };
     }
     state.tree.attach(&state.writer, state.track);

@@ -59,8 +59,9 @@ pub fn map(err: anyerror) Error {
         error.SegmentLimit => error.SegmentLimit,
         error.LsnExhausted => error.LsnExhausted,
         error.Failed, error.InvalidHeader => error.Failed,
-        // Sized away by the pool and frees floors that `Db.open` asserts (ADR-0005 section 8).
-        error.PoolExhausted, error.FreesPendingLimit => unreachable,
+        // The floors `Db.open` asserts make these impossible (ADR-0005 section 8); if a
+        // miscount ever lets one through, the latch is safer than a panic.
+        error.PoolExhausted, error.FreesPendingLimit => error.Failed,
         else => error.InputOutput,
     };
 }

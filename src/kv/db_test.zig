@@ -460,3 +460,45 @@ test "db: the log stays bounded by checkpoints under many writes" {
 
     try fx.check(&db, scratch, options.value_len_max, 400, 1, true);
 }
+
+test "db: close frees the pages a delete left pending" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const options = fx.options(512, .none);
+    const scratch = try testing.allocator.alloc(u8, options.value_len_max);
+    defer testing.allocator.free(scratch);
+
+    var db = try open_in(&tmp, options);
+    try fx.fill(&db, scratch, options.value_len_max, 400, 0);
+    try db.flush();
+    var key_buf: [8]u8 = undefined;
+    var n: u32 = 0;
+    while (db.pending_frees() == 0) : (n += 1) { // Stop at the first delete that unlinks pages.
+        try testing.expect(n < 400);
+        try testing.expect(try db.delete(fx.key_of(&key_buf, n)));
+    }
+    try testing.expect(db.pending_frees() > 0);
+    db.close();
+
+    var sub = try sub_dir(&tmp);
+    defer sub.close(testing.io);
+
+    var pm: manager.PageManager = undefined;
+    try manager.PageManager.open(&pm, testing.io, sub, "pages.db", .{
+        .page_size = 512,
+        .page_count_max = options.page_count_max,
+        .sync_policy = .none,
+    });
+    const freed = pm.freelist_head != null; // Nothing was freed before close did.
+    const count_before = pm.page_count;
+    pm.close(testing.io); // Releases the database lock.
+    try testing.expect(freed);
+
+    db = try open_in(&tmp, options);
+    defer db.close();
+
+    try testing.expectEqual(@as(u32, 0), db.pending_frees());
+    try fx.fill(&db, scratch, options.value_len_max, 8, 1);
+    try testing.expect(count_before >= 2);
+}

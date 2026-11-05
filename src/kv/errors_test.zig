@@ -48,10 +48,12 @@ test "errors: map sends each lower variant group to its kv variant" {
         .{ .from = error.LsnExhausted, .want = error.LsnExhausted },
         .{ .from = error.Failed, .want = error.Failed },
         .{ .from = error.InvalidHeader, .want = error.Failed },
+        .{ .from = error.PoolExhausted, .want = error.Failed },
+        .{ .from = error.FreesPendingLimit, .want = error.Failed },
         .{ .from = error.InputOutput, .want = error.InputOutput },
         .{ .from = error.SystemResources, .want = error.InputOutput },
         .{ .from = error.PayloadTooLarge, .want = error.InputOutput },
     };
-    assert(cases.len == 23);
+    assert(cases.len == 25);
     for (cases) |case| try testing.expectEqual(case.want, errors.map(case.from));
 }
