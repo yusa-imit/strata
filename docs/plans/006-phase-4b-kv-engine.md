@@ -30,7 +30,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       Disk bytes are untrusted and cycles 68-70 reviews found real defects here: one sealed
       crafted page per `Corrupted` branch of `plan_merge`, `plan_level`, cursor `next/prev/
       step_back/left_sibling`; scans assert height 3. Verify: one named test per branch.
-- [ ] **ADR-0005 — kv layout v1** (`docs/adr/0005-kv-layout.md`). Format before bytes. Fixes: the
+- [x] **ADR-0005 — kv layout v1** (`docs/adr/0005-kv-layout.md`). Format before bytes. Fixes: the
       directory (page file, `wal/`, names, exclusive lock); the root id (recommend page 1, first
       allocation of `create`, type-checked on open: no meta page, no page-0 image, ADR-0003 OQ2);
       create durable before `open` returns, a half-created directory → `Corrupted`; the open

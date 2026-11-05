@@ -10,6 +10,11 @@ All notable changes to this project are documented in this file. The format foll
 ### Changed
 - `Tree.insert` and `Tree.delete` with a writer attached assert the pool's WAL gate is on.
 
+### Docs
+- ADR-0005 kv layout v1: directory names, root = page 1, create and open order, a `commit`
+  frame (WAL type 4, reserved id) for batch atomicity. A v0.6.0 reader rejects such a log as
+  `Corrupted`.
+
 ### Tests
 - Replay onto the live page file after `free_at` trunk stamps (rule B), and a failing `free_at`
   in `release_frees` keeps ids queued without a double free.
