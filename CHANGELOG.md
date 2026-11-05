@@ -7,7 +7,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- `kv.Db` (`src/kv/db.zig`): `open` creates a database in an empty directory (page file, `wal/`,
+  root at page 1, ADR-0005) and reopens a cleanly closed one; `put`, `get`, `delete`, `flush`,
+  `close`. Reopening a directory whose log needs replay returns `Corrupted` until recovery lands.
+
 ### Changed
+- `kv.Error` no longer has `NotImplemented`.
 - `Tree.insert` and `Tree.delete` with a writer attached assert the pool's WAL gate is on.
 
 ### Docs

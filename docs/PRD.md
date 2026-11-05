@@ -299,13 +299,19 @@ pub const Compaction = struct {
   서로 다른 `Io` 아래에서 섞어 쓰는 것은 계약 위반이다.
 
 ```zig
+// 기본값 없음 — 모든 필드를 호출부에서 적는다 (ADR-0005 §5, Tiger Style 1.15).
 pub const Options = struct {
-    engine: enum { btree, lsm } = .btree,
-    sync_policy: file.SyncPolicy = .fdatasync,
-    page_size: u32 = 4096,
-    pool_frames_max: u32 = 4096,
-    key_len_max: u32 = 1 << 10,
-    value_len_max: u32 = 1 << 20,
+    engine: enum { btree },        // lsm은 후속 계획
+    sync_policy: file.SyncPolicy,
+    page_size: u32,                // 2의 거듭제곱, 512..65536
+    page_count_max: u32,           // PageManager 성장 한도, >= 2
+    pool_frames_max: u32,          // >= pool_frames_min(options)
+    key_len_max: u32,              // 페이지 크기별 node.key_len_max로 clamp
+    value_len_max: u32,
+    batch_ops_max: u32,            // >= 1 (put/delete는 1개짜리 배치)
+    batch_bytes_max: u32,          // >= key_len_max + value_len_max
+    wal_segments_max: u32,         // >= 2: 체크포인트용 여유 세그먼트 1개
+    wal_segment_bytes_max: u64,
 };
 
 pub const Db = struct {
