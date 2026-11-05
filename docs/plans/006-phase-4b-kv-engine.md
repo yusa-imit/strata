@@ -39,7 +39,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       asserted; `key_len_max` clamped per page size (ADR-0004 OQ4); when `put` is durable per
       `SyncPolicy`; `release_frees` cadence; batch atomicity (recommend one `page_images` frame
       per batch under a static op bound); `Iterator` lifetime. Verify: merged; PRD §4.8 links it.
-- [ ] **`kv/db.zig` — create, put, get, delete, flush, close** (`src/kv/`). `Db.open` on an
+- [x] **`kv/db.zig` — create, put, get, delete, flush, close** (`src/kv/`). `Db.open` on an
       empty dir builds page file, WAL and a logged root tree; `put`/`delete` commit per
       `SyncPolicy`, raise the pool gate, `release_frees`. Verify: round trip at 512 B, 4 KiB,
       64 KiB; reopen after `close` sees every key; `FailingAllocator` armed after `open` holds.
