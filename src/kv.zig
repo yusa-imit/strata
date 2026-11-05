@@ -7,15 +7,18 @@
 //!   - `kv/iterator.zig`
 //!   - `kv/snapshot.zig`
 //!
-//! Status: stub. Public declarations are added as PRD phases land.
+//! Landed so far: `kv/db.zig` (`Db`: create, open after a clean close, put, get, delete,
+//! flush, close; ADR-0005). Recovery, batch and iterator follow.
+//!
+//! Status: in progress. Public declarations are added as PRD phases land.
 
 const std = @import("std");
 
-/// Module-level error set. Extend as functionality lands; keep names descriptive
-/// (`error.ChecksumMismatch`, not `error.Invalid`).
-pub const Error = error{
-    NotImplemented,
-};
+pub const db = @import("kv/db.zig");
+pub const Db = db.Db;
+pub const errors = @import("kv/errors.zig");
+/// Module-level error set (ADR-0005 section 10).
+pub const Error = errors.Error;
 
 test "kv: module compiles" {
     std.testing.refAllDecls(@This());
