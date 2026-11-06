@@ -5,7 +5,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
-const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const file_mod = @import("../file/file.zig");
 const db_mod = @import("db.zig");
 
@@ -105,6 +105,60 @@ pub fn check(
         try testing.expect(got != null);
         try testing.expectEqualSlices(u8, want, got.?);
     }
+}
+
+/// The on-disk state of an open database at this instant, as a new database directory `to`:
+/// `pages.db` and every `wal` segment, byte for byte. Every write that returned is in the OS
+/// already, so this is what a process crash leaves (no flush, no close, no checkpoint).
+pub fn crash_copy(dir: Io.Dir, from: []const u8, to: []const u8) !void {
+    assert(from.len >= 1);
+    assert(!std.mem.eql(u8, from, to));
+    const io = testing.io;
+    var src = try dir.openDir(io, from, .{ .iterate = true });
+    defer src.close(io);
+
+    try dir.createDir(io, to, .default_dir);
+    var dst = try dir.openDir(io, to, .{ .iterate = true });
+    defer dst.close(io);
+
+    try src.copyFile("pages.db", dst, "pages.db", io, .{});
+    try dst.createDir(io, "wal", .default_dir);
+    var src_wal = try src.openDir(io, "wal", .{ .iterate = true });
+    defer src_wal.close(io);
+
+    var dst_wal = try dst.openDir(io, "wal", .{ .iterate = true });
+    defer dst_wal.close(io);
+
+    var it = src_wal.iterate();
+    var copied: u32 = 0;
+    while (try it.next(io)) |entry| : (copied += 1) {
+        try testing.expect(copied < 1024); // Bound: a test log has a handful of segments.
+        try src_wal.copyFile(entry.name, dst_wal, entry.name, io, .{});
+    }
+}
+
+/// How many entries `<sub>/wal` has.
+pub fn wal_count(dir: Io.Dir, sub: []const u8) !u32 {
+    assert(sub.len >= 1);
+    assert(dir.handle >= 0);
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/wal", .{sub});
+    var wal = try dir.openDir(testing.io, path, .{ .iterate = true });
+    defer wal.close(testing.io);
+
+    var it = wal.iterate();
+    var count: u32 = 0;
+    while (try it.next(testing.io)) |_| count += 1;
+    return count;
+}
+
+/// The bytes of `<sub>/pages.db`; the caller frees them.
+pub fn pages_bytes(dir: Io.Dir, sub: []const u8) ![]u8 {
+    assert(sub.len >= 1);
+    assert(dir.handle >= 0);
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/pages.db", .{sub});
+    return dir.readFileAlloc(testing.io, path, testing.allocator, .limited(64 << 20));
 }
 
 /// Deletes the odd keys `0 ..< count`; each was present.

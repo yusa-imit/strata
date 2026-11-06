@@ -40,6 +40,7 @@ pub const GetError = Error;
 pub const PutError = Error;
 pub const DeleteError = Error;
 pub const FlushError = Error;
+pub const CheckpointError = Error;
 
 /// Maps a lower-layer error to its kv meaning; see the file header for the rule.
 pub fn map(err: anyerror) Error {
