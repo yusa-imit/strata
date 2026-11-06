@@ -12,7 +12,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const Error = error{
-    /// Untrusted bytes, half-created directories, a missing log, a log that needs replay.
+    /// Untrusted bytes, half-created directories, a missing log, a log that does not match the
+    /// page file.
     Corrupted,
     ChecksumMismatch,
     /// The database lock is held; `PageManager.create` found the file (a race).

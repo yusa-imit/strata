@@ -18,9 +18,11 @@
 //! Latch: a failed commit, checkpoint or tree op that left unlogged pages drops the pool and
 //! every later call is `Failed`; reopen recovers by replay.
 //! Allocation: `open` allocates the `State`, the pool, the writer buffer, `frees`, `track` and
-//! `value_buf`, and the redo page buffer (freed before `open` returns), and nothing else,
-//! ever; `gpa` is stored to free them in `close`. Only this file caches an `Io` (`Db.io`, set
-//! once, asserted equal to `State.io` by every method).
+//! `value_buf`, which stay until `close`, and nothing else after it returns. During `open`,
+//! `probe_log`, `redo_start` and `Recovery.replay` each open a log `Reader` that allocates via
+//! `gpa` and frees it before returning, and the redo page buffer is freed likewise. `gpa` is
+//! stored to free the long-lived buffers in `close`. Only this file caches an `Io` (`Db.io`,
+//! set once, asserted equal to `State.io` by every method).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -288,9 +290,8 @@ pub const Db = struct {
 
     /// Checkpoints (unless the database is already clean or latched) and releases everything.
     /// A failed checkpoint is not reported: the log keeps every committed change, and the next
-    /// `open` replays it. Pending page ids
-    /// are freed first (best effort; an id that stays pending leaks, which ADR-0002 section 7
-    /// calls safe).
+    /// `open` replays it. Pending page ids are freed first (best effort; an id that stays
+    /// pending leaks, which ADR-0002 section 7 calls safe).
     pub fn close(self: *Db) void {
         const state = self.live();
         const io = self.io;
@@ -503,7 +504,8 @@ fn replay_log(state: *State, gpa: Allocator) Error!checkpoint.Lsn {
         replay_options,
     ) catch |err| return map(err);
     state.pm.sync(io) catch |err| return map(err);
-    if (result.last_lsn < wal_lsn) return error.Corrupted; // The log ends before its checkpoint.
+    assert(result.last_lsn >= wal_lsn); // `redo_start` proved the log reaches its checkpoint.
+    assert(result.last_lsn >= from);
     return result.last_lsn;
 }
 

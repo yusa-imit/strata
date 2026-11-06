@@ -4,7 +4,13 @@
 //! Covered: replay at three page sizes, replay twice equals replay once, replay starting at the
 //! checkpoint (the older segments are gone), a bounded log, a missing or emptied log beside
 //! `wal_lsn` 0 and not 0, a crafted wrong-type root, a torn log tail, and no allocation after a
-//! recovering `open`.
+//! recovering `open`, a zeroed page 1, and a flipped byte in a mid-log frame.
+//!
+//! Deferred to plan item 10 (crash and fault matrix): the "redo ignores the page lsn" mutant.
+//! It needs a stale log beside newer pages, but a log older than the page file's `wal_lsn` is
+//! `Corrupted` by `redo_start` before any frame is applied, so no consistent crash image of
+//! it can be built here; the replay-twice test below covers idempotence from a replayed state.
+//! Also deferred: a `wal_lsn` that names no checkpoint frame (needs a crafted page file).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -299,6 +305,93 @@ test "recover: a sealed page 1 of another type is Corrupted" {
         try pm.sync(testing.io);
         pm.close(testing.io);
         try testing.expectError(error.Corrupted, open_named(&tmp, fx.sub_path, options));
+    }
+}
+
+/// Overwrites `bytes.len` bytes of `<sub>/<path>` at `offset`; the database must not be open.
+fn poke(
+    tmp: *testing.TmpDir,
+    sub_path: []const u8,
+    path: []const u8,
+    offset: u64,
+    bytes: []const u8,
+) !void {
+    assert(sub_path.len >= 1);
+    assert(bytes.len >= 1);
+    var sub = try tmp.dir.openDir(testing.io, sub_path, .{ .iterate = true });
+    defer sub.close(testing.io);
+
+    var file = try sub.openFile(testing.io, path, .{ .mode = .read_write });
+    defer file.close(testing.io);
+
+    try file.writePositionalAll(testing.io, bytes, offset);
+}
+
+test "recover: a zeroed (Unwritten) page 1 is Corrupted, pages unchanged" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const options = fx.options(512, .none);
+    var db = try open_named(&tmp, fx.sub_path, options);
+    try db.put("k", "v");
+    db.close();
+
+    const zeros: [512]u8 = @splat(0);
+    try poke(&tmp, fx.sub_path, "pages.db", 512, &zeros); // Page 1 starts at 1 * page_size.
+    const before = try fx.pages_bytes(tmp.dir, fx.sub_path);
+    defer testing.allocator.free(before);
+
+    try testing.expectError(error.Corrupted, open_named(&tmp, fx.sub_path, options));
+    const after = try fx.pages_bytes(tmp.dir, fx.sub_path);
+    defer testing.allocator.free(after);
+
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "recover: a flipped byte in a mid-log frame fails open, also on reopen" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const options = fx.options(4096, .none);
+    var db = try open_named(&tmp, fx.sub_path, options);
+    for (0..8) |n| {
+        var key_buf: [8]u8 = undefined;
+        try db.put(fx.key_of(&key_buf, @intCast(n)), "value");
+    }
+    try fx.crash_copy(tmp.dir, fx.sub_path, crash_name);
+    db.close();
+
+    const log_path = "wal/wal-00000001.log";
+    var sub = try tmp.dir.openDir(testing.io, crash_name, .{ .iterate = true });
+    defer sub.close(testing.io);
+
+    const size = (try sub.statFile(testing.io, log_path, .{})).size;
+    try testing.expect(size >= 4096 * 4); // Eight page-image frames: the middle is inside one.
+    var flipped: [1]u8 = undefined;
+    var log = try sub.openFile(testing.io, log_path, .{ .mode = .read_write });
+    defer log.close(testing.io);
+
+    const at = @divFloor(size, 2);
+    try testing.expectEqual(@as(usize, 1), try log.readPositionalAll(testing.io, &flipped, at));
+    flipped[0] ^= 0xff;
+    try log.writePositionalAll(testing.io, &flipped, at);
+    if (open_named(&tmp, crash_name, options)) |*opened| {
+        var rec = opened.*;
+        rec.close();
+        return error.TestUnexpectedResult; // A damaged mid-log frame must not open.
+    } else |err| switch (err) {
+        error.Corrupted, error.ChecksumMismatch => {},
+        else => return err,
+    }
+    // The intact frames before the damaged one were redone (redo is idempotent, so a partial
+    // replay is safe), hence the page file may differ from before; the reopen must fail alike.
+    if (open_named(&tmp, crash_name, options)) |*opened| {
+        var rec = opened.*;
+        rec.close();
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.Corrupted, error.ChecksumMismatch => {},
+        else => return err,
     }
 }
 
