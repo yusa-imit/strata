@@ -12,7 +12,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const Error = error{
-    /// Untrusted bytes, half-created directories, a missing log, a log that needs replay.
+    /// Untrusted bytes, half-created directories, a missing log, a log that does not match the
+    /// page file.
     Corrupted,
     ChecksumMismatch,
     /// The database lock is held; `PageManager.create` found the file (a race).
@@ -40,6 +41,7 @@ pub const GetError = Error;
 pub const PutError = Error;
 pub const DeleteError = Error;
 pub const FlushError = Error;
+pub const CheckpointError = Error;
 
 /// Maps a lower-layer error to its kv meaning; see the file header for the rule.
 pub fn map(err: anyerror) Error {

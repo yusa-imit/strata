@@ -9,7 +9,6 @@ const testing = std.testing;
 const Io = std.Io;
 const header = @import("../page/header.zig");
 const manager = @import("../page/manager.zig");
-const writer_mod = @import("../wal/writer.zig");
 const node = @import("../btree/node.zig");
 const fx = @import("db_fixtures.zig");
 
@@ -386,29 +385,6 @@ test "db: a root page that is not a tree node is Corrupted" {
 
     const zeros = [_]u8{0} ** 512;
     try pages.writePositionalAll(testing.io, &zeros, 512); // Page 1 becomes `Unwritten`.
-    try testing.expectError(error.Corrupted, open_in(&tmp, fx.options(512, .none)));
-}
-
-test "db: a log with frames past the last checkpoint needs replay (item 5): Corrupted" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    try create_closed(&tmp, fx.options(512, .none));
-    var sub = try sub_dir(&tmp);
-    defer sub.close(testing.io);
-
-    var wal = try sub.openDir(testing.io, "wal", .{ .iterate = true });
-    defer wal.close(testing.io);
-
-    var writer: writer_mod.Writer = undefined;
-    const writer_options: writer_mod.Options = .{
-        .segments_max = 8,
-        .sync_policy = .none,
-        .segment_bytes_max = 1 << 21,
-    };
-    try writer_mod.Writer.init(&writer, testing.io, testing.allocator, wal, writer_options);
-    _ = try writer.append(testing.io, .record, "late");
-    writer.deinit(testing.io, testing.allocator);
     try testing.expectError(error.Corrupted, open_in(&tmp, fx.options(512, .none)));
 }
 
