@@ -43,7 +43,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       empty dir builds page file, WAL and a logged root tree; `put`/`delete` commit per
       `SyncPolicy`, raise the pool gate, `release_frees`. Verify: round trip at 512 B, 4 KiB,
       64 KiB; reopen after `close` sees every key; `FailingAllocator` armed after `open` holds.
-- [ ] **Recovery on open, `Db.checkpoint`** (`src/kv/db.zig`). An existing directory replays
+- [x] **Recovery on open, `Db.checkpoint`** (`src/kv/db.zig`). An existing directory replays
       from `redo_start`, then attaches; `checkpoint` runs `wal.Checkpoint` and reclaims segments
       so the log stays bounded. Verify: crash (pool dropped, no flush) → reopen → same `get`s;
       reopen twice = once; after a checkpoint reopen replays only frames past `wal_lsn`; a

@@ -1,24 +1,26 @@
 //! strata.kv.Db: the embedded KV store over the B+Tree, the buffer pool, the page file and the
 //! WAL (ADR-0005). `open` creates a database in an empty directory (page file `pages.db`, log
-//! directory `wal`, root = page 1) or reopens one that `close` shut down cleanly; `put`,
-//! `delete`, `get`, `flush` and `close` follow.
+//! directory `wal`, root = page 1) or reopens an existing one, replaying the log past the last
+//! checkpoint; `put`, `delete`, `get`, `checkpoint`, `flush` and `close` follow.
 //!
-//! Scope of this file today (plan 006 item "kv/db.zig"): sections 1 to 3 and 5 to 7 of the ADR.
-//! Not yet built: replay of a log with frames past the last checkpoint (section 4, item
-//! "Recovery on open"): such a directory is `Corrupted` here, never silently opened on stale
-//! pages. Commit frames and `WriteBatch` (section 8) are later items: today one `put` or
-//! `delete` is one `page_images` frame, which is atomic on its own, and `Writer.commit` of it is
-//! the durable point.
+//! Scope of this file today (plan 006 items "kv/db.zig" and "Recovery on open"): sections 1 to
+//! 7 of the ADR. Not yet built: the commit frame, commit-bounded replay and `WriteBatch`
+//! (section 8, later items): today one `put` or `delete` is one `page_images` frame, which is
+//! atomic on its own, and `Writer.commit` of it is the durable point, so recovery applies every
+//! intact frame.
 //!
 //! Durability: `put` and `delete` return after `Writer.commit` of their frame returned, then
 //! raise the pool gate to `writer.durable_lsn` (never above a durable commit point). `close`
 //! runs a checkpoint (all pages flushed and synced, `wal_lsn` = the last frame), so a clean
-//! reopen needs no replay: `open` accepts a log iff `writer.last_lsn == pm.wal_lsn`.
+//! reopen replays nothing but the checkpoint frame. After a crash, `open` runs `redo_start`
+//! from `wal_lsn`, one `Recovery.replay` into `PageRedo` (the page lsn makes redo idempotent),
+//! a `PageManager.sync`, and only then builds the writer and the pool.
 //! Latch: a failed commit, checkpoint or tree op that left unlogged pages drops the pool and
-//! every later call is `Failed`; reopen recovers (item "Recovery on open").
+//! every later call is `Failed`; reopen recovers by replay.
 //! Allocation: `open` allocates the `State`, the pool, the writer buffer, `frees`, `track` and
-//! `value_buf` and nothing else, ever; `gpa` is stored to free them in `close`. Only this file
-//! caches an `Io` (`Db.io`, set once, asserted equal to `State.io` by every method).
+//! `value_buf`, and the redo page buffer (freed before `open` returns), and nothing else,
+//! ever; `gpa` is stored to free them in `close`. Only this file caches an `Io` (`Db.io`, set
+//! once, asserted equal to `State.io` by every method).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -35,6 +37,8 @@ const file = @import("../file/file.zig");
 const platform = @import("../file/platform.zig");
 const checkpoint = @import("../wal/checkpoint.zig");
 const reader = @import("../wal/reader.zig");
+const recovery = @import("../wal/recovery.zig");
+const redo = @import("../wal/redo.zig");
 const segment = @import("../wal/segment.zig");
 const writer_mod = @import("../wal/writer.zig");
 const errors = @import("errors.zig");
@@ -45,6 +49,7 @@ pub const GetError = errors.GetError;
 pub const PutError = errors.PutError;
 pub const DeleteError = errors.DeleteError;
 pub const FlushError = errors.FlushError;
+pub const CheckpointError = errors.CheckpointError;
 
 const Id = header.Id;
 const map = errors.map;
@@ -245,11 +250,15 @@ pub const Db = struct {
     gpa: Allocator,
     state: *State,
 
-    /// Creates the database in an empty (or absent) `sub_path` of `dir`, or reopens one that
-    /// `close` shut down cleanly. A non-empty directory without `pages.db`, a half-created
-    /// database, a missing or empty `wal`, a root page that is no tree node and a log that
-    /// needs replay are `Corrupted`; a held database is `WouldBlock`. On error nothing stays
-    /// open, locked or allocated (a half-created directory stays on disk: delete it).
+    /// Creates the database in an empty (or absent) `sub_path` of `dir`, or reopens an existing
+    /// one: after a crash it replays every intact log frame past the last checkpoint and repairs
+    /// a torn log tail, so every `put` and `delete` that returned is visible. A non-empty
+    /// directory without `pages.db`, a half-created database, a missing or empty `wal` (whatever
+    /// `wal_lsn` is; the page file stays unchanged), a root page that is no tree node and a
+    /// log that does not match the page file are `Corrupted`; a held database is `WouldBlock`.
+    /// On error nothing stays open, locked or allocated (a half-created directory stays on
+    /// disk: delete it). Cost: a few reads of the log from the checkpoint, so `checkpoint`
+    /// bounds the open time.
     pub fn open(
         io: Io,
         gpa: Allocator,
@@ -279,7 +288,7 @@ pub const Db = struct {
 
     /// Checkpoints (unless the database is already clean or latched) and releases everything.
     /// A failed checkpoint is not reported: the log keeps every committed change, and the next
-    /// `open` decides (it replays, or today refuses with `Corrupted`). Pending page ids
+    /// `open` replays it. Pending page ids
     /// are freed first (best effort; an id that stays pending leaks, which ADR-0002 section 7
     /// calls safe).
     pub fn close(self: *Db) void {
@@ -360,9 +369,23 @@ pub const Db = struct {
         return found;
     }
 
-    /// Frees queued page ids and checkpoints: every change is in the page file and `wal_lsn`
-    /// names the checkpoint frame.
+    /// Frees queued page ids and checkpoints; see `checkpoint`.
     pub fn flush(self: *Db) FlushError!void {
+        try self.checkpoint();
+        assert(self.state.pool.dirty_count == 0);
+        assert(self.state.pm.wal_lsn == self.state.writer.last_lsn);
+    }
+
+    /// Frees queued page ids, then runs a sharp checkpoint (flush, sync, `wal_lsn`, reclaim;
+    /// ADR-0005 section 7): every change is in the page file, `wal_lsn` names the checkpoint
+    /// frame, and the segments wholly below it are deleted. A clean `Db` (nothing logged since
+    /// the last checkpoint) does nothing. Precondition: no write is in flight (one caller per
+    /// `Db`, so always true between calls). This is what bounds the log: it holds at most
+    /// `wal_segments_max - 1` segments before a write, because every write checkpoints first
+    /// when it would not (`begin_write`); call it to shrink the log or the recovery time. A
+    /// failure latches the `Db` (`Failed` afterwards): the log still holds every committed
+    /// change, and `open` replays it. Errors are returned as `Error`.
+    pub fn checkpoint(self: *Db) CheckpointError!void {
         const state = try self.usable();
         try state.release(self.io);
         try state.run_checkpoint(self.io);
@@ -405,7 +428,7 @@ fn open_sub(state: *State, dir: Io.Dir, sub_path: []const u8) Error!bool {
     return empty;
 }
 
-/// C2 to C4 (create) or steps 1 to 3 and 7 of section 4 (open): page file, log directory and
+/// C2 to C4 (create) or steps 1 to 7 of section 4 (open): page file, log directory, replay and
 /// writer. On error everything opened here is closed again.
 fn open_files(state: *State, gpa: Allocator, fresh: bool) Error!void {
     const io = state.io;
@@ -431,16 +454,57 @@ fn open_files(state: *State, gpa: Allocator, fresh: bool) Error!void {
     };
     errdefer state.wal_dir.close(io);
 
-    if (!fresh) try probe_log(state, gpa);
+    var replayed: checkpoint.Lsn = 0; // A fresh log has no frame.
+    if (!fresh) {
+        try probe_log(state, gpa);
+        replayed = try replay_log(state, gpa);
+    }
     const writer_options = state.writer_options();
     writer_mod.Writer.init(&state.writer, io, gpa, state.wal_dir, writer_options) catch |err| {
         return map_init(err);
     };
-    if (!fresh and state.writer.last_lsn != state.pm.wal_lsn) {
-        state.writer.deinit(io, gpa); // Frames past the last checkpoint: replay (not built).
+    if (state.writer.last_lsn != replayed) {
+        state.writer.deinit(io, gpa); // The log changed under our lock: do not trust it.
         return error.Corrupted;
     }
     assert(!fresh or state.writer.last_lsn == 0);
+}
+
+/// Steps 4 to 6 of section 4: derives the start from `wal_lsn`, replays every frame from it
+/// into `PageRedo` (the torn tail is repaired by `Recovery`), then syncs the page file, because
+/// redo does not. Returns the last frame's lsn, where the writer continues. The redo page
+/// buffer is allocated here and freed before this returns. Idempotent: a crash anywhere in
+/// here replays again to the same pages (redo is guarded by the page lsn).
+fn replay_log(state: *State, gpa: Allocator) Error!checkpoint.Lsn {
+    const io = state.io;
+    const segment_options = state.segment_options();
+    const wal_lsn = state.pm.wal_lsn;
+    const from = checkpoint.redo_start(
+        io,
+        gpa,
+        state.wal_dir,
+        wal_lsn,
+        segment_options,
+    ) catch |err| return map(err);
+    assert(from <= wal_lsn);
+    var target: redo.PageRedo = undefined;
+    try redo.PageRedo.init(&target, gpa, &state.pm);
+    defer target.deinit(gpa);
+
+    const replay_options: recovery.ReplayOptions = .{
+        .from_lsn = from,
+        .segment_options = segment_options,
+    };
+    const result = recovery.Recovery.replay(
+        io,
+        gpa,
+        state.wal_dir,
+        target.apply_target(),
+        replay_options,
+    ) catch |err| return map(err);
+    state.pm.sync(io) catch |err| return map(err);
+    if (result.last_lsn < wal_lsn) return error.Corrupted; // The log ends before its checkpoint.
+    return result.last_lsn;
 }
 
 /// A missing file or directory where the layout needs one is a damaged database.
@@ -453,9 +517,8 @@ fn map_missing(err: anyerror) Error {
     };
 }
 
-/// `RecoveryRequired` from `Writer.init` is a torn tail: another process touched the log, or a
-/// crash cut the last frame. Replay and tail repair are item "Recovery on open"; until then
-/// the directory is `Corrupted`.
+/// `RecoveryRequired` from `Writer.init` is a torn tail after `replay_log` repaired it: another
+/// process touched the log under our lock, which is `Corrupted`.
 fn map_init(err: anyerror) Error {
     assert(@errorName(err).len >= 1);
     assert(@intFromError(err) != 0);
@@ -561,4 +624,5 @@ fn check_root(state: *State) Error!void {
 
 test {
     _ = @import("db_test.zig"); // Contract tests live in their own files (800-line limit).
+    _ = @import("db_recover_test.zig");
 }

@@ -10,7 +10,8 @@ All notable changes to this project are documented in this file. The format foll
 ### Added
 - `kv.Db` (`src/kv/db.zig`): `open` creates a database in an empty directory (page file, `wal/`,
   root at page 1, ADR-0005) and reopens a cleanly closed one; `put`, `get`, `delete`, `flush`,
-  `close`. Reopening a directory whose log needs replay returns `Corrupted` until recovery lands.
+  `close`. `open` on a crashed directory replays the log from the checkpoint (idempotent, a torn
+  tail is repaired), and `checkpoint` bounds the log and frees the page ids deletes left pending.
 
 ### Changed
 - `kv.Error` no longer has `NotImplemented`.
