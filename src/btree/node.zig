@@ -112,6 +112,14 @@ pub fn height_max(page_size: u32) u8 {
     return @intCast(@min(@as(u32, height_limit), @divFloor(images - 1, 2)));
 }
 
+/// Most distinct pages one tree operation touches: `2 * height_max + 1` (ADR-0005 section 8).
+pub fn op_pages_max(page_size: u32) u32 {
+    assert(header.page_size_valid(page_size));
+    const pages: u32 = 2 * @as(u32, height_max(page_size)) + 1;
+    assert(pages >= 3);
+    return pages;
+}
+
 comptime {
     for (0..8) |shift| {
         const ps: u32 = header.page_size_min << @intCast(shift);

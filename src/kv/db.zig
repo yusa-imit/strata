@@ -3,18 +3,19 @@
 //! directory `wal`, root = page 1) or reopens an existing one, replaying the log past the last
 //! checkpoint; `put`, `delete`, `get`, `checkpoint`, `flush` and `close` follow.
 //!
-//! Scope of this file today (plan 006 items "kv/db.zig" and "Recovery on open"): sections 1 to
-//! 7 of the ADR. Not yet built: the commit frame, commit-bounded replay and `WriteBatch`
-//! (section 8, later items): today one `put` or `delete` is one `page_images` frame, which is
-//! atomic on its own, and `Writer.commit` of it is the durable point, so recovery applies every
-//! intact frame.
+//! Scope of this file today (plan 006 items "kv/db.zig", "Recovery on open" and "Commit frame
+//! and commit-bounded recovery"): sections 1 to 8 of the ADR except `WriteBatch`. One `put` or
+//! `delete` is a group: its `page_images` frame(s), then one `commit` frame; a group that logged
+//! nothing (an absent-key `delete`) logs no `commit` frame and is not a commit point.
 //!
-//! Durability: `put` and `delete` return after `Writer.commit` of their frame returned, then
-//! raise the pool gate to `writer.durable_lsn` (never above a durable commit point). `close`
+//! Durability: `put` and `delete` return after `Writer.commit` of their `commit` frame returned,
+//! then raise the pool gate to it (the last commit point, never `writer.durable_lsn`). `close`
 //! runs a checkpoint (all pages flushed and synced, `wal_lsn` = the last frame), so a clean
 //! reopen replays nothing but the checkpoint frame. After a crash, `open` runs `redo_start`
-//! from `wal_lsn`, one `Recovery.replay` into `PageRedo` (the page lsn makes redo idempotent),
-//! a `PageManager.sync`, and only then builds the writer and the pool.
+//! from `wal_lsn`, a first `Recovery.replay` into `CommitScan` (the last commit point `K`, a
+//! torn tail repaired), `Recovery.truncate_after(K)`, a second replay into `PageRedo` (the page
+//! lsn makes redo idempotent), a `PageManager.sync`, and only then builds the writer and the
+//! pool. No frame past `K` is ever applied, and the log ends at `K` before the writer appends.
 //! Latch: a failed commit, checkpoint or tree op that left unlogged pages drops the pool and
 //! every later call is `Failed`; reopen recovers by replay.
 //! Allocation: `open` allocates the `State`, the pool, the writer buffer, `frees`, `track` and
@@ -38,6 +39,8 @@ const tree_mod = @import("../btree/tree.zig");
 const file = @import("../file/file.zig");
 const platform = @import("../file/platform.zig");
 const checkpoint = @import("../wal/checkpoint.zig");
+const commit_scan = @import("../wal/commit_scan.zig");
+const frame = @import("../wal/frame.zig");
 const reader = @import("../wal/reader.zig");
 const recovery = @import("../wal/recovery.zig");
 const redo = @import("../wal/redo.zig");
@@ -108,7 +111,7 @@ pub fn pool_frames_min(options: Options) u32 {
 fn track_len(options: Options) u32 {
     assert(options.value_len_max <= node.value_len_max);
     assert(header.page_size_valid(options.page_size));
-    const ops_max: u32 = 2 * @as(u32, node.height_max(options.page_size)) + 1;
+    const ops_max: u32 = node.op_pages_max(options.page_size);
     return @max(ops_max, overflow.chain_len(options.page_size, options.value_len_max));
 }
 
@@ -147,6 +150,8 @@ const State = struct {
     frees: []Id,
     track: []u32,
     value_buf: []u8,
+    /// The last commit point: a `commit` or `checkpoint` frame, or 0. The pool gate (section 7).
+    commit_lsn: frame.Lsn,
     failed: bool,
 
     fn manager_options(self: *const State) manager.Options {
@@ -201,6 +206,7 @@ const State = struct {
     fn run_checkpoint(self: *State, io: Io) Error!void {
         assert(!self.failed);
         assert(self.pool.pinned_count() == 0);
+        assert(self.writer.last_lsn == self.commit_lsn or self.commit_lsn == 0); // Between groups.
         if (self.writer.last_lsn == self.pm.wal_lsn) return; // Clean: nothing to checkpoint.
         _ = self.cp.run(io) catch |err| {
             self.latch();
@@ -208,20 +214,30 @@ const State = struct {
         };
         assert(self.pool.dirty_count == 0);
         assert(self.pm.wal_lsn == self.writer.last_lsn);
+        self.commit_lsn = self.writer.last_lsn; // A checkpoint frame is a commit point.
     }
 
-    /// Makes the frame an op appended durable (if it appended one) and raises the gate to the
-    /// writer's durable point. A failed commit latches the `Db`.
-    fn commit(self: *State, io: Io, last_before: u64) Error!void {
+    /// Closes the group an op ran: when it appended any frame, appends one `commit` frame whose
+    /// `first_lsn` is the writer's `next_lsn` at group start (`first_lsn`), makes it durable and
+    /// raises the gate to it (sections 7 and 8). A group with no frame is not a commit point.
+    /// A failed append or commit latches the `Db`: the group's pages are dropped.
+    fn commit(self: *State, io: Io, first_lsn: frame.Lsn) Error!void {
         assert(!self.failed);
-        assert(self.writer.last_lsn >= last_before);
-        if (self.writer.last_lsn == last_before) return; // No frame: not a commit point.
-        self.writer.commit(io, self.writer.last_lsn) catch |err| {
+        assert(self.writer.next_lsn >= first_lsn);
+        if (self.writer.next_lsn == first_lsn) return; // No frame: not a commit point.
+        const payload = frame.commit_payload(first_lsn);
+        const lsn = self.writer.append(io, .commit, &payload) catch |err| {
             self.latch();
             return map(err);
         };
-        self.pool.set_durable_lsn(self.writer.durable_lsn);
-        assert(self.writer.durable_lsn == self.writer.last_lsn);
+        self.writer.commit(io, lsn) catch |err| {
+            self.latch();
+            return map(err);
+        };
+        assert(self.writer.durable_lsn == lsn);
+        assert(lsn > first_lsn);
+        self.commit_lsn = lsn;
+        self.pool.set_durable_lsn(lsn); // The gate: the last commit point, never a bare frame.
     }
 
     /// The error of a failed tree op. The tree latches itself (and drops the pool) when it
@@ -277,6 +293,7 @@ pub const Db = struct {
         state.options = options;
         state.key_len_eff = @min(options.key_len_max, node.key_len_max(options.page_size));
         state.failed = false;
+        state.commit_lsn = 0;
         const fresh = try open_sub(state, dir, sub_path);
         errdefer state.sub.close(io);
 
@@ -351,10 +368,10 @@ pub const Db = struct {
         if (value.len > state.options.value_len_max) return error.ValueTooLarge;
         assert(value.len <= state.value_buf.len);
         try state.begin_write(self.io);
-        const last_before = state.writer.last_lsn;
+        const first_lsn = state.writer.next_lsn;
         state.tree.insert(self.io, key, value) catch |err| return state.fail(err);
-        try state.commit(self.io, last_before);
-        assert(state.writer.last_lsn > last_before);
+        try state.commit(self.io, first_lsn);
+        assert(state.commit_lsn > first_lsn);
     }
 
     /// Removes `key`; true when it was present. Durable on return when it was.
@@ -363,10 +380,10 @@ pub const Db = struct {
         if (key.len > state.key_len_eff) return error.KeyTooLarge;
         assert(key.len <= state.key_len_eff);
         try state.begin_write(self.io);
-        const last_before = state.writer.last_lsn;
+        const first_lsn = state.writer.next_lsn;
         const found = state.tree.delete(self.io, key) catch |err| return state.fail(err);
-        try state.commit(self.io, last_before);
-        assert(found or state.writer.last_lsn == last_before); // Absent key: no frame.
+        try state.commit(self.io, first_lsn);
+        assert(found or state.writer.next_lsn == first_lsn); // Absent key: no frame.
         return found;
     }
 
@@ -455,7 +472,7 @@ fn open_files(state: *State, gpa: Allocator, fresh: bool) Error!void {
     };
     errdefer state.wal_dir.close(io);
 
-    var replayed: checkpoint.Lsn = 0; // A fresh log has no frame.
+    var replayed: checkpoint.Lsn = 0; // A fresh log has no frame; else K, the last commit.
     if (!fresh) {
         try probe_log(state, gpa);
         replayed = try replay_log(state, gpa);
@@ -469,13 +486,15 @@ fn open_files(state: *State, gpa: Allocator, fresh: bool) Error!void {
         return error.Corrupted;
     }
     assert(!fresh or state.writer.last_lsn == 0);
+    state.commit_lsn = replayed;
 }
 
-/// Steps 4 to 6 of section 4: derives the start from `wal_lsn`, replays every frame from it
-/// into `PageRedo` (the torn tail is repaired by `Recovery`), then syncs the page file, because
-/// redo does not. Returns the last frame's lsn, where the writer continues. The redo page
-/// buffer is allocated here and freed before this returns. Idempotent: a crash anywhere in
-/// here replays again to the same pages (redo is guarded by the page lsn).
+/// Steps 4 to 6 of section 4: derives the start from `wal_lsn`, finds the last commit point `K`
+/// with a first pass into `CommitScan` (which also repairs a torn tail), cuts the log after
+/// `K`, replays the frames `<= K` into `PageRedo`, then syncs the page file, because redo does
+/// not. Returns `K`, where the writer continues. The redo page buffer is allocated here and
+/// freed before this returns. Idempotent: a crash anywhere in here runs again to the same pages
+/// (redo is guarded by the page lsn, the cut re-creates the same state).
 fn replay_log(state: *State, gpa: Allocator) Error!checkpoint.Lsn {
     const io = state.io;
     const segment_options = state.segment_options();
@@ -488,15 +507,34 @@ fn replay_log(state: *State, gpa: Allocator) Error!checkpoint.Lsn {
         segment_options,
     ) catch |err| return map(err);
     assert(from <= wal_lsn);
-    var target: redo.PageRedo = undefined;
-    try redo.PageRedo.init(&target, gpa, &state.pm);
-    defer target.deinit(gpa);
-
     const replay_options: recovery.ReplayOptions = .{
         .from_lsn = from,
         .segment_options = segment_options,
     };
-    const result = recovery.Recovery.replay(
+    var scan = commit_scan.CommitScan.init(from);
+    const first = recovery.Recovery.replay(
+        io,
+        gpa,
+        state.wal_dir,
+        scan.target(),
+        replay_options,
+    ) catch |err| return map(err);
+    const commit_last = scan.last_commit_lsn;
+    assert(commit_last <= first.last_lsn);
+    if (commit_last < first.last_lsn) { // Frames of an unfinished group follow `K`.
+        recovery.Recovery.truncate_after(
+            io,
+            gpa,
+            state.wal_dir,
+            commit_last,
+            segment_options,
+        ) catch |err| return map(err);
+    }
+    var target: redo.PageRedo = undefined;
+    try redo.PageRedo.init(&target, gpa, &state.pm);
+    defer target.deinit(gpa);
+
+    const second = recovery.Recovery.replay(
         io,
         gpa,
         state.wal_dir,
@@ -504,9 +542,10 @@ fn replay_log(state: *State, gpa: Allocator) Error!checkpoint.Lsn {
         replay_options,
     ) catch |err| return map(err);
     state.pm.sync(io) catch |err| return map(err);
-    assert(result.last_lsn >= wal_lsn); // `redo_start` proved the log reaches its checkpoint.
-    assert(result.last_lsn >= from);
-    return result.last_lsn;
+    // The log ends at `K` now, so no frame past it reached `PageRedo`.
+    assert(second.last_lsn == commit_last);
+    assert(commit_last >= wal_lsn); // `redo_start` proved the log reaches its checkpoint.
+    return commit_last;
 }
 
 /// A missing file or directory where the layout needs one is a damaged database.
@@ -584,7 +623,7 @@ fn open_runtime(state: *State, gpa: Allocator, fresh: bool) Error!void {
         };
     }
     state.tree.attach(&state.writer, state.track);
-    state.pool.set_durable_lsn(state.writer.durable_lsn); // The gate: the last commit point.
+    state.pool.set_durable_lsn(state.commit_lsn); // The gate: the last commit point (K).
     checkpoint.Checkpoint.init(&state.cp, &state.writer, &state.pool, &state.pm);
     assert(state.pool.gate_on);
     assert(state.pool.pinned_count() == 0);
@@ -627,4 +666,5 @@ fn check_root(state: *State) Error!void {
 test {
     _ = @import("db_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("db_recover_test.zig");
+    _ = @import("db_commit_test.zig");
 }

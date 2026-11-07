@@ -171,7 +171,7 @@ pub const Tree = struct {
     /// The caller turns the pool's WAL gate on (`set_durable_lsn`, even at 0) before the first
     /// logged `insert` or `delete` (both assert `pool.gate_on`), and commits.
     pub fn attach(self: *Tree, writer: *wal_writer.Writer, track: []u32) void {
-        const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
+        const ops_max: u32 = node.op_pages_max(self.page_size);
         assert(self.writer == null);
         assert(self.frees_len == 0); // Ids queued unlogged have no lsn to wait for (rule B).
         assert(self.pool.pinned_count() == 0);
@@ -353,7 +353,7 @@ pub const Tree = struct {
         if (self.op_popped) try pool.pages.sync(io); // Rule A: pops durable before a frame.
         const ids = pool.track[0..pool.track_len];
         std.mem.sort(u32, ids, {}, std.sort.asc(u32));
-        const ops_max: u32 = 2 * @as(u32, node.height_max(self.page_size)) + 1;
+        const ops_max: u32 = node.op_pages_max(self.page_size);
         if (ids.len > ops_max) return error.Failed;
         return try self.log_images(io, writer, ids);
     }
