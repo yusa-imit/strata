@@ -31,9 +31,16 @@ pub const frame_header_size: u32 = 17;
 pub const frame_bytes_max: u32 = 1 << 20;
 pub const payload_bytes_max: u32 = frame_bytes_max - frame_header_size;
 
-/// Frame type byte. 0 is never valid, 4..15 and 17..127 are reserved (16 is `page_images`,
-/// ADR-0004 section 9), 128..255 belong to consumers.
-pub const Type = enum(u8) { record = 1, page_image = 2, checkpoint = 3, page_images = 16, _ };
+/// Frame type byte. 0 is never valid, 5..15 and 17..127 are reserved (4 is `commit`, ADR-0005
+/// section 8; 16 is `page_images`, ADR-0004 section 9), 128..255 belong to consumers.
+pub const Type = enum(u8) {
+    record = 1,
+    page_image = 2,
+    checkpoint = 3,
+    commit = 4,
+    page_images = 16,
+    _,
+};
 
 /// `payload` borrows from the decoded image; valid until the caller's buffer is reused.
 pub const Frame = struct { lsn: Lsn, frame_type: Type, payload: []const u8 };
@@ -46,6 +53,7 @@ const offset_lsn: u32 = 8;
 const offset_type: u32 = 16;
 const page_id_size: u32 = 4;
 const checkpoint_payload_size: u32 = 8;
+const commit_payload_size: u32 = 8;
 /// `page_images` payload prefix: `count u32` then `page_size u32`.
 pub const images_prefix_size: u32 = 8;
 /// Most images a `page_images` payload can hold: the smallest page size fills the frame.
@@ -86,21 +94,24 @@ fn put(comptime T: type, bytes: []u8, offset: u32, value: T) void {
 
 /// True when `payload` is legal for `type_byte` in a frame at `lsn` (ADR-0003 section 6):
 /// record and consumer types (128..255) take any payload; `page_image` is a page id then a
-/// valid page size; `checkpoint` is a `redo_lsn` in `[1, lsn]`; `page_images` is the layout of
-/// `page_images_valid`; 0 and the other reserved types 4..127 never.
+/// valid page size; `checkpoint` is a `redo_lsn` in `[1, lsn]`; `commit` is a `first_lsn` in
+/// `[1, lsn)`; `page_images` is the layout of `page_images_valid`; 0 and the other reserved
+/// types 5..127 never.
 pub fn payload_valid(type_byte: u8, lsn: Lsn, payload: []const u8) bool {
     assert(payload.len <= payload_bytes_max);
     assert(lsn < lsn_limit);
     const record: u8 = @intFromEnum(Type.record);
     const page_image: u8 = @intFromEnum(Type.page_image);
     const checkpoint: u8 = @intFromEnum(Type.checkpoint);
+    const commit: u8 = @intFromEnum(Type.commit);
     const page_images: u8 = @intFromEnum(Type.page_images);
     return switch (type_byte) {
         0 => false,
         record => true,
         page_image => page_image_valid(payload),
         checkpoint => checkpoint_valid(lsn, payload),
-        4...15 => false,
+        commit => commit_valid(lsn, payload),
+        5...15 => false,
         page_images => page_images_valid(payload),
         17...127 => false,
         128...255 => true,
@@ -152,6 +163,33 @@ fn checkpoint_valid(lsn: Lsn, payload: []const u8) bool {
     if (payload.len != checkpoint_payload_size) return false;
     const redo_lsn = get(u64, payload, 0);
     return redo_lsn >= lsn_first and redo_lsn <= lsn;
+}
+
+fn commit_valid(lsn: Lsn, payload: []const u8) bool {
+    assert(payload.len <= payload_bytes_max);
+    assert(lsn >= lsn_first);
+    if (payload.len != commit_payload_size) return false;
+    const first_lsn = get(u64, payload, 0);
+    return first_lsn >= lsn_first and first_lsn < lsn;
+}
+
+/// The 8-byte payload of a `commit` frame (ADR-0005 section 8): the group's `first_lsn`, which
+/// `encode` requires to lie in `[lsn_first, lsn)` of the frame it goes into.
+pub fn commit_payload(first_lsn: Lsn) [commit_payload_size]u8 {
+    assert(first_lsn >= lsn_first);
+    assert(first_lsn < lsn_limit);
+    var bytes: [commit_payload_size]u8 = undefined;
+    put(u64, &bytes, 0, first_lsn);
+    return bytes;
+}
+
+/// The `first_lsn` of a decoded `commit` frame's payload. Precondition: the payload came from a
+/// decoded `commit` frame (exactly 8 bytes).
+pub fn commit_first_lsn(payload: []const u8) Lsn {
+    assert(payload.len == commit_payload_size);
+    const first_lsn = get(u64, payload, 0);
+    assert(first_lsn >= lsn_first);
+    return first_lsn;
 }
 
 /// Seeded CRC32C of `frame_bytes` under `lsn_expected` (ADR-0003 section 4): the LSN as eight
@@ -259,4 +297,5 @@ pub fn intact(image: []const u8, lsn_expected: Lsn) bool {
 test {
     _ = @import("frame_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("frame_images_test.zig");
+    _ = @import("frame_commit_test.zig");
 }
