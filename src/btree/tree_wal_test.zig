@@ -321,7 +321,7 @@ test "a chain longer than the tracker is ValueTooLarge and leaves the tree usabl
     try env.start(512, .none);
     defer env.stop();
 
-    const ops_max: u32 = 2 * @as(u32, node.height_max(512)) + 1;
+    const ops_max: u32 = node.op_pages_max(512);
     env.tree.track = env.track[0..ops_max]; // A tracker just big enough for a tree path.
     const len: u32 = (ops_max + 1) * 512;
     try testing.expect(overflow.chain_len(512, len) > ops_max);

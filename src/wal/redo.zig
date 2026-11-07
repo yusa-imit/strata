@@ -103,7 +103,7 @@ pub const PageRedo = struct {
         switch (f.frame_type) {
             .page_image => try self.redo_image(io, try self.parse(f.payload), f.lsn),
             .page_images => try self.apply_images(io, f),
-            .record, .checkpoint, _ => self.stats.ignored += 1,
+            .record, .checkpoint, .commit, _ => self.stats.ignored += 1,
         }
     }
 

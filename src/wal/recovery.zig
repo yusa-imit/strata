@@ -38,6 +38,7 @@ const platform = @import("../file/platform.zig");
 const frame = @import("frame.zig");
 const reader = @import("reader.zig");
 const segment = @import("segment.zig");
+const truncate = @import("truncate.zig");
 
 pub const Lsn = frame.Lsn;
 
@@ -86,6 +87,8 @@ const Torn = struct { segment_index: u32, offset: u64, length: u64 };
 const Outcome = struct { last_lsn: Lsn, torn: ?Torn, header_index: u32 };
 
 pub const Recovery = struct {
+    pub const truncate_after = truncate.truncate_after;
+
     /// Replays the log in `dir` (opened with iteration) into `target` and repairs a torn tail;
     /// see the file header. Errors: `Corrupted`, `ChecksumMismatch` (also for a bad start),
     /// `SegmentLimit`, `WouldBlock`, I/O errors, and whatever `target` returns.
