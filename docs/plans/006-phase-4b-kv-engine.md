@@ -57,7 +57,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       buffer from `open` under the ADR's op and byte bounds; `commit` applies one group, commits
       once. Verify: a crash cut inside the batch frame shows none of it, after `commit` all of
       it; one past the bound → `BatchTooLarge` before any page changes.
-- [ ] **`kv/iterator.zig` — `Db.scan`** (`src/kv/`). Half-open `Range` over `Cursor`, forward;
+- [x] **`kv/iterator.zig` — `Db.scan`** (`src/kv/`). Half-open `Range` over `Cursor`, forward;
       an entry borrows until the next `next`; a write during a live scan is a contract violation
       asserted by a generation counter. Verify: equals the sorted model for empty, one-key, full
       and past-the-end ranges at 3 page sizes; overflow values come back whole.
