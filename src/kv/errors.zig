@@ -44,6 +44,8 @@ pub const PutError = Error;
 pub const DeleteError = Error;
 pub const FlushError = Error;
 pub const CheckpointError = Error;
+/// `KeyTooLarge` for a bound over the key limit; the rest are read errors of the cursor.
+pub const ScanError = Error;
 /// Recording an op: limits only, nothing else is touched.
 pub const BatchError = error{ KeyTooLarge, ValueTooLarge, BatchTooLarge };
 /// `WriteBatch.init` allocates its op table and byte arena once.

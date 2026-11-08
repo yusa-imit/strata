@@ -48,6 +48,7 @@ const redo = @import("../wal/redo.zig");
 const segment = @import("../wal/segment.zig");
 const writer_mod = @import("../wal/writer.zig");
 const errors = @import("errors.zig");
+const iterator = @import("iterator.zig");
 
 pub const Error = errors.Error;
 pub const OpenError = errors.OpenError;
@@ -58,6 +59,9 @@ pub const FlushError = errors.FlushError;
 pub const CheckpointError = errors.CheckpointError;
 pub const BatchError = errors.BatchError;
 pub const CommitError = errors.CommitError;
+pub const ScanError = errors.ScanError;
+pub const Range = iterator.Range;
+pub const Iterator = iterator.Iterator;
 
 const Id = header.Id;
 const map = errors.map;
@@ -164,6 +168,8 @@ const State = struct {
     /// The last commit point: a `commit` or `checkpoint` frame, or 0. The pool gate (section 7).
     commit_lsn: frame.Lsn,
     failed: bool,
+    /// The write counter and the live-scan count shared with the `Iterator` (section 9).
+    scan: iterator.Shared,
 
     fn manager_options(self: *const State) manager.Options {
         assert(header.page_size_valid(self.options.page_size));
@@ -255,7 +261,7 @@ const State = struct {
     /// left unlogged pages behind; the `Db` follows.
     fn fail(self: *State, err: anyerror) Error {
         if (self.tree.failed) self.failed = true;
-        assert(self.pool.pinned_count() == 0);
+        assert(self.pool.pinned_count() == self.scan.scans_live);
         return map(err);
     }
 
@@ -315,6 +321,7 @@ pub const Db = struct {
         state.key_len_eff = @min(options.key_len_max, node.key_len_max(options.page_size));
         state.failed = false;
         state.commit_lsn = 0;
+        state.scan = .init;
         const fresh = try open_sub(state, dir, sub_path);
         errdefer state.sub.close(io);
 
@@ -327,11 +334,13 @@ pub const Db = struct {
     }
 
     /// Checkpoints (unless the database is already clean or latched) and releases everything.
+    /// Contract: no `Iterator` is live (`deinit` it first; it is invalid after `close`).
     /// A failed checkpoint is not reported: the log keeps every committed change, and the next
     /// `open` replays it. Pending page ids are freed first (best effort; an id that stays
     /// pending leaks, which ADR-0002 section 7 calls safe).
     pub fn close(self: *Db) void {
         const state = self.live();
+        assert(state.scan.scans_live == 0); // `deinit` every `Iterator` first.
         const io = self.io;
         if (!state.failed) {
             // Best effort, like the checkpoint: an id that stays pending leaks, which is safe.
@@ -376,7 +385,7 @@ pub const Db = struct {
         if (key.len > state.key_len_eff) return error.KeyTooLarge;
         assert(key.len <= state.key_len_eff);
         const found = state.tree.get(self.io, key) catch |err| return state.fail(err);
-        assert(state.pool.pinned_count() == 0);
+        assert(state.pool.pinned_count() == state.scan.scans_live); // A live scan pins its leaf.
         assert(!state.failed);
         return found;
     }
@@ -388,6 +397,7 @@ pub const Db = struct {
         if (key.len > state.key_len_eff) return error.KeyTooLarge;
         if (value.len > state.options.value_len_max) return error.ValueTooLarge;
         assert(value.len <= state.value_buf.len);
+        state.scan.bump();
         try state.begin_write(self.io);
         const first_lsn = state.writer.next_lsn;
         state.tree.insert(self.io, key, value) catch |err| {
@@ -402,6 +412,7 @@ pub const Db = struct {
         const state = try self.usable();
         if (key.len > state.key_len_eff) return error.KeyTooLarge;
         assert(key.len <= state.key_len_eff);
+        state.scan.bump();
         try state.begin_write(self.io);
         const first_lsn = state.writer.next_lsn;
         const found = state.tree.delete(self.io, key) catch |err| {
@@ -424,6 +435,7 @@ pub const Db = struct {
         const state = try self.usable();
         try batch_check(state.options, state.key_len_eff, ops);
         if (ops.len == 0) return;
+        state.scan.bump();
         try state.begin_write(self.io);
         const first_lsn = state.writer.next_lsn;
         const commit_before = state.commit_lsn;
@@ -461,10 +473,32 @@ pub const Db = struct {
     /// change, and `open` replays it. Errors are returned as `Error`.
     pub fn checkpoint(self: *Db) CheckpointError!void {
         const state = try self.usable();
+        state.scan.bump(); // `flush` is this call.
         try state.release(self.io);
         try state.run_checkpoint(self.io);
         assert(state.pool.dirty_count == 0);
         assert(state.pm.wal_lsn == state.writer.last_lsn);
+    }
+
+    /// Starts a forward scan of `range` (ADR-0005 section 9). A bound longer than `key_len_max`
+    /// is `KeyTooLarge`; `start >= end` is an empty scan. At most one `Iterator` may be live
+    /// (asserted: a second `scan` while one is live is a contract violation); end it with
+    /// `next` returning null or `deinit`. The bounds are borrowed.
+    pub fn scan(self: *Db, range: Range) ScanError!Iterator {
+        const state = try self.usable();
+        if (range.start.len > state.key_len_eff) return error.KeyTooLarge;
+        if (range.end) |end| {
+            if (end.len > state.key_len_eff) return error.KeyTooLarge;
+        }
+        assert(state.scan.scans_live == 0);
+        return Iterator.open(&state.io, &state.tree, &state.scan, range);
+    }
+
+    /// Counts writes (`put`, `delete`, `commit_ops`, `checkpoint`, `flush`); see `Iterator`.
+    pub fn generation(self: *const Db) u64 {
+        const state = self.live();
+        assert(state.pool.pinned_count() == state.scan.scans_live);
+        return state.scan.generation;
     }
 
     fn live(self: *const Db) *State {
@@ -740,4 +774,5 @@ test {
     _ = @import("db_commit_test.zig");
     _ = @import("batch.zig");
     _ = @import("batch_test.zig");
+    _ = @import("iterator.zig");
 }

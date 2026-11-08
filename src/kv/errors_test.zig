@@ -16,6 +16,7 @@ test "errors: every subset is a subset of Error" {
         errors.DeleteError,
         errors.FlushError,
         errors.CheckpointError,
+        errors.ScanError,
         errors.BatchError,
         errors.BatchInitError,
         errors.CommitError,

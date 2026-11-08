@@ -23,6 +23,11 @@ All notable changes to this project are documented in this file. The format foll
   `batch_ops_max` and `batch_bytes_max`; `put`, `delete`, `clear`, `commit`. `commit` applies
   all ops as one group (`Db.commit_ops`) under one `commit` frame: a crash shows none or all.
   New `kv.Error.BatchTooLarge` (over the op or byte bound, at record and at commit time).
+- `kv.Db.scan` and `kv.Iterator` (`src/kv/iterator.zig`): a forward scan over the half-open
+  `kv.Range` `[start, end)` (`end == null` is +infinity; `start >= end` is empty; a bound over
+  `key_len_max` is `KeyTooLarge`). An entry borrows until the next `next`, `get`, `scan` or
+  `deinit`. `Db.generation` counts writes and `next` asserts no write happened during a live scan;
+  at most one `Iterator` is live per `Db`.
 
 ### Changed
 - A log written by a `kv.Db` before the `commit` frame existed is unreadable: its `checkpoint`
