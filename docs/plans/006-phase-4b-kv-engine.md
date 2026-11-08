@@ -53,7 +53,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       images them all. Fold the three `ops_max` copies first (cycle 74 review). Split from the
       batch (Risks: item size). Verify: a 32-op group cut mid-frame replays to the pre-group
       tree; replay twice = once; an empty group appends nothing; ungrouped tests stay green.
-- [ ] **`kv/batch.zig` — `WriteBatch`** (`src/kv/`). Holds `*Db`, no `io`; records into the
+- [x] **`kv/batch.zig` — `WriteBatch`** (`src/kv/`). Holds `*Db`, no `io`; records into the
       buffer from `open` under the ADR's op and byte bounds; `commit` applies one group, commits
       once. Verify: a crash cut inside the batch frame shows none of it, after `commit` all of
       it; one past the bound → `BatchTooLarge` before any page changes.

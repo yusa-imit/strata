@@ -173,6 +173,26 @@ test "commit: page_images frames after the last commit are not applied and are c
     try expect_value(&rec, "c", null);
 }
 
+test "commit: a checkpoint right after create and after an empty-log recovery is clean" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const options = fx.options(512, .none);
+    var db = try Db.open(testing.io, testing.allocator, tmp.dir, fx.sub_path, options);
+    defer db.close();
+
+    try db.checkpoint(); // `commit_lsn` 0 and `last_lsn` 0: the strict between-groups assert.
+    try fx.crash_copy(tmp.dir, fx.sub_path, crash_name);
+    var rec = try Db.open(testing.io, testing.allocator, tmp.dir, crash_name, options);
+    defer rec.close();
+
+    try rec.checkpoint();
+    try rec.put("a", "1");
+    try rec.checkpoint(); // `commit_lsn` after the recovery equals the log end.
+    try expect_value(&rec, "a", "1");
+    try testing.expect(options.batch_ops_max >= 1);
+}
+
 test "commit: recovering twice equals recovering once" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

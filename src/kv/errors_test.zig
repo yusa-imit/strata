@@ -16,6 +16,9 @@ test "errors: every subset is a subset of Error" {
         errors.DeleteError,
         errors.FlushError,
         errors.CheckpointError,
+        errors.BatchError,
+        errors.BatchInitError,
+        errors.CommitError,
     }) |Set| {
         const info = @typeInfo(Set).error_set.?;
         try testing.expect(info.len >= 1);

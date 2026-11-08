@@ -12,8 +12,22 @@ All notable changes to this project are documented in this file. The format foll
   root at page 1, ADR-0005) and reopens a cleanly closed one; `put`, `get`, `delete`, `flush`,
   `close`. `open` on a crashed directory replays the log from the checkpoint (idempotent, a torn
   tail is repaired), and `checkpoint` bounds the log and frees the page ids deletes left pending.
+- WAL `commit` frame (type 4, payload `first_lsn`; ADR-0005 section 8): the last frame of an
+  atomic group. `Recovery.truncate_after(last_lsn)` cuts a log back to a frame, and `CommitScan`
+  finds the last commit point of a replay and rejects a `first_lsn` that does not follow the
+  previous commit point (`Corrupted`).
+- `kv.Db` durability: `put` and `delete` log their `page_images` frame(s) and then one `commit`
+  frame, and return after it is durable per `SyncPolicy`. Recovery on `open` applies only frames
+  up to the last commit point and cuts the unfinished group, so no partial write is visible.
+- `kv.WriteBatch` (`src/kv/batch.zig`): `init` allocates the op table and byte arena once from
+  `batch_ops_max` and `batch_bytes_max`; `put`, `delete`, `clear`, `commit`. `commit` applies
+  all ops as one group (`Db.commit_ops`) under one `commit` frame: a crash shows none or all.
+  New `kv.Error.BatchTooLarge` (over the op or byte bound, at record and at commit time).
 
 ### Changed
+- A log written by a `kv.Db` before the `commit` frame existed is unreadable: its `checkpoint`
+  frames follow frames of no group and are `Corrupted`, and a crashed one has no commit point, so
+  its frames are cut. This is fine: `kv.Db` is unreleased.
 - `kv.Error` no longer has `NotImplemented`.
 - `Tree.insert` and `Tree.delete` with a writer attached assert the pool's WAL gate is on.
 

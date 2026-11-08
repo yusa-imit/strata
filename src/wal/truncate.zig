@@ -61,15 +61,18 @@ pub fn truncate_after(
 
     const plan = (try find_end(io, gpa, dir, last_lsn, segment_options, deletes)) orelse return;
     assert(plan.delete_count <= plan.deletes.len);
+    assert(plan.deletes.len == segment_options.segments_max);
     var remaining: u32 = plan.delete_count;
-    for (0..segment_options.segments_max) |_| { // Newest first: no hole at any crash point.
-        if (remaining == 0) break;
+    // The bound is the delete list's capacity (`delete_count <= deletes.len`, asserted above):
+    // the loop runs exactly `delete_count` times, so no fallthrough branch exists.
+    for (0..plan.delete_count) |_| { // Newest first: no hole at any crash point.
         remaining -= 1;
         var name: [segment.name_size]u8 = @splat(0);
         segment.format_name(plan.deletes[remaining], &name);
         try dir.deleteFile(io, &name);
         if (segment_options.sync_policy != .none) try platform.sync_dir(io, dir);
-    } else return error.Corrupted; // Unreachable: the bound is the delete list's capacity.
+    }
+    assert(remaining == 0);
     try cut_segment(io, dir, plan, segment_options);
 }
 

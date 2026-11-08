@@ -7,8 +7,8 @@
 //!   - `kv/iterator.zig`
 //!   - `kv/snapshot.zig`
 //!
-//! Landed so far: `kv/db.zig` (`Db`: create, open after a clean close, put, get, delete,
-//! flush, close; ADR-0005). Recovery, batch and iterator follow.
+//! Landed so far: `kv/db.zig` (`Db`: create, open with crash recovery, put, get, delete,
+//! checkpoint, flush, close; ADR-0005) and `kv/batch.zig` (`WriteBatch`). The iterator follows.
 //!
 //! Status: in progress. Public declarations are added as PRD phases land.
 
@@ -16,6 +16,8 @@ const std = @import("std");
 
 pub const db = @import("kv/db.zig");
 pub const Db = db.Db;
+pub const batch = @import("kv/batch.zig");
+pub const WriteBatch = batch.WriteBatch;
 pub const errors = @import("kv/errors.zig");
 /// Module-level error set (ADR-0005 section 10).
 pub const Error = errors.Error;

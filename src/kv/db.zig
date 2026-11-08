@@ -3,10 +3,11 @@
 //! directory `wal`, root = page 1) or reopens an existing one, replaying the log past the last
 //! checkpoint; `put`, `delete`, `get`, `checkpoint`, `flush` and `close` follow.
 //!
-//! Scope of this file today (plan 006 items "kv/db.zig", "Recovery on open" and "Commit frame
-//! and commit-bounded recovery"): sections 1 to 8 of the ADR except `WriteBatch`. One `put` or
-//! `delete` is a group: its `page_images` frame(s), then one `commit` frame; a group that logged
-//! nothing (an absent-key `delete`) logs no `commit` frame and is not a commit point.
+//! Scope of this file today (plan 006 items "kv/db.zig", "Recovery on open", "Commit frame and
+//! commit-bounded recovery" and the group half of "WriteBatch"): sections 1 to 8 of the ADR. One
+//! `put` or `delete`, or one `commit_ops` call (the apply side of `WriteBatch`, `batch.zig`), is
+//! a group: its `page_images` frame(s), then one `commit` frame; a group that logged nothing (an
+//! absent-key `delete`, an empty batch) logs no `commit` frame and is not a commit point.
 //!
 //! Durability: `put` and `delete` return after `Writer.commit` of their `commit` frame returned,
 //! then raise the pool gate to it (the last commit point, never `writer.durable_lsn`). `close`
@@ -55,6 +56,8 @@ pub const PutError = errors.PutError;
 pub const DeleteError = errors.DeleteError;
 pub const FlushError = errors.FlushError;
 pub const CheckpointError = errors.CheckpointError;
+pub const BatchError = errors.BatchError;
+pub const CommitError = errors.CommitError;
 
 const Id = header.Id;
 const map = errors.map;
@@ -66,6 +69,13 @@ const wal_name = "wal";
 const root_id: Id = @enumFromInt(1);
 
 pub const Engine = enum { btree };
+
+/// One recorded write of a batch; `value` is ignored by `.delete`. Borrowed, never copied here.
+pub const BatchOp = struct {
+    kind: enum { put, delete },
+    key: []const u8,
+    value: []const u8,
+};
 
 /// Every field is spelled at the call site (ADR-0005 section 5): there are no defaults.
 pub const Options = struct {
@@ -206,7 +216,7 @@ const State = struct {
     fn run_checkpoint(self: *State, io: Io) Error!void {
         assert(!self.failed);
         assert(self.pool.pinned_count() == 0);
-        assert(self.writer.last_lsn == self.commit_lsn or self.commit_lsn == 0); // Between groups.
+        assert(self.writer.last_lsn == self.commit_lsn); // Between groups: no open one.
         if (self.writer.last_lsn == self.pm.wal_lsn) return; // Clean: nothing to checkpoint.
         _ = self.cp.run(io) catch |err| {
             self.latch();
@@ -246,6 +256,16 @@ const State = struct {
         if (self.tree.failed) self.failed = true;
         assert(self.pool.pinned_count() == 0);
         return map(err);
+    }
+
+    /// `fail` for an op inside a group that started at `first_lsn`: when an earlier op already
+    /// logged a frame, the group is open and cannot be left behind (the next commit frame would
+    /// not follow the last commit point), so the `Db` latches.
+    fn fail_group(self: *State, err: anyerror, first_lsn: frame.Lsn) Error {
+        assert(self.writer.next_lsn >= first_lsn);
+        assert(!self.failed or self.tree.failed);
+        if (self.writer.next_lsn != first_lsn) self.latch();
+        return self.fail(err);
     }
 
     /// Drops every unlogged change; every later call is `Failed` until reopen.
@@ -387,6 +407,37 @@ pub const Db = struct {
         return found;
     }
 
+    /// Applies `ops` in order as ONE group, then one `commit` frame (ADR-0005 section 8): after
+    /// a crash none of them or all of them are visible; the last write to a key wins. Every
+    /// limit is checked for all ops before the first applies (`KeyTooLarge`, `ValueTooLarge`,
+    /// `BatchTooLarge`, nothing changed). An empty `ops` does nothing; so does a group that
+    /// logged no frame (deletes of absent keys), which is not a commit point. A failure after
+    /// the first frame was logged latches the `Db`: the open group cannot be rolled back, and
+    /// reopen recovers to the last commit point. `WriteBatch.commit` is the usual caller; the
+    /// slices are only read.
+    pub fn commit_ops(self: *Db, ops: []const BatchOp) CommitError!void {
+        const state = try self.usable();
+        try batch_check(state.options, state.key_len_eff, ops);
+        if (ops.len == 0) return;
+        try state.begin_write(self.io);
+        const first_lsn = state.writer.next_lsn;
+        const commit_before = state.commit_lsn;
+        for (ops) |op| {
+            switch (op.kind) {
+                .put => state.tree.insert(self.io, op.key, op.value) catch |err| {
+                    return state.fail_group(err, first_lsn);
+                },
+                .delete => _ = state.tree.delete(self.io, op.key) catch |err| {
+                    return state.fail_group(err, first_lsn);
+                },
+            }
+        }
+        try state.commit(self.io, first_lsn);
+        const logged = state.writer.next_lsn > first_lsn;
+        assert(logged == (state.commit_lsn > commit_before)); // Only a logged group is a commit.
+        assert(!state.failed);
+    }
+
     /// Frees queued page ids and checkpoints; see `checkpoint`.
     pub fn flush(self: *Db) FlushError!void {
         try self.checkpoint();
@@ -424,6 +475,21 @@ pub const Db = struct {
         return state;
     }
 };
+
+/// The limits of a batch (ADR-0005 section 8): op count, per-op key and value, and the sum of
+/// key and value bytes. Pure; returns before anything is touched.
+fn batch_check(options: Options, key_len_eff: u32, ops: []const BatchOp) BatchError!void {
+    assert(options.batch_ops_max >= 1);
+    assert(key_len_eff >= 1);
+    if (ops.len > options.batch_ops_max) return error.BatchTooLarge;
+    var bytes: u64 = 0;
+    for (ops) |op| { // Bound: `ops.len <= batch_ops_max`.
+        if (op.key.len > key_len_eff) return error.KeyTooLarge;
+        if (op.value.len > options.value_len_max) return error.ValueTooLarge;
+        bytes += op.key.len + op.value.len;
+    }
+    if (bytes > options.batch_bytes_max) return error.BatchTooLarge;
+}
 
 /// Makes `sub_path` if it is absent and opens it with iteration. True when the database must
 /// be created (the directory was absent or has no entry at all, a bound of one read).
@@ -667,4 +733,6 @@ test {
     _ = @import("db_test.zig"); // Contract tests live in their own files (800-line limit).
     _ = @import("db_recover_test.zig");
     _ = @import("db_commit_test.zig");
+    _ = @import("batch.zig");
+    _ = @import("batch_test.zig");
 }

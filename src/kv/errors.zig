@@ -29,6 +29,8 @@ pub const Error = error{
     InputOutput,
     KeyTooLarge,
     ValueTooLarge,
+    /// A `WriteBatch` over `batch_ops_max` ops or `batch_bytes_max` key and value bytes.
+    BatchTooLarge,
     HeightLimit,
     SegmentLimit,
     LsnExhausted,
@@ -42,6 +44,11 @@ pub const PutError = Error;
 pub const DeleteError = Error;
 pub const FlushError = Error;
 pub const CheckpointError = Error;
+/// Recording an op: limits only, nothing else is touched.
+pub const BatchError = error{ KeyTooLarge, ValueTooLarge, BatchTooLarge };
+/// `WriteBatch.init` allocates its op table and byte arena once.
+pub const BatchInitError = error{OutOfMemory};
+pub const CommitError = Error;
 
 /// Maps a lower-layer error to its kv meaning; see the file header for the rule.
 pub fn map(err: anyerror) Error {
