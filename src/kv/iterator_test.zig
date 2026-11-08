@@ -245,3 +245,37 @@ test "scan: the generation counter moves on every write kind" {
     it.deinit();
     try testing.expectEqual(last, db.generation());
 }
+
+test "scan: a get between scan and the first next does not clobber an overflow first value" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var options = fx.options(4096, .none);
+    options.value_len_max = 1 << 16;
+    options.batch_bytes_max = options.key_len_max + options.value_len_max;
+    options.pool_frames_max = db_mod.pool_frames_min(options) + 32;
+    var db = try open_in(&tmp, options);
+    defer db.close();
+
+    const one = try testing.allocator.alloc(u8, 1 << 16);
+    defer testing.allocator.free(one);
+
+    const two = try testing.allocator.alloc(u8, 1 << 16);
+    defer testing.allocator.free(two);
+
+    for (one, two, 0..) |*x, *y, index| {
+        x.* = @truncate(index *% 31 +% 7);
+        y.* = @truncate(index *% 17 +% 3);
+    }
+    try db.put("a", one);
+    try db.put("b", two);
+    var it = try db.scan(.{ .start = "", .end = null });
+    defer it.deinit();
+
+    try testing.expectEqualSlices(u8, two, (try db.get("b")).?);
+    try testing.expectEqual(it.shared.scans_live, db.state.pool.pinned_count());
+    const first = (try it.next()).?;
+    try testing.expectEqualStrings("a", first.key);
+    try testing.expectEqualSlices(u8, one, first.value);
+    try testing.expectEqualSlices(u8, two, (try it.next()).?.value);
+}

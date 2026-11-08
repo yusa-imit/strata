@@ -261,7 +261,7 @@ const State = struct {
     /// left unlogged pages behind; the `Db` follows.
     fn fail(self: *State, err: anyerror) Error {
         if (self.tree.failed) self.failed = true;
-        assert(self.pool.pinned_count() <= self.scan.scans_live);
+        assert(self.pool.pinned_count() == self.scan.scans_live);
         return map(err);
     }
 
@@ -334,11 +334,13 @@ pub const Db = struct {
     }
 
     /// Checkpoints (unless the database is already clean or latched) and releases everything.
+    /// Contract: no `Iterator` is live (`deinit` it first; it is invalid after `close`).
     /// A failed checkpoint is not reported: the log keeps every committed change, and the next
     /// `open` replays it. Pending page ids are freed first (best effort; an id that stays
     /// pending leaks, which ADR-0002 section 7 calls safe).
     pub fn close(self: *Db) void {
         const state = self.live();
+        assert(state.scan.scans_live == 0); // `deinit` every `Iterator` first.
         const io = self.io;
         if (!state.failed) {
             // Best effort, like the checkpoint: an id that stays pending leaks, which is safe.
@@ -383,7 +385,7 @@ pub const Db = struct {
         if (key.len > state.key_len_eff) return error.KeyTooLarge;
         assert(key.len <= state.key_len_eff);
         const found = state.tree.get(self.io, key) catch |err| return state.fail(err);
-        assert(state.pool.pinned_count() <= state.scan.scans_live); // A live scan pins its leaf.
+        assert(state.pool.pinned_count() == state.scan.scans_live); // A live scan pins its leaf.
         assert(!state.failed);
         return found;
     }
@@ -480,7 +482,8 @@ pub const Db = struct {
 
     /// Starts a forward scan of `range` (ADR-0005 section 9). A bound longer than `key_len_max`
     /// is `KeyTooLarge`; `start >= end` is an empty scan. At most one `Iterator` may be live
-    /// (asserted); end it with `next` returning null or `deinit`. The bounds are borrowed.
+    /// (asserted: a second `scan` while one is live is a contract violation); end it with
+    /// `next` returning null or `deinit`. The bounds are borrowed.
     pub fn scan(self: *Db, range: Range) ScanError!Iterator {
         const state = try self.usable();
         if (range.start.len > state.key_len_eff) return error.KeyTooLarge;
@@ -493,8 +496,9 @@ pub const Db = struct {
 
     /// Counts writes (`put`, `delete`, `commit_ops`, `checkpoint`, `flush`); see `Iterator`.
     pub fn generation(self: *const Db) u64 {
-        assert(self.live().scan.scans_live <= 1);
-        return self.state.scan.generation;
+        const state = self.live();
+        assert(state.pool.pinned_count() == state.scan.scans_live);
+        return state.scan.generation;
     }
 
     fn live(self: *const Db) *State {

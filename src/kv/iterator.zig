@@ -9,6 +9,8 @@
 //! asserts it is the value `scan` saw, so a write during a live scan is a contract violation.
 //! `Db.get` during a scan is fine, but it shares `value_buf` with the cursor: an `Entry` is valid
 //! only until the next `next`, `get`, `scan` or `deinit`.
+//! Lifetime: `deinit` (or `next` returning null) before `Db.close`; `deinit` after `close` is
+//! invalid, and `scan` while another iterator is live is a contract violation.
 //! Borrowing: the `Range` bytes are borrowed and must outlive the iterator. Allocation: none;
 //! the `Io` is the `Db`'s, borrowed by pointer.
 
@@ -16,6 +18,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
 const cursor_mod = @import("../btree/cursor.zig");
+const node = @import("../btree/node.zig");
 const tree_mod = @import("../btree/tree.zig");
 const errors = @import("errors.zig");
 
@@ -36,14 +39,14 @@ pub const Shared = struct {
 
     /// Records a write: every live iterator is now invalid.
     pub fn bump(self: *Shared) void {
-        assert(self.scans_live <= 1);
+        assert(self.scans_live == 0); // A write during a live scan is a contract violation.
         self.generation += 1;
         assert(self.generation != 0);
     }
 };
 
 const Phase = enum {
-    /// Seeked: the cursor holds the first entry of the range, not yet handed out.
+    /// Seeked: the cursor holds a leaf, but the first entry is read again by the first `next`.
     fresh,
     running,
     done,
@@ -54,6 +57,7 @@ pub const Iterator = struct {
     io: *const Io,
     shared: *Shared,
     cursor: cursor_mod.Cursor,
+    start: []const u8,
     end: ?[]const u8,
     generation: u64,
     phase: Phase,
@@ -68,11 +72,13 @@ pub const Iterator = struct {
         range: Range,
     ) ScanError!Iterator {
         assert(shared.scans_live == 0); // One live iterator per `Db`.
-        assert(range.start.len <= tree.page_size); // A key limit check came first (`Db.scan`).
+        assert(range.start.len <= node.key_len_max(tree.page_size)); // `Db.scan` checked it.
+        assert(range.end == null or range.end.?.len <= node.key_len_max(tree.page_size));
         var result: Iterator = .{
             .io = io,
             .shared = shared,
             .cursor = undefined,
+            .start = range.start,
             .end = range.end,
             .generation = shared.generation,
             .phase = .done,
@@ -96,8 +102,8 @@ pub const Iterator = struct {
         if (self.phase == .done) return null;
         assert(self.shared.scans_live == 1);
         assert(self.generation == self.shared.generation); // A write during a live scan.
-        const step: cursor_mod.Error!?Entry = switch (self.phase) {
-            .fresh => self.cursor.current(),
+        const step: cursor_mod.SeekError!?Entry = switch (self.phase) {
+            .fresh => self.first_entry(),
             .running => self.cursor.next(self.io.*),
             .done => unreachable, // Returned above.
         };
@@ -117,6 +123,15 @@ pub const Iterator = struct {
             }
         }
         return entry;
+    }
+
+    /// The first entry of the range, read again: an overflow value of the entry `open` seeked
+    /// to lives in the tree's `value_buf`, which a `Db.get` since then has overwritten.
+    fn first_entry(self: *Iterator) cursor_mod.SeekError!?Entry {
+        assert(self.phase == .fresh);
+        assert(self.shared.scans_live == 1);
+        try self.cursor.seek(self.io.*, self.start);
+        return self.cursor.current();
     }
 
     /// Releases the pin and the live slot. Idempotent; an `Entry` handed out is invalid after.
