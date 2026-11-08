@@ -173,7 +173,7 @@ test "commit: page_images frames after the last commit are not applied and are c
     try expect_value(&rec, "c", null);
 }
 
-test "commit: a checkpoint right after create and after an empty-log recovery is clean" {
+test "commit: checkpoint at commit_lsn 0 (after create, after empty-log recovery) is clean" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -190,7 +190,6 @@ test "commit: a checkpoint right after create and after an empty-log recovery is
     try rec.put("a", "1");
     try rec.checkpoint(); // `commit_lsn` after the recovery equals the log end.
     try expect_value(&rec, "a", "1");
-    try testing.expect(options.batch_ops_max >= 1);
 }
 
 test "commit: recovering twice equals recovering once" {

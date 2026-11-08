@@ -8,8 +8,8 @@
 //! the batch stores no allocator. Keys and values are copied into the arena, so the caller's
 //! slices may change or die right after `put` or `delete` returns. Ops keep their record order
 //! and apply in it: the last write to a key wins.
-//! Ownership: the batch borrows the `Db` by pointer and must not outlive it; `Db.close` is not
-//! allowed while a batch is in use. It holds no `Io` (the `Db` has it).
+//! Ownership: the batch borrows the `Db` by pointer and must not outlive it: `deinit` every
+//! batch before `Db.close`. It holds no `Io` (the `Db` has it).
 //! Limits: recording an op that would make the count exceed `batch_ops_max`, or the sum of key
 //! and value lengths exceed `batch_bytes_max`, is `BatchTooLarge`; an over-long key or value is
 //! `KeyTooLarge` or `ValueTooLarge`. A refused op leaves the batch unchanged.
@@ -76,6 +76,7 @@ pub const WriteBatch = struct {
     /// Records `put(key, value)`; see the file header for the limits.
     pub fn put(self: *WriteBatch, key: []const u8, value: []const u8) BatchError!void {
         assert(self.ops_len <= self.ops.len);
+        if (key.len > self.key_len_max) return error.KeyTooLarge; // Same order as `Db.put`.
         if (value.len > self.value_len_max) return error.ValueTooLarge;
         try self.record(.put, key, value);
     }

@@ -70,7 +70,8 @@ const root_id: Id = @enumFromInt(1);
 
 pub const Engine = enum { btree };
 
-/// One recorded write of a batch; `value` is ignored by `.delete`. Borrowed, never copied here.
+/// One recorded write of a batch; `value` must be empty for `.delete`. Borrowed, never copied
+/// here.
 pub const BatchOp = struct {
     kind: enum { put, delete },
     key: []const u8,
@@ -389,7 +390,9 @@ pub const Db = struct {
         assert(value.len <= state.value_buf.len);
         try state.begin_write(self.io);
         const first_lsn = state.writer.next_lsn;
-        state.tree.insert(self.io, key, value) catch |err| return state.fail(err);
+        state.tree.insert(self.io, key, value) catch |err| {
+            return state.fail_group(err, first_lsn); // A logged chain is an open group.
+        };
         try state.commit(self.io, first_lsn);
         assert(state.commit_lsn > first_lsn);
     }
@@ -401,7 +404,9 @@ pub const Db = struct {
         assert(key.len <= state.key_len_eff);
         try state.begin_write(self.io);
         const first_lsn = state.writer.next_lsn;
-        const found = state.tree.delete(self.io, key) catch |err| return state.fail(err);
+        const found = state.tree.delete(self.io, key) catch |err| {
+            return state.fail_group(err, first_lsn);
+        };
         try state.commit(self.io, first_lsn);
         assert(found or state.writer.next_lsn == first_lsn); // Absent key: no frame.
         return found;

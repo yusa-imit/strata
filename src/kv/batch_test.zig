@@ -403,6 +403,7 @@ test "batch: a crash cut at every frame boundary of the group shows none of it (
                 try expect_cut_shows_none(&tmp, options, offset_of(shape.lsns[at]) + extra);
             }
         }
+        try expect_cut_shows_none(&tmp, options, log.len - 1); // A torn commit frame.
         var rec = try Db.open(testing.io, testing.allocator, tmp.dir, "full", options);
         defer rec.close();
 
@@ -425,4 +426,158 @@ fn expect_cut_shows_none(tmp: *testing.TmpDir, options: fx.Options, length: u64)
 
     try expect_value(&rec, "z", "0");
     for ([_][]const u8{ "a", "b", "c" }) |key| try expect_value(&rec, key, null);
+}
+
+test "batch: a last op that fails after earlier ops logged latches the Db, reopen is pre-batch" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var options = options_of(512, false);
+    options.page_count_max = 12; // Room for three 3-page overflow chains, not twelve.
+    var db = try Db.open(testing.io, testing.allocator, tmp.dir, fx.sub_path, options);
+    defer db.close();
+
+    var wb: WriteBatch = undefined;
+    try WriteBatch.init(&wb, testing.allocator, &db);
+    defer wb.deinit(testing.allocator);
+
+    const big = try testing.allocator.alloc(u8, options.value_len_max);
+    defer testing.allocator.free(big);
+
+    @memset(big, 9);
+    try db.put("z", "0");
+    var key_buf: [8]u8 = undefined;
+    for (0..ops_max) |n| try wb.put(fx.key_of(&key_buf, @intCast(n)), big);
+    try testing.expectError(error.NoSpaceLeft, wb.commit());
+    try testing.expectEqual(ops_max, wb.ops_len); // A failed commit leaves the batch recorded.
+    try testing.expectError(error.Failed, db.get("z"));
+    try testing.expectError(error.Failed, db.put("y", "1"));
+    try testing.expectError(error.Failed, wb.commit());
+    try testing.expectEqual(ops_max, wb.ops_len);
+    try fx.crash_copy(tmp.dir, fx.sub_path, "crash");
+    const shape = try shape_of(tmp.dir, "crash");
+    try testing.expect(shape.types[shape.count - 1] != .commit); // Frames of the open group.
+    var rec = try Db.open(testing.io, testing.allocator, tmp.dir, "crash", options);
+    defer rec.close();
+
+    try expect_value(&rec, "z", "0");
+    try expect_value(&rec, fx.key_of(&key_buf, 0), null);
+}
+
+test "batch: a first op rejected with nothing logged leaves the Db usable and the batch" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var options = options_of(512, false);
+    options.page_count_max = 24;
+    var db = try Db.open(testing.io, testing.allocator, tmp.dir, fx.sub_path, options);
+    defer db.close();
+
+    var wb: WriteBatch = undefined;
+    try WriteBatch.init(&wb, testing.allocator, &db);
+    defer wb.deinit(testing.allocator);
+
+    const value = "0123456789012345678901234567890123456789";
+    var key_buf: [8]u8 = undefined;
+    var failed_at: u32 = 0;
+    for (0..400) |n| { // Fill until the growth limit.
+        db.put(fx.key_of(&key_buf, @intCast(n)), value) catch |err| {
+            try testing.expectEqual(error.NoSpaceLeft, err);
+            failed_at = @intCast(n);
+            break;
+        };
+    }
+    try testing.expect(failed_at >= 1);
+    try fx.crash_copy(tmp.dir, fx.sub_path, "before");
+    try wb.put(fx.key_of(&key_buf, failed_at), value);
+    try testing.expectError(error.NoSpaceLeft, wb.commit());
+    try testing.expectEqual(@as(u32, 1), wb.ops_len);
+    try fx.crash_copy(tmp.dir, fx.sub_path, "after");
+    try expect_same_files(tmp.dir, "before", "after"); // Nothing logged: no latch.
+    try expect_value(&db, fx.key_of(&key_buf, 0), value);
+    wb.clear();
+    try wb.put(fx.key_of(&key_buf, 0), "9876543210987654321098765432109876543210");
+    try wb.commit(); // A retry after fixing the batch works.
+    try expect_value(&db, fx.key_of(&key_buf, 0), "9876543210987654321098765432109876543210");
+}
+
+test "db: a put that fails after frames were logged latches, a clean one stays usable" {
+    for ([_]u32{ 4, 5, 6, 7, 8, 9 }) |page_count_max| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+
+        var options = options_of(512, false);
+        options.page_count_max = page_count_max;
+        var db = try Db.open(testing.io, testing.allocator, tmp.dir, fx.sub_path, options);
+        defer db.close();
+
+        const big = try testing.allocator.alloc(u8, options.value_len_max);
+        defer testing.allocator.free(big);
+
+        @memset(big, 9);
+        try db.put("z", "0");
+        var key_buf: [8]u8 = undefined;
+        var failed = false;
+        for (0..4) |n| {
+            db.put(fx.key_of(&key_buf, @intCast(n)), big) catch |err| {
+                try testing.expect(err == error.NoSpaceLeft or err == error.Failed);
+                failed = true;
+                break;
+            };
+        }
+        try testing.expect(failed);
+        try fx.crash_copy(tmp.dir, fx.sub_path, "crash");
+        const shape = try shape_of(tmp.dir, "crash");
+        const open_group = shape.types[shape.count - 1] != .commit;
+        const latched = if (db.get("z")) |_| false else |err| blk: {
+            try testing.expectEqual(error.Failed, err);
+            break :blk true;
+        };
+        try testing.expect(latched or !open_group); // Orphan frames after the last commit point.
+        var image: []const u8 = "crash";
+        if (!latched) {
+            try db.put("y", "1");
+            try fx.crash_copy(tmp.dir, fx.sub_path, "crash2");
+            image = "crash2";
+        }
+        var rec = try Db.open(testing.io, testing.allocator, tmp.dir, image, options);
+        defer rec.close();
+
+        try expect_value(&rec, "z", "0");
+        if (!latched) try expect_value(&rec, "y", "1");
+    }
+}
+
+test "batch: a batch of exactly batch_bytes_max commits, one byte more is BatchTooLarge" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const options = options_of(512, true);
+    var db = try Db.open(testing.io, testing.allocator, tmp.dir, fx.sub_path, options);
+    defer db.close();
+
+    var wb: WriteBatch = undefined;
+    try WriteBatch.init(&wb, testing.allocator, &db);
+    defer wb.deinit(testing.allocator);
+
+    const big = try testing.allocator.alloc(u8, options.value_len_max);
+    defer testing.allocator.free(big);
+
+    @memset(big, 5);
+    const rest: u32 = options.batch_bytes_max - 1 - options.value_len_max; // After op 1.
+    const key2 = big[0..100];
+    try wb.put("a", big); // 1 + value_len_max bytes.
+    try testing.expectError(error.BatchTooLarge, wb.put(key2, big[0 .. rest - 100 + 1]));
+    var ops = [_]BatchOp{
+        .{ .kind = .put, .key = "a", .value = big },
+        .{ .kind = .put, .key = key2, .value = big[0 .. rest - 100 + 1] },
+    };
+    try testing.expectError(error.BatchTooLarge, db.commit_ops(&ops));
+    try testing.expectEqual(@as(u32, 1), wb.ops_len);
+    try wb.put(key2, big[0 .. rest - 100]); // Exactly the bound.
+    try testing.expectEqual(options.batch_bytes_max, wb.bytes_len);
+    try wb.commit();
+    try expect_value(&db, "a", big);
+    const got = (try db.get(key2)).?;
+    try testing.expectEqualSlices(u8, big[0 .. rest - 100], got);
 }
