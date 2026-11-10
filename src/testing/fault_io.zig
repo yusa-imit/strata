@@ -18,6 +18,14 @@
 //!     with `error.AccessDenied` without reaching the inner `Io`, else it forwards.
 //! Any other `Io` operation through the wrapper is not supported: use the inner `Io` directly.
 //!
+//! Durable mode (`Plan.durable`, plan 006 item 9): a write that reaches the inner `Io` first has
+//! its pre-image and the file length recorded in the caller's `Durable` undo log (`durable.zig`;
+//! a full log fails the write with `error.InputOutput`); a sync that succeeds drops that file's
+//! entries (a failed one keeps them); `crash()` restores what was never synced, so the files
+//! hold exactly what the last syncs made durable. Limitation: only the bytes and the length of
+//! files already open through the wrapper are modeled; file creation, deletion and directory
+//! entries are not. Without a `Durable`, `crash()` does nothing.
+//!
 //! Allocation: none, ever. Ownership: nothing is owned; the inner `Io` is borrowed and must
 //! outlive the wrapper. The `FaultIo` is initialised in place and must not move afterwards,
 //! because the wrapped `Io` points into it. Not thread-safe: counters are plain integers, so
@@ -28,6 +36,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const File = std.Io.File;
 const Dir = std.Io.Dir;
+const durable_mod = @import("durable.zig");
 
 /// What a faulted positional call does.
 pub const Fault = union(enum) {
@@ -53,6 +62,8 @@ pub const Plan = struct {
     /// File deletions (0-based count) that pass through before every later one fails with
     /// `error.AccessDenied` without reaching the inner `Io`; null never fails a deletion.
     delete_fail_after: ?u32 = null,
+    /// Undo log for durable mode; null records nothing. Must outlive the `FaultIo`.
+    durable: ?*durable_mod.Durable = null,
 };
 
 /// A fault-injecting `Io` wrapper; see the file header for what is faulted and forwarded.
@@ -112,6 +123,16 @@ pub const FaultIo = struct {
         assert(self.inner.vtable != &self.vtable);
         assert(self.vtable.fileWritePositional == write_positional);
         return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    /// Reverts every write not yet made durable by a sync (durable mode); see `Durable.restore`.
+    /// Precondition: the files written through the wrapper are still open. Without a `Durable`
+    /// in the plan this does nothing. Errors are those of `Durable.restore`.
+    pub fn crash(self: *FaultIo) durable_mod.RestoreError!void {
+        assert(self.inner.vtable != &self.vtable);
+        assert(self.vtable.fileWritePositional == write_positional);
+        const durable = self.plan.durable orelse return;
+        return durable.restore(self.inner);
     }
 
     /// Asserts internal consistency: hooks installed, no self-recursion, counters sane.
@@ -188,6 +209,9 @@ fn forward_dir_delete_file(
 fn forward_file_close(userdata: ?*anyopaque, files: []const File) void {
     const self = self_of(userdata);
     assert(files.len > 0);
+    if (self.plan.durable) |durable| {
+        for (files) |file| durable.note_close(file);
+    }
     self.inner.vtable.fileClose(self.inner.userdata, files);
 }
 
@@ -202,7 +226,8 @@ fn sync_file(userdata: ?*anyopaque, file: File) File.SyncError!void {
     if (self.plan.sync_fail_after) |after| {
         if (index >= after) return error.InputOutput;
     }
-    return self.inner.vtable.fileSync(self.inner.userdata, file);
+    try self.inner.vtable.fileSync(self.inner.userdata, file);
+    if (self.plan.durable) |durable| durable.drop_file(file); // Durable now; a failure kept them.
 }
 
 fn forward_file_length(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
@@ -317,14 +342,17 @@ fn write_positional(
     const fault = fault_take(self.plan.write, &self.write_calls, self.plan.after_calls);
     const vtable = self.inner.vtable;
     switch (fault) {
-        .none => return vtable.fileWritePositional(
-            self.inner.userdata,
-            file,
-            header,
-            data,
-            splat,
-            offset,
-        ),
+        .none => {
+            try capture_pre_image(self, file, offset, write_len(header, data, splat));
+            return vtable.fileWritePositional(
+                self.inner.userdata,
+                file,
+                header,
+                data,
+                splat,
+                offset,
+            );
+        },
         .zero => return 0,
         .canceled => return error.Canceled,
         .short => |cap| {
@@ -332,6 +360,7 @@ fn write_positional(
             // that never has to split a splat.
             const piece = write_piece(header, data, splat, cap);
             if (piece.len == 0) return 0;
+            try capture_pre_image(self, file, offset, piece.len);
             return vtable.fileWritePositional(
                 self.inner.userdata,
                 file,
@@ -342,6 +371,30 @@ fn write_positional(
             );
         },
     }
+}
+
+/// Records the pre-image of a write that is about to reach the inner `Io` (durable mode only).
+fn capture_pre_image(
+    self: *FaultIo,
+    file: File,
+    offset: u64,
+    len: u64,
+) durable_mod.CaptureError!void {
+    assert(self.inner.vtable != &self.vtable);
+    const durable = self.plan.durable orelse return;
+    if (len == 0) return; // Nothing is written, so nothing to undo.
+    try durable.capture(self.inner, file, offset, len);
+}
+
+/// Total bytes a `fileWritePositional` call asks for; `splat == 0` omits the last element.
+fn write_len(header: []const u8, data: []const []const u8, splat: usize) u64 {
+    var total: u64 = header.len;
+    if (data.len == 0) return total;
+    for (data[0 .. data.len - 1]) |chunk| total +|= chunk.len;
+    const last: u64 = data[data.len - 1].len;
+    total +|= last *| splat;
+    assert(total >= header.len);
+    return total;
 }
 
 /// First non-empty chunk of the write (header first), at most `cap` bytes; empty if none.
