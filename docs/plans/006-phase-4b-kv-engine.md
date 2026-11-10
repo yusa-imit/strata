@@ -61,7 +61,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       an entry borrows until the next `next`; a write during a live scan is a contract violation
       asserted by a generation counter. Verify: equals the sorted model for empty, one-key, full
       and past-the-end ranges at 3 page sizes; overflow values come back whole.
-- [ ] **Durable-boundary `FaultIo`** (`src/testing/`). Today `FaultIo` fails calls and
+- [x] **Durable-boundary `FaultIo`** (`src/testing/`). Today `FaultIo` fails calls and
       `CrashSink` is a bare `writeAt` sink: neither forgets what was never synced. Add a mode
       that records pre-images of positional writes in a caller-given undo buffer, drops a file's
       entries at its `fileSync`, and on `crash()` restores them (no allocation; full → typed

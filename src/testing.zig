@@ -7,6 +7,8 @@
 //!     safety, since reordered or partially flushed sectors are not reproduced)
 //!   - `testing/fault_io.zig` (landed: fault-injecting `std.Io` wrapper for positional reads
 //!     and writes: short, zero, canceled; and failing syncs)
+//!   - `testing/durable.zig` (landed: undo log behind `FaultIo`'s durable mode; `crash()` reverts
+//!     every write not yet synced; file creation, deletion and directory entries not modeled)
 //!   - `testing/truncation_matrix_test.zig` (landed, test-only: every truncation and torn cut
 //!     of a real `wal.frame` must decode to a typed error, never to a damaged payload)
 //!   - `testing/page_matrix_test.zig` (landed, test-only: the same sweep over the real page
@@ -29,6 +31,7 @@ pub const fault_io = @import("testing/fault_io.zig");
 test {
     _ = @import("testing/crash_test.zig");
     _ = @import("testing/fault_io_test.zig");
+    _ = @import("testing/durable_test.zig");
     _ = @import("testing/truncation_matrix_test.zig");
     _ = @import("testing/page_matrix_test.zig");
     _ = @import("testing/wal_recovery_test.zig");

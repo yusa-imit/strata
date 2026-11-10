@@ -13,6 +13,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 const Io = std.Io;
+const file_mod = @import("../file/file.zig");
 const cfx = @import("../wal/checkpoint_fixtures.zig");
 const checkpoint = @import("../wal/checkpoint.zig");
 const frame = @import("../wal/frame.zig");
@@ -24,6 +25,7 @@ const rfx = @import("../wal/redo_fixtures.zig");
 const segment = @import("../wal/segment.zig");
 const sfx = @import("../wal/segment_fixtures.zig");
 const crash = @import("crash.zig");
+const durable_mod = @import("durable.zig");
 const fault_io = @import("fault_io.zig");
 const FaultIo = fault_io.FaultIo;
 
@@ -216,10 +218,23 @@ pub const Stats = struct {
     from_lsn: Lsn = 0,
 };
 
+/// How the crash forgets the unsynced writes: `cut` truncates or tears the unsynced tail of the
+/// newest segment through `CrashSink` (everything is written under `.none` sync policy); `durable`
+/// runs under `.fsync` and reverts every write since each file's last sync through the durable
+/// `FaultIo` (`crash()`), with no cut at all.
+pub const Mode = enum { cut, durable };
+
+/// Undo-log entries a durable run may record (a run makes a few hundred writes).
+const undo_entries_max: u32 = 4096;
+
 /// Initialised in place: the fault wrapper and the checkpoint env point into it.
 pub const Run = struct {
     env: cfx.Env,
     fio: FaultIo,
+    mode: Mode,
+    durable: durable_mod.Durable,
+    undo_entries: []durable_mod.Entry,
+    undo_bytes: []u8,
     rng: std.Random.DefaultPrng,
     ref: Ref,
     /// Highest LSN a commit, sync or checkpoint returned for before the crash.
@@ -231,8 +246,25 @@ pub const Run = struct {
 
     pub fn init(run: *Run, size: u32, seed: u64) !void {
         assert(seed != 0);
-        try cfx.Env.init(&run.env, size, segments_max, segment_frames, .none);
+        return run.init_mode(size, seed, .cut);
+    }
+
+    pub fn init_mode(run: *Run, size: u32, seed: u64, mode: Mode) !void {
+        assert(seed != 0);
+        const policy: file_mod.SyncPolicy = if (mode == .cut) .none else .fsync;
+        try cfx.Env.init(&run.env, size, segments_max, segment_frames, policy);
         errdefer run.env.deinit();
+
+        run.mode = mode;
+        const undo_entries_count: u32 = if (mode == .cut) 0 else undo_entries_max;
+        const undo_bytes_count: usize = if (mode == .cut) 0 else 512 * @as(usize, size);
+        run.undo_entries = try testing.allocator.alloc(durable_mod.Entry, undo_entries_count);
+        errdefer testing.allocator.free(run.undo_entries);
+
+        run.undo_bytes = try testing.allocator.alloc(u8, undo_bytes_count);
+        errdefer testing.allocator.free(run.undo_bytes);
+
+        durable_mod.Durable.init(&run.durable, run.undo_entries, run.undo_bytes);
 
         run.rng = .init(seed *% 0x9E37_79B9_7F4A_7C15 +% size);
         const r = run.rng.random();
@@ -245,6 +277,7 @@ pub const Run = struct {
             .read = .none,
             .after_calls = r.uintLessThan(u32, crash_after_max),
             .sync_fail_after = sync_fail,
+            .durable = if (mode == .durable) &run.durable else null,
         };
         FaultIo.init(&run.fio, testing.io, plan);
         run.ref = Ref.init();
@@ -262,6 +295,8 @@ pub const Run = struct {
         assert(run.stats.ops <= 1000);
         assert(run.ref.count <= recs_max);
         run.env.deinit();
+        testing.allocator.free(run.undo_bytes);
+        testing.allocator.free(run.undo_entries);
     }
 
     /// Runs up to `ops_max` random ops, stopping at the first injected fault (the crash).
@@ -373,6 +408,13 @@ pub const Run = struct {
         log.check_invariants();
         run.durable_lsn = log.durable_lsn;
         try testing.expect(run.acked_lsn <= run.durable_lsn);
+        if (run.mode == .durable) {
+            // Revert while the handles are open; no cut: the files hold what the syncs made.
+            try run.fio.crash();
+            run.stats.cut_bytes = run.durable.reverted_bytes;
+            run.env.close_handles();
+            return run.recover_check_stats();
+        }
         const durable_end = try run.ref.end_of(run.durable_lsn, log.next_lsn);
         try testing.expect(durable_end >= log.current.first_lsn);
         const durable_offset = segment.segment_header_size + (durable_end - log.current.first_lsn);
@@ -380,6 +422,11 @@ pub const Run = struct {
         run.env.close_handles();
         const dir = run.env.tmp.dir;
         run.stats.cut_bytes = try cut_tail(dir, index, durable_offset, run.rng.random());
+        return run.recover_check_stats();
+    }
+
+    fn recover_check_stats(run: *Run) !void {
+        assert(!run.env.open);
         try run.recover_check();
         assert(run.stats.replayed <= run.ref.count);
         assert(run.stats.from_lsn <= run.durable_lsn);

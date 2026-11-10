@@ -29,6 +29,13 @@ All notable changes to this project are documented in this file. The format foll
   `deinit`. `Db.generation` counts writes and `next` asserts no write happened during a live scan;
   at most one `Iterator` is live per `Db`.
 
+- Durable-boundary `FaultIo` (`src/testing/durable.zig`, `Plan.durable`, `FaultIo.crash`): an
+  undo log in caller-given buffers records the pre-image and the old length of each positional
+  write, drops a file's entries at its successful sync, and `crash()` restores the rest, so
+  unsynced bytes are genuinely forgotten (no allocation; a full log is `error.UndoFull`). The WAL
+  recovery property test also runs through it, with no `CrashSink` cut. File creation, deletion
+  and directory entries are not modeled.
+
 ### Changed
 - A log written by a `kv.Db` before the `commit` frame existed is unreadable: its `checkpoint`
   frames follow frames of no group and are `Corrupted`, and a crashed one has no commit point, so

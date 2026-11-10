@@ -12,6 +12,8 @@
 //!   3. every page equals the model at the last recovered LSN, so a page written back ahead of
 //!      its log (gate off) or skipped by redo is caught;
 //!   4. a second replay yields the same frames, applies nothing and leaves the same pages.
+//! The same sweep also runs in `durable` mode: `.fsync` policy and a durable `FaultIo`, where
+//! the crash reverts every write since each file's last sync (`FaultIo.crash`), with no cut.
 //! A failure reproduces from the printed page size and seed alone. The fixed seeds are a
 //! floor, not a proof; the totals test guards against a vacuous sweep.
 
@@ -48,8 +50,14 @@ const Totals = struct {
 fn run_one(size: u32, seed: u64) !fx.Stats {
     assert(seed != 0);
     assert(size >= 512);
+    return run_mode(size, seed, .cut);
+}
+
+fn run_mode(size: u32, seed: u64, mode: fx.Mode) !fx.Stats {
+    assert(seed != 0);
+    assert(size >= 512);
     var run: fx.Run = undefined;
-    try fx.Run.init(&run, size, seed);
+    try run.init_mode(size, seed, mode);
     defer run.deinit();
 
     run.drive(ops_max) catch |err| {
@@ -66,8 +74,14 @@ fn run_one(size: u32, seed: u64) !fx.Stats {
 fn sweep(size: u32) !Totals {
     assert(seeds.len >= 8);
     assert(size >= 512);
+    return sweep_mode(size, .cut);
+}
+
+fn sweep_mode(size: u32, mode: fx.Mode) !Totals {
+    assert(seeds.len >= 8);
+    assert(size >= 512);
     var totals: Totals = .{};
-    for (seeds) |seed| totals.add(try run_one(size, seed));
+    for (seeds) |seed| totals.add(try run_mode(size, seed, mode));
     try testing.expectEqual(@as(u32, seeds.len), totals.runs);
     return totals;
 }
@@ -100,6 +114,25 @@ test "wal recovery property: 64 KiB pages, every seed" {
 test "wal recovery property: a run is reproducible from its seed" {
     const a = try run_one(fx.sizes[0], seeds[3]);
     const b = try run_one(fx.sizes[0], seeds[3]);
+    try testing.expectEqual(a, b);
+    try testing.expect(a.ops >= 1);
+}
+
+test "wal recovery property: durable FaultIo crash, 512 B pages, every seed" {
+    try expect_not_vacuous(try sweep_mode(fx.sizes[0], .durable));
+}
+
+test "wal recovery property: durable FaultIo crash, 4 KiB pages, every seed" {
+    try expect_not_vacuous(try sweep_mode(fx.sizes[1], .durable));
+}
+
+test "wal recovery property: durable FaultIo crash, 64 KiB pages, every seed" {
+    try expect_not_vacuous(try sweep_mode(fx.sizes[2], .durable));
+}
+
+test "wal recovery property: a durable run is reproducible from its seed" {
+    const a = try run_mode(fx.sizes[0], seeds[3], .durable);
+    const b = try run_mode(fx.sizes[0], seeds[3], .durable);
     try testing.expectEqual(a, b);
     try testing.expect(a.ops >= 1);
 }
