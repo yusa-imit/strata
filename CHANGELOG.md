@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- Seeded crash model for `kv.Db` (`src/testing/kv_model_test.zig`): random put, delete, batch,
+  scan, checkpoint and reopen against a model at three page sizes, crashing through the
+  durable-boundary `FaultIo`; recovery must equal the last committed state, or that state plus
+  the whole in-flight op. `FaultIo` now forwards `dirCreateDir`, `dirOpenDir` and `dirClose`;
+  `Durable` documents that `fileSetLength` is unrecorded and that a failed `restore` still
+  clears the log.
 - `kv.Db` (`src/kv/db.zig`): `open` creates a database in an empty directory (page file, `wal/`,
   root at page 1, ADR-0005) and reopens a cleanly closed one; `put`, `get`, `delete`, `flush`,
   `close`. `open` on a crashed directory replays the log from the checkpoint (idempotent, a torn

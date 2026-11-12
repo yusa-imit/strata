@@ -71,8 +71,9 @@ test "fault_io: io() carries the FaultIo as userdata over its own failing-based 
     try testing.expect(wrapped.vtable.fileWritePositional != inner.vtable.fileWritePositional);
     try testing.expect(wrapped.vtable.fileReadPositional != inner.vtable.fileReadPositional);
     // Slots that are not forwarded stay the `Io.failing` ones, never the inner ones.
-    try testing.expect(wrapped.vtable.dirCreateDir == std.Io.failing.vtable.dirCreateDir);
-    try testing.expect(wrapped.vtable.dirCreateDir != inner.vtable.dirCreateDir);
+    try testing.expect(wrapped.vtable.dirDeleteDir == std.Io.failing.vtable.dirDeleteDir);
+    try testing.expect(wrapped.vtable.dirDeleteDir != inner.vtable.dirDeleteDir);
+    try testing.expect(wrapped.vtable.dirCreateDir != std.Io.failing.vtable.dirCreateDir);
     try testing.expect(wrapped.vtable.fileSync != std.Io.failing.vtable.fileSync);
     fio.check_invariants();
 }
@@ -96,7 +97,9 @@ test "fault_io: a slot that is not forwarded fails safely instead of reading Fau
     FaultIo.init(&fio, testing.io, none_plan);
     const io = fio.io();
 
-    try testing.expectError(error.NoSpaceLeft, tmp.dir.createDir(io, "nope", .default_dir));
+    try tmp.dir.createDir(testing.io, "victim", .default_dir); // Through the inner `Io`.
+    try testing.expectError(error.FileNotFound, tmp.dir.deleteDir(io, "victim")); // Failing.
+    try tmp.dir.deleteDir(testing.io, "victim"); // It was still there.
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, "nope", .{}));
     try testing.expectEqual(@as(u32, 0), fio.write_calls);
     fio.check_invariants();
@@ -437,6 +440,26 @@ test "fault_io: open, sync, setLength, length, lock and close really work throug
     try expect_contents(again, &([_]u8{0} ** 16)); // the real file, seen via the inner Io
     try testing.expectEqual(@as(u32, 0), fio.write_calls); // none of the above is a transfer
     try testing.expectEqual(@as(u32, 0), fio.read_calls);
+    fio.check_invariants();
+}
+
+test "fault_io: createDir, openDir and dir close are forwarded, so a nested layout builds" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fio: FaultIo = undefined;
+    FaultIo.init(&fio, testing.io, plan_of(.canceled, .canceled, 0));
+    const io = fio.io();
+
+    try tmp.dir.createDir(io, "outer", .default_dir); // dirCreateDir
+    var outer = try tmp.dir.openDir(io, "outer", .{ .iterate = true }); // dirOpenDir
+    try outer.createDir(io, "inner", .default_dir);
+    try testing.expectError(error.PathAlreadyExists, outer.createDir(io, "inner", .default_dir));
+    outer.close(io); // dirClose
+
+    var seen = try tmp.dir.openDir(testing.io, "outer/inner", .{}); // the real dirs, inner Io
+    seen.close(testing.io);
+    try testing.expectError(error.FileNotFound, tmp.dir.openDir(io, "absent", .{}));
+    try testing.expectEqual(@as(u32, 0), fio.write_calls);
     fio.check_invariants();
 }
 

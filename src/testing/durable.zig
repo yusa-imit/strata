@@ -7,7 +7,8 @@
 //! genuinely gone. A crash model for the durable boundary, not for torn sectors: use `CrashSink`
 //! for those.
 //!
-//! Not modeled: file creation and deletion, and directory entries. Only the bytes and the length
+//! Not modeled: file creation and deletion, directory entries, and `setLength` (the wrapper
+//! forwards it unrecorded, so a resize counts as durable at once). Only the bytes and the length
 //! of files that were already open through the wrapper are undone. A file closed with unsynced
 //! entries cannot be restored through a stale handle, so it latches `closed_dirty` and `restore`
 //! reports `error.FileClosed` instead of guessing. Sync the file before closing it, or crash
@@ -169,17 +170,20 @@ pub const Durable = struct {
     /// Latches `closed_dirty` when `file` is closed while it still has unsynced entries.
     pub fn note_close(self: *Durable, file: Io.File) void {
         assert(self.entries_used <= self.entries.len);
+        const dirty_before = self.closed_dirty;
         for (self.entries[0..self.entries_used]) |entry| {
             if (entry.file.handle == file.handle) self.closed_dirty = true;
         }
-        assert(self.closed_dirty or self.entries_used <= self.entries.len);
+        assert(!dirty_before or self.closed_dirty); // The latch only ever rises, until `restore`.
         assert(self.bytes_used <= self.pre_images.len);
     }
 
     /// Puts every pre-image back through `inner`, newest first, cuts grown files back to their
     /// old length, and clears the log and its latches. Reports `FileClosed` (nothing restored)
     /// or `UndoFull` (everything recorded was restored) after clearing. The files must still be
-    /// open.
+    /// open. If a step fails midway (`InputOutput`, `Canceled`) the log is cleared all the same:
+    /// the entries not yet undone are forgotten, so the files are left half restored and must
+    /// not be trusted; there is no retry.
     pub fn restore(self: *Durable, inner: Io) RestoreError!void {
         self.check_invariants();
         const closed = self.closed_dirty;

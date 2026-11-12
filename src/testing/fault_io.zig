@@ -10,10 +10,11 @@
 //!   - `fileSync`: counted; from call number `sync_fail_after` (0-based, any file or directory
 //!     handle) it fails with `error.InputOutput` without reaching the inner `Io`; earlier
 //!     calls, and every call when it is null, forward.
-//!   - forwarders to the inner `Io` with the inner userdata: `dirCreateFile`, `dirOpenFile`,
-//!     `dirRead` (listing), `fileClose`, `fileLength`, `fileSetLength`,
-//!     `fileStat`, `fileLock`, `fileTryLock`, `fileUnlock`, `checkCancel`:
-//!     everything `strata.file.File` uses.
+//!   - forwarders to the inner `Io` with the inner userdata: `dirCreateDir`, `dirOpenDir`,
+//!     `dirClose`, `dirCreateFile`, `dirOpenFile`, `dirRead` (listing), `fileClose`,
+//!     `fileLength`, `fileSetLength`, `fileStat`, `fileLock`, `fileTryLock`, `fileUnlock`,
+//!     `checkCancel`: everything `strata.file.File` and `kv.Db.open` use. `fileSetLength` is
+//!     not recorded by the durable undo log (a resize is treated as durable at once).
 //!   - `dirDeleteFile` (segment reclaim): counted; from call number `delete_fail_after` it fails
 //!     with `error.AccessDenied` without reaching the inner `Io`, else it forwards.
 //! Any other `Io` operation through the wrapper is not supported: use the inner `Io` directly.
@@ -96,6 +97,9 @@ pub const FaultIo = struct {
         };
         target.vtable.fileWritePositional = write_positional;
         target.vtable.fileReadPositional = read_positional;
+        target.vtable.dirCreateDir = forward_dir_create_dir;
+        target.vtable.dirOpenDir = forward_dir_open_dir;
+        target.vtable.dirClose = forward_dir_close;
         target.vtable.dirCreateFile = forward_dir_create_file;
         target.vtable.dirOpenFile = forward_dir_open_file;
         target.vtable.dirRead = forward_dir_read;
@@ -152,6 +156,38 @@ fn self_of(userdata: ?*anyopaque) *FaultIo {
     const self: *FaultIo = @ptrCast(@alignCast(userdata));
     assert(self.inner.vtable != &self.vtable); // Forwarding to ourselves would recurse forever.
     return self;
+}
+
+/// Directory creation passes through, so a `kv.Db.open` can build its layout on a `FaultIo`.
+fn forward_dir_create_dir(
+    userdata: ?*anyopaque,
+    dir: Dir,
+    sub_path: []const u8,
+    permissions: Dir.Permissions,
+) Dir.CreateDirError!void {
+    const self = self_of(userdata);
+    assert(sub_path.len > 0);
+    assert(self.inner.vtable.dirCreateDir != forward_dir_create_dir);
+    return self.inner.vtable.dirCreateDir(self.inner.userdata, dir, sub_path, permissions);
+}
+
+fn forward_dir_open_dir(
+    userdata: ?*anyopaque,
+    dir: Dir,
+    sub_path: []const u8,
+    options: Dir.OpenOptions,
+) Dir.OpenError!Dir {
+    const self = self_of(userdata);
+    assert(sub_path.len > 0);
+    assert(self.inner.vtable.dirOpenDir != forward_dir_open_dir);
+    return self.inner.vtable.dirOpenDir(self.inner.userdata, dir, sub_path, options);
+}
+
+fn forward_dir_close(userdata: ?*anyopaque, dirs: []const Dir) void {
+    const self = self_of(userdata);
+    assert(dirs.len > 0);
+    assert(self.inner.vtable.dirClose != forward_dir_close);
+    self.inner.vtable.dirClose(self.inner.userdata, dirs);
 }
 
 fn forward_dir_create_file(
