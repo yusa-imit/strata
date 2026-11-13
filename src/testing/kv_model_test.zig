@@ -34,13 +34,18 @@ fn run_size(page_size: u32, ops_n: u32) !fx.Stats {
     return total;
 }
 
-/// The runs did real work: ops committed, scans and reopens ran, and at least one crash came from
-/// an injected fault (an op in flight) and one from a stop between ops.
+/// The runs did real work: ops committed, scans, checkpoints and reopens ran, an op in flight was
+/// found absent after recovery, and at least one crash came from an injected fault and one from a
+/// stop between ops. `applied` (an op in flight found whole on disk) is not asserted: no random
+/// seed reaches it, the synthetic test below covers that path.
 fn expect_not_vacuous(total: fx.Stats) !void {
     assert(total.applied + total.absent <= total.rounds + total.reopens);
     assert(total.faulted <= total.rounds);
     try testing.expect(total.committed >= 10);
     try testing.expect(total.scans >= 1);
+    try testing.expect(total.reopens >= 1);
+    try testing.expect(total.checkpoints >= 1);
+    try testing.expect(total.absent >= 1);
     try testing.expect(total.faulted >= 1);
     try testing.expect(total.faulted < total.rounds);
     try testing.expectEqual(@as(u32, rounds * seeds.len), total.rounds);

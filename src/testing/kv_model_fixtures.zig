@@ -5,8 +5,10 @@
 //! durable `FaultIo`, then crashes it (`FaultIo.crash` reverts every write not yet synced) and
 //! reopens. After each crash the recovered contents (every key by `get`, and a full scan) must
 //! equal the model as of the last op that returned, or that model plus the whole op that was in
-//! flight: never part of a batch. Everything is reproducible from `(page size, seed)`. Test-only;
-//! I/O through `std.testing.io`, memory through `std.testing.allocator`.
+//! flight: never part of a batch. Everything is reproducible from `(page size, seed)`. Not
+//! exercised: a crash during recovery or open itself, since the fault is armed only after open
+//! and verify (and a reopen op suspends it around its close and open). Test-only; I/O through
+//! `std.testing.io`, memory through `std.testing.allocator`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -36,9 +38,11 @@ pub const Model = struct {
     pub const empty: Model = .{ .gens = @splat(0) };
 
     pub fn count(self: *const Model) u32 {
-        assert(self.gens.len == keys_max);
         var total: u32 = 0;
-        for (self.gens) |gen| total += @intFromBool(gen != 0);
+        for (self.gens) |gen| {
+            assert(gen < std.math.maxInt(u32)); // `next_gen` never hands out the last one.
+            total += @intFromBool(gen != 0);
+        }
         assert(total <= keys_max);
         return total;
     }
@@ -49,7 +53,9 @@ pub const Model = struct {
             assert(pending.keys[i] < keys_max);
             self.gens[pending.keys[i]] = pending.gens[i];
         }
-        assert(self.count() <= keys_max);
+        // The last op on a key wins.
+        const last = pending.len -| 1;
+        assert(pending.len == 0 or self.gens[pending.keys[last]] == pending.gens[last]);
     }
 };
 
@@ -85,11 +91,12 @@ pub const Stats = struct {
     absent: u32 = 0,
 
     pub fn add(self: *Stats, other: Stats) void {
-        assert(self.rounds <= 1 << 20);
-        assert(other.rounds <= 1 << 20);
+        assert(self.faulted <= self.rounds); // A fault is counted in the round it ends.
+        assert(other.faulted <= other.rounds);
         inline for (std.meta.fields(Stats)) |field| {
             @field(self, field.name) += @field(other, field.name);
         }
+        assert(self.faulted <= self.rounds);
     }
 };
 
@@ -107,6 +114,9 @@ pub fn options_of(page_size: u32) fx.Options {
 
 /// A `Db` that may be closed already (a reopen that failed leaves none).
 const Session = struct { db: Db, open: bool };
+
+/// The fault plan and call counters saved while the plan is suspended.
+const Suspended = struct { plan: fault_io.Plan, writes: u32, syncs: u32 };
 
 /// Initialised in place: the fault wrapper points at the undo log.
 pub const Run = struct {
@@ -242,7 +252,9 @@ pub const Run = struct {
         try testing.expectEqual(@as(u32, 0), run.durable.entries_used);
     }
 
-    /// Runs ops until `ops_n` are done or one fails; a failure must be the injected fault.
+    /// Runs ops until `ops_n` are done or one fails; a failure must be the injected fault: once
+    /// it fired, `InputOutput` (failed sync), `Canceled` (canceled write) and `Failed` (the
+    /// latched `Db`, `errors.map` of both) are the only errors swallowed.
     fn drive(run: *Run, s: *Session, ops_n: u32) !void {
         assert(s.open);
         assert(ops_n >= 1);
@@ -250,7 +262,10 @@ pub const Run = struct {
         for (0..ops_n) |_| {
             run.step(s) catch |err| {
                 if (!run.faulted()) return err; // A failure nothing injected: a real bug.
-                return;
+                switch (err) {
+                    error.InputOutput, error.Canceled, error.Failed => return,
+                    else => return err, // Not an injected fault: a real bug.
+                }
             };
             run.fio.check_invariants();
         }
@@ -270,10 +285,11 @@ pub const Run = struct {
     }
 
     fn next_gen(run: *Run) u32 {
-        assert(run.gen_next >= 1);
-        run.gen_next += 1;
-        assert(run.gen_next > 1);
-        return run.gen_next - 1;
+        const gen = run.gen_next;
+        assert(gen >= 1); // 0 is "absent".
+        assert(gen < std.math.maxInt(u32)); // Generations are never reused.
+        run.gen_next = gen + 1;
+        return gen;
     }
 
     /// The write returned: the pending op is part of the model now.
@@ -301,7 +317,8 @@ pub const Run = struct {
         var key_buf: [8]u8 = undefined;
         run.pending.add(n, 0);
         const found = try db.delete(fx.key_of(&key_buf, n));
-        assert(found == (run.model.gens[n] != 0)); // The model agrees on presence.
+        // The model agrees on presence (a check that survives ReleaseFast).
+        try testing.expectEqual(run.model.gens[n] != 0, found);
         run.committed();
     }
 
@@ -333,39 +350,50 @@ pub const Run = struct {
 
     fn op_checkpoint(run: *Run, db: *Db) !void {
         assert(run.pending.len == 0);
-        assert(run.model.count() <= keys_max);
         try db.checkpoint();
+        // A checkpoint changes no contents: the model still holds exactly.
+        try testing.expect(try run.matches(db, &run.model));
         run.stats.checkpoints += 1;
         assert(run.pending.len == 0);
     }
 
-    /// `Db.close` with the fault plan suspended: a close that fails halfway leaves page writes
-    /// unsynced in a file it then closes, which the undo log cannot revert (`closed_dirty`). The
-    /// plan resumes after, as many calls later as the close made.
-    fn close_clean(run: *Run, db: *Db) void {
-        const plan = run.fio.plan;
-        const writes_before = run.fio.write_calls;
-        const syncs_before = run.fio.sync_calls;
+    /// Suspends the fault plan: a close or open that fails halfway leaves page writes unsynced
+    /// in a file it then closes, which the undo log cannot revert (`closed_dirty`).
+    fn suspend_faults(run: *Run) Suspended {
+        assert(run.fio.plan.durable == &run.durable);
+        const saved: Suspended = .{
+            .plan = run.fio.plan,
+            .writes = run.fio.write_calls,
+            .syncs = run.fio.sync_calls,
+        };
         run.fio.plan.write = .none;
         run.fio.plan.sync_fail_after = null;
-        db.close();
-        run.fio.plan = plan;
-        run.fio.plan.after_calls +|= run.fio.write_calls - writes_before;
-        if (plan.sync_fail_after) |after| {
-            run.fio.plan.sync_fail_after = after +| (run.fio.sync_calls - syncs_before);
-        }
-        assert(run.fio.write_calls >= writes_before);
-        assert(run.fio.sync_calls >= syncs_before);
+        assert(!run.faulted());
+        return saved;
     }
 
-    /// A clean close (checkpoint) and open: no crash, so the model must hold exactly.
+    /// Resumes the plan as many calls later as the suspended stretch made.
+    fn resume_faults(run: *Run, saved: Suspended) void {
+        assert(run.fio.write_calls >= saved.writes);
+        assert(run.fio.sync_calls >= saved.syncs);
+        run.fio.plan = saved.plan;
+        run.fio.plan.after_calls +|= run.fio.write_calls - saved.writes;
+        if (saved.plan.sync_fail_after) |after| {
+            run.fio.plan.sync_fail_after = after +| (run.fio.sync_calls - saved.syncs);
+        }
+    }
+
+    /// A clean close (checkpoint) and open, both with the plan suspended: no crash, so the
+    /// model must hold exactly.
     fn op_reopen(run: *Run, s: *Session) !void {
         assert(s.open);
         assert(run.pending.len == 0);
-        run.close_clean(&s.db);
+        const saved = run.suspend_faults();
+        s.db.close();
         s.open = false;
         s.db = try run.open_db(run.fio.io());
         s.open = true;
+        run.resume_faults(saved);
         try run.verify(&s.db);
         run.stats.reopens += 1;
     }
