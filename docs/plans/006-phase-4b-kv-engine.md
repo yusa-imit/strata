@@ -74,6 +74,8 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       under group commit with `.fdatasync` ≥ 200k ops/s; `Recovery.replay` of a 1 GB log into a
       counting `Apply` < 5 s. Figures and sync policy into `000-inherited.md`. Verify: `zig build
       bench` prints both; a missed floor is fixed here or split out before release.
+      Status: both benches land and run (`zig build bench -- wal [MiB]`); append meets its floor,
+      the 1 GiB replay measured 5.222 s against 5 s, so the item stays open for that fix.
 - [ ] **Docs, module status, release v0.7.0** (`docs/`, `README.md`, `build.zig.zon`). Drop
       `NotImplemented` from `src/kv.zig`; README kv row `Landed`; tick 4D; CHANGELOG (kv layout
       v1, `Db`/`WriteBatch`/`Iterator`, tree op groups) + `.version = "0.7.0"` in one PR, then

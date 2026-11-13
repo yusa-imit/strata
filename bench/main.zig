@@ -28,6 +28,7 @@ const strata = @import("strata");
 const codec = strata.codec;
 const pool_bench = @import("pool.zig");
 const btree_bench = @import("btree.zig");
+const wal_bench = @import("wal.zig");
 
 /// Everything a run needs, spelled out so no knob hides in a default (Tiger Style 1.15).
 const Options = struct {
@@ -40,6 +41,7 @@ const Options = struct {
     pass_count: u32,
     pool: pool_bench.Options,
     btree: btree_bench.Options,
+    wal: wal_bench.Options,
 };
 
 const options_baseline: Options = .{
@@ -61,6 +63,12 @@ const options_baseline: Options = .{
         .get_count = 1 << 20,
         .logged_key_count = 8192,
         .seed = 0x5742_A7A0_5EED,
+    },
+    .wal = .{
+        .append_count = 1 << 20,
+        .batch_count = 4096,
+        .log_bytes = wal_bench.log_bytes_full,
+        .segment_bytes = 64 << 20,
     },
 };
 
@@ -154,6 +162,10 @@ pub fn main(init: std.process.Init) !void {
         });
         ran_count += 1;
     }
+    const wal_size: ?[]const u8 = if (raw_args.len > 2) raw_args[2] else null;
+    var wal_options = options_baseline.wal;
+    wal_options.log_bytes = try wal_bench.log_bytes_parse(wal_size);
+    ran_count += try wal_bench.run_all(io, gpa, std.Io.Dir.cwd(), filter, wal_options, out);
     if (ran_count == 0) try out.print("no benchmark name contains the filter\n", .{});
     try out.flush();
 }
@@ -412,6 +424,7 @@ fn btree_insert_logged_run(fixture: *Fixture) RunError!Result {
 test {
     _ = pool_bench; // The pool kernels' tests live in pool.zig; reference it so they run.
     _ = btree_bench; // Likewise for the B+Tree kernels.
+    _ = wal_bench; // And the WAL append and replay kernels.
 }
 
 const options_test: Options = .{
@@ -421,6 +434,7 @@ const options_test: Options = .{
     .pass_count = 3,
     .pool = pool_bench.options_test,
     .btree = btree_bench.options_test,
+    .wal = wal_bench.options_test,
 };
 
 fn test_fixture_init(
