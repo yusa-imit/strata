@@ -44,7 +44,7 @@ const Case = struct {
 
     fn open(case: *Case, dir: std.Io.Dir, name: []const u8) !File {
         assert(name.len > 0);
-        assert(case.durable.entries_used == 0 or case.durable.entries_used <= entries_count);
+        assert(case.durable.entries_used <= case.durable.entries.len);
         assert(case.fio.plan.durable == &case.durable);
         const io = case.fio.io();
         return File.open(io, dir, name, .{ .create = true, .sync_policy = .fsync });
@@ -299,4 +299,52 @@ test "durable: without a Durable, crash is a no-op and writes are not recorded" 
     try f.writeAtAll(fio.io(), "abc", 0);
     try fio.crash();
     try expect_contents(f, "abc");
+}
+
+test "durable: closing a synced file leaves closed_dirty false and crash restores nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var case: Case = undefined;
+    case.init(entries_count, bytes_count, null);
+    const f = try case.open(tmp.dir, "a.bin");
+
+    try f.writeAtAll(testing.io, "abc", 0);
+    try f.writeAtAll(case.fio.io(), "X", 0);
+    try f.sync(case.fio.io());
+    f.close(case.fio.io());
+    try testing.expect(!case.durable.closed_dirty);
+    try testing.expectEqual(@as(u32, 0), case.durable.entries_used);
+    try case.fio.crash(); // Nothing to undo, and no error.
+    try testing.expectEqual(@as(u64, 0), case.durable.reverted_bytes);
+    const again = try File.open(testing.io, tmp.dir, "a.bin", .{});
+    defer again.close(testing.io);
+
+    try expect_contents(again, "Xbc");
+}
+
+test "durable: a handle number reused after a clean close does not inherit the old entries" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var case: Case = undefined;
+    case.init(entries_count, bytes_count, null);
+    const first = try case.open(tmp.dir, "a.bin");
+
+    try first.writeAtAll(testing.io, "abc", 0);
+    try first.writeAtAll(case.fio.io(), "X", 0);
+    try first.sync(case.fio.io());
+    first.close(case.fio.io());
+    try testing.expect(!case.durable.closed_dirty);
+    const second = try case.open(tmp.dir, "b.bin"); // Typically the same descriptor number.
+    defer second.close(testing.io);
+
+    try second.writeAtAll(testing.io, "def", 0);
+    try second.writeAtAll(case.fio.io(), "Y", 0);
+    try testing.expectEqual(@as(u32, 1), case.durable.entries_used);
+    try case.fio.crash();
+    try expect_contents(second, "def"); // Only the new file's unsynced write is undone.
+    const old = try File.open(testing.io, tmp.dir, "a.bin", .{});
+    defer old.close(testing.io);
+
+    try expect_contents(old, "Xbc"); // The synced write of the closed file stays.
+    try testing.expect(!case.durable.closed_dirty);
 }

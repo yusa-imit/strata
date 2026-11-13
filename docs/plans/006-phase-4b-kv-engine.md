@@ -66,7 +66,7 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       that records pre-images of positional writes in a caller-given undo buffer, drops a file's
       entries at its `fileSync`, and on `crash()` restores them (no allocation; full → typed
       error). Verify: unsynced write → old bytes, synced → new; the WAL property test passes on it.
-- [ ] **kv seeded crash model** (`src/testing/kv_model_test.zig`). Random put/delete/batch/scan/
+- [x] **kv seeded crash model** (`src/testing/kv_model_test.zig`). Random put/delete/batch/scan/
       checkpoint/reopen vs a bounded model, 3 page sizes × fixed seeds, crashing through the item
       above: recovery equals the last *committed* state (the durable-boundary variant plan 005
       deferred). Verify: green; mutants (commit skips sync, redo ignores lsn) fail.
