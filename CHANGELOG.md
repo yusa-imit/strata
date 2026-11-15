@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- Read-ahead window in `wal.Reader` (`read_window_size`, 64 KiB, allocated once in `open`):
+  sequential regular frames are served from memory, one positional read per window instead of
+  two per frame, and no byte is read twice. Replaying a 1 GiB log drops from 5.2 s to 0.35 s
+  (plan 006 item 11). Verdicts, locking and borrowing are unchanged.
 - Seeded crash model for `kv.Db` (`src/testing/kv_model_test.zig`): random put, delete, batch,
   scan, checkpoint and reopen against a model at three page sizes, crashing through the
   durable-boundary `FaultIo`; recovery must equal the last committed state, or that state plus

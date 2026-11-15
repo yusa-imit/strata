@@ -472,7 +472,7 @@ test "reader: injected read faults surface as typed errors, short reads change n
     }
 }
 
-test "reader: a frame costs a read of exactly its own bytes, not of the rest of the segment" {
+test "reader: no byte is read twice and none beyond the frames of the segment" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     _ = try fx.put_segment(tmp.dir, 1, 1, &.{ pa, pb, pc });
