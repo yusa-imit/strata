@@ -24,15 +24,16 @@
 //! segment, the segments closed again but the first, so it is linear in `segments_max` and does
 //! not read frames. `next` is one CRC per frame and, amortised, one positional read per
 //! `read_window_size` bytes: a regular frame (a whole header that is not all zero, a legal `len`
-//! that fits in the segment and in the window) is served from the read-ahead window, which a
-//! read of `min(bytes left, read_window_size)` refills from the cursor when a frame is not
-//! inside it, so no byte is read twice and none beyond the segment end. A regular frame larger
-//! than the window, and any irregular header (all zero, `len` beyond `payload_bytes_max` or past
-//! the segment end, or cut short), take the slow path: the 17 byte header, then the rest of the
-//! frame, or for an irregular header up to `frame_bytes_max` bytes, so the zero-tail and
-//! torn-tail checks see the whole window. Only a failure in the newest segment runs the
-//! look-ahead, at most once: a pass over the rest of that segment, at most
-//! `segment_bytes_limit` bytes, whose CRC runs only on LSN matches.
+//! that fits in the segment and in the window) is served from the read-ahead window; when a
+//! frame is not wholly inside it, the unconsumed tail moves to the window start and one read
+//! fills the window up to `min(bytes left, read_window_size)`, so no byte is read twice and none
+//! beyond the segment end. A regular frame larger than the window is the window bytes plus one
+//! read of the rest. Any irregular header (all zero, `len` beyond `payload_bytes_max` or past
+//! the segment end, or cut short) takes the slow path: the 17 byte header, then up to
+//! `frame_bytes_max` bytes, so the zero-tail and torn-tail checks see the whole window.
+//! Only a failure in the newest segment runs the look-ahead, at most once: a pass over the
+//! rest of that segment, at most `segment_bytes_limit` bytes, whose CRC runs only on LSN
+//! matches.
 //! Locking: the reader holds the exclusive lock (`Segment.open`) of the segment it reads, from
 //! `open` until the end of the log, an error (which releases it at once) or `deinit`, so a
 //! second reader or a writer on that segment fails with `WouldBlock` meanwhile. The lock is per
@@ -82,6 +83,7 @@ pub const read_window_size: u32 = 65536;
 comptime {
     assert(read_window_size >= frame.frame_header_size);
     assert(read_window_size <= frame.frame_bytes_max);
+    assert(read_window_size == window_size); // One 64 KiB size for the window and the scan.
     assert(window_stride > 0);
     assert(window_size >= frame.frame_header_size);
     assert(@as(u64, windows_max) * window_stride >= segment.segment_bytes_limit);
@@ -442,14 +444,25 @@ pub const Reader = struct {
         if (!self.window_covers(frame.frame_header_size)) try self.refill(io, seg, remaining);
         const at = self.offset - self.win_start;
         const head = self.win[at..][0..frame.frame_header_size];
-        if (std.mem.allEqual(u8, head, 0)) return null;
-        const len = std.mem.readInt(u32, head[0..4], .little);
-        if (len > frame.payload_bytes_max) return null;
-        const total = frame.frame_header_size + len;
-        if (total > remaining or total > read_window_size) return null;
+        const total = Reader.regular_total(head, remaining) orelse return null;
+        if (total > read_window_size) return try self.large_image(io, seg, total);
         if (!self.window_covers(total)) try self.refill(io, seg, remaining);
         assert(self.window_covers(total));
         return self.win[self.offset - self.win_start ..][0..total];
+    }
+
+    /// A regular frame of `total` bytes, larger than the window: the window bytes from the
+    /// cursor are copied to the frame buffer and only the rest is read, so nothing is read twice.
+    fn large_image(self: *Reader, io: Io, seg: segment.Segment, total: u32) NextError![]u8 {
+        assert(total > read_window_size);
+        assert(total <= frame.frame_bytes_max);
+        assert(self.window_covers(frame.frame_header_size));
+        const have: u32 = @intCast(self.win_start + self.win_len - self.offset);
+        assert(have < total); // The window is smaller than the frame.
+        const at = self.offset - self.win_start;
+        @memcpy(self.buf[0..have], self.win[at..][0..have]);
+        try read_exact(io, seg, self.buf[have..total], self.offset + have);
+        return self.buf[0..total];
     }
 
     /// True when the window holds the `n` bytes from the cursor.
@@ -466,10 +479,34 @@ pub const Reader = struct {
         assert(remaining >= frame.frame_header_size);
         assert(self.offset + remaining == self.length);
         const n: u32 = @intCast(@min(remaining, read_window_size));
+        const end = self.win_start + self.win_len;
+        var keep: u32 = 0; // Unconsumed bytes already in the window: moved, not read again.
+        if (self.win_len > 0 and self.offset >= self.win_start and self.offset <= end) {
+            keep = @intCast(end - self.offset);
+        }
+        assert(keep < n); // Called only when the window lacks a header or a frame that fits.
+        if (keep > 0) {
+            const at = self.offset - self.win_start;
+            std.mem.copyForwards(u8, self.win[0..keep], self.win[at..][0..keep]);
+        }
         self.win_len = 0; // A failed read leaves no stale claim.
-        try read_exact(io, seg, self.win[0..n], self.offset);
+        try read_exact(io, seg, self.win[keep..n], self.offset + keep);
         self.win_start = self.offset;
         self.win_len = n;
+    }
+
+    /// The length of the regular frame whose first bytes are `head` (a whole header), with
+    /// `remaining` bytes left in the segment, or `null` when the header is irregular: all zero,
+    /// `len` beyond `payload_bytes_max`, or a frame that does not fit in the segment.
+    fn regular_total(head: []const u8, remaining: u64) ?u32 {
+        assert(head.len == frame.frame_header_size);
+        assert(remaining >= head.len);
+        if (std.mem.allEqual(u8, head, 0)) return null;
+        const len = std.mem.readInt(u32, head[0..4], .little);
+        if (len > frame.payload_bytes_max) return null;
+        const total = frame.frame_header_size + len;
+        if (total > remaining) return null;
+        return total;
     }
 
     /// The frame image at the cursor read straight from the file, for what the window does not
@@ -499,11 +536,7 @@ pub const Reader = struct {
         assert(self.offset + remaining == self.length);
         const window: u32 = @intCast(@min(remaining, frame.frame_bytes_max));
         if (head.len < frame.frame_header_size) return window;
-        if (std.mem.allEqual(u8, head, 0)) return window;
-        const len = std.mem.readInt(u32, head[0..4], .little);
-        if (len > frame.payload_bytes_max) return window;
-        const total = frame.frame_header_size + len;
-        if (total > remaining) return window;
+        const total = Reader.regular_total(head, remaining) orelse return window;
         assert(total <= window);
         return total;
     }
