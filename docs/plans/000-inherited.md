@@ -73,4 +73,5 @@
 | 2026-11-01 | B+Tree sequential insert (4 KiB, unlogged) | 1.26 M ops/s | 1 M | Apple aarch64, ReleaseFast; 100k ascending keys into a fresh tree |
 | 2026-11-01 | B+Tree logged insert (4 KiB, `page_images` frame per op) | 0.22 M ops/s | — | Apple aarch64, ReleaseFast; recorded, not gated (a whole page image per insert) |
 | 2026-11-13 | WAL append (128 B payload, 145 B frame, group commit) | 0.905 M ops/s | 0.2 M | Apple aarch64, ReleaseFast; sync policy `.fdatasync`, one `commit` per 4096 appends (256 syncs for 1 Mi appends), one caller; floor met |
-| 2026-11-13 | WAL replay (1 GiB log, 7.4 M frames, counting `Apply`) | 5.222 s | 5 s | Apple aarch64, ReleaseFast; log written with `.none` (setup), page cache warm; **floor missed by 4%**, 128 MiB: 0.674 s; fix or split out before v0.7.0 |
+| 2026-11-13 | WAL replay (1 GiB log, 7.4 M frames, counting `Apply`) | 5.222 s | 5 s | Apple aarch64, ReleaseFast; log written with `.none` (setup), page cache warm; floor missed by 4% before the `wal.Reader` read-ahead window (#91) |
+| 2026-11-18 | WAL replay (1 GiB log, 7.4 M frames, counting `Apply`) | 0.284 s | 5 s | Apple aarch64, ReleaseFast; after the read-ahead window (#91), page cache warm; floor met. Append re-measured 0.940 M ops/s, `.fdatasync` (macOS: not `F_FULLFSYNC`) |

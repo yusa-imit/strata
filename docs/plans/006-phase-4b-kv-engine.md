@@ -70,12 +70,13 @@ No item is blocked (`.dependencies = .{}`). Only `src/kv/db.zig` may cache an `I
       checkpoint/reopen vs a bounded model, 3 page sizes × fixed seeds, crashing through the item
       above: recovery equals the last *committed* state (the durable-boundary variant plan 005
       deferred). Verify: green; mutants (commit skips sync, redo ignores lsn) fail.
-- [ ] **WAL benches** (`bench/wal.zig`, `bench/main.zig`). PRD §5, ReleaseFast: 128 B appends
+- [x] **WAL benches** (`bench/wal.zig`, `bench/main.zig`). PRD §5, ReleaseFast: 128 B appends
       under group commit with `.fdatasync` ≥ 200k ops/s; `Recovery.replay` of a 1 GB log into a
       counting `Apply` < 5 s. Figures and sync policy into `000-inherited.md`. Verify: `zig build
       bench` prints both; a missed floor is fixed here or split out before release.
-      Status: both benches land and run (`zig build bench -- wal [MiB]`); append meets its floor,
-      the 1 GiB replay measured 5.222 s against 5 s, so the item stays open for that fix.
+      Status: both benches land and run (`zig build bench -- wal [MiB]`); append 0.940 M ops/s
+      and the 1 GiB replay 0.284 s (after the `wal.Reader` read-ahead window, #91) meet their
+      floors; figures recorded in `000-inherited.md`.
 - [ ] **Docs, module status, release v0.7.0** (`docs/`, `README.md`, `build.zig.zon`). Drop
       `NotImplemented` from `src/kv.zig`; README kv row `Landed`; tick 4D; CHANGELOG (kv layout
       v1, `Db`/`WriteBatch`/`Iterator`, tree op groups) + `.version = "0.7.0"` in one PR, then
