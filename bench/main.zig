@@ -69,7 +69,7 @@ const options_baseline: Options = .{
         .batch_count = 4096,
         .log_bytes = wal_bench.log_bytes_full,
         .segment_bytes = 64 << 20,
-        .free_bytes = null,
+        .free_bytes_override = null,
     },
 };
 
@@ -135,18 +135,13 @@ pub fn main(init: std.process.Init) !void {
     const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
     const filter: ?[]const u8 = if (raw_args.len > 1) raw_args[1] else null;
 
+    // Validate the WAL arguments and the free space before any benchmark or fixture exists.
+    const wal_size: ?[]const u8 = if (raw_args.len > 2) raw_args[2] else null;
+    const wal_options = try wal_options_resolve(io, filter, wal_size);
+
     var buffer: [1024]u8 = undefined;
     var file_writer = std.Io.File.stdout().writer(io, &buffer);
     const out = &file_writer.interface;
-
-    // Validate the WAL size argument before any benchmark runs.
-    const wal_size: ?[]const u8 = if (raw_args.len > 2) raw_args[2] else null;
-    var wal_options = options_baseline.wal;
-    wal_options.log_bytes = wal_bench.log_bytes_parse(wal_size) catch |err| {
-        try wal_bench.usage_write(out, err);
-        try out.flush();
-        return err;
-    };
 
     var name_buffer: [pool_bench.name_len_max]u8 = undefined;
     const pool_name = try pool_file_name(io, &name_buffer);
@@ -175,6 +170,33 @@ pub fn main(init: std.process.Init) !void {
     ran_count += try wal_bench.run_all(io, gpa, std.Io.Dir.cwd(), filter, wal_options, out);
     if (ran_count == 0) try out.print("no benchmark name contains the filter\n", .{});
     try out.flush();
+}
+
+/// The WAL options for this run: the size argument parsed (1 ... `mib_max` MiB) and the free
+/// space of the cwd checked for the benchmarks `filter` selects. A rejection prints the error
+/// and usage to stderr and is returned; nothing has run yet.
+fn wal_options_resolve(
+    io: std.Io,
+    filter: ?[]const u8,
+    wal_size: ?[]const u8,
+) !wal_bench.Options {
+    var options = options_baseline.wal;
+    var buffer: [512]u8 = undefined;
+    var file_writer = std.Io.File.stderr().writer(io, &buffer);
+    const err_out = &file_writer.interface;
+    options.log_bytes = wal_bench.log_bytes_parse(wal_size) catch |err| {
+        try wal_bench.usage_write(err_out, err);
+        try err_out.flush();
+        return err;
+    };
+    wal_bench.space_preflight(io, std.Io.Dir.cwd(), filter, options) catch |err| {
+        try err_out.print("error: {t}: not enough free space for the WAL benchmarks\n", .{err});
+        try err_out.flush();
+        return err;
+    };
+    assert(options.log_bytes >= 1 << 20);
+    assert(options.log_bytes <= @as(u64, wal_bench.mib_max) << 20);
+    return options;
 }
 
 fn filter_matches(name: []const u8, filter: ?[]const u8) bool {

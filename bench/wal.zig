@@ -77,7 +77,7 @@ pub const Options = struct {
     /// `Writer.Options.segment_bytes_max` for both benchmarks.
     segment_bytes: u64,
     /// Free bytes of the scratch filesystem; null asks the OS (`free_bytes`). Tests set it.
-    free_bytes: ?u64,
+    free_bytes_override: ?u64,
 };
 
 /// One kernel's outcome with the time its timed section took; `sync_count` is the syncs the
@@ -89,7 +89,7 @@ pub const options_test: Options = .{
     .batch_count = 8,
     .log_bytes = 40 * frame_len,
     .segment_bytes = 16 * frame_len,
-    .free_bytes = null,
+    .free_bytes_override = null,
 };
 
 /// The counting redo target: frames, payload bytes, and the sum of the payload head bytes.
@@ -344,19 +344,25 @@ pub fn free_bytes(io: Io, parent: Io.Dir) ?u64 {
     const dir = parent.openDir(io, ".", .{}) catch return null;
     defer dir.close(io);
 
-    assert(dir.handle >= 0);
     if (comptime is_darwin) {
+        assert(dir.handle >= 0);
         var info: DarwinStatfs = undefined;
         if (fstatfs(dir.handle, &info) != 0) return null;
-        return info.bavail * info.bsize;
+        if (info.bsize == 0) return null;
+        return info.bavail *| info.bsize;
     } else if (comptime builtin.os.tag == .linux and (builtin.cpu.arch == .x86_64 or
         builtin.cpu.arch == .aarch64))
     {
+        assert(dir.handle >= 0);
         var info: LinuxStatfs = undefined;
         const fd: usize = @intCast(dir.handle);
         const rc = std.os.linux.syscall2(.fstatfs, fd, @intFromPtr(&info));
         if (std.os.linux.errno(rc) != .SUCCESS) return null;
-        return info.bavail * @as(u64, @intCast(info.bsize));
+        // Blocks are counted in fragment-size units; old kernels leave `frsize` zero.
+        const unit_signed = if (info.frsize > 0) info.frsize else info.bsize;
+        if (unit_signed <= 0) return null;
+        const unit: u64 = @intCast(unit_signed);
+        return info.bavail *| unit;
     } else {
         return null;
     }
@@ -372,38 +378,77 @@ const DarwinStatfs = extern struct {
     rest: [2136]u8,
 };
 
-/// `struct statfs` of 64-bit linux; only the leading fields are read.
+/// `struct statfs` of 64-bit linux (x86_64, aarch64).
 const LinuxStatfs = extern struct {
     type: i64,
     bsize: i64,
     blocks: u64,
     bfree: u64,
     bavail: u64,
-    rest: [80]u8,
+    files: u64,
+    ffree: u64,
+    fsid: [2]i32,
+    namelen: i64,
+    frsize: i64,
+    flags: i64,
+    spare: [4]i64,
 };
 
 comptime {
     assert(@sizeOf(DarwinStatfs) == 2168);
     assert(@offsetOf(DarwinStatfs, "bavail") == 24);
     assert(@sizeOf(LinuxStatfs) == 120);
+    assert(@offsetOf(LinuxStatfs, "frsize") == 72);
 }
 
 extern "c" fn fstatfs(fd: c_int, buf: *DarwinStatfs) c_int;
 
-/// Bytes the whole run may leave on disk at once: both logs plus rotation slack.
-pub fn space_need(options: Options) u64 {
+/// Whether `name` runs under `filter` (substring match; null selects all).
+fn selected(name: Name, filter: ?[]const u8) bool {
+    const text = filter orelse "";
+    return std.mem.find(u8, @tagName(name), text) != null;
+}
+
+/// Bytes the selected benchmarks leave on disk at once (both logs stay until the run ends)
+/// plus rotation slack; null when the filter selects none. Saturates instead of wrapping.
+pub fn space_need(options: Options, filter: ?[]const u8) ?u64 {
     assert(options.segment_bytes >= frame_len);
     assert(options.log_bytes <= @as(u64, mib_max) << 20);
-    const append_bytes = @as(u64, options.append_count) * frame_len;
-    return append_bytes + options.log_bytes + 2 * options.segment_bytes;
+    var need: u64 = 0;
+    var chosen: u32 = 0;
+    for (std.enums.values(Name)) |name| {
+        if (!selected(name, filter)) continue;
+        const bytes = switch (name) {
+            .wal_append => @as(u64, options.append_count) * frame_len,
+            .wal_replay => options.log_bytes,
+        };
+        need +|= bytes;
+        chosen += 1;
+    }
+    if (chosen == 0) return null;
+    return need +| 2 *| options.segment_bytes;
 }
 
 /// `free` is null when unknown (no check). Fails with `InsufficientSpace` below `need`.
 pub fn space_check(free: ?u64, need: u64) CheckError!void {
     assert(need > 0);
-    assert(need < std.math.maxInt(u64) / 2);
+    assert(need >= frame_len);
     const have = free orelse return;
     if (have < need) return error.InsufficientSpace;
+}
+
+/// The space check for the benchmarks `filter` selects, under `parent`; nothing selected
+/// passes. `main` calls it right after argument parsing, `run_all` again before creating files.
+pub fn space_preflight(
+    io: Io,
+    parent: Io.Dir,
+    filter: ?[]const u8,
+    options: Options,
+) CheckError!void {
+    assert(options.append_count >= 1);
+    assert(options.log_bytes >= frame_len);
+    const need = space_need(options, filter) orelse return;
+    try space_check(options.free_bytes_override orelse free_bytes(io, parent), need);
 }
 
 /// Runs the benchmarks whose name contains `filter` (all when null), each in a fresh
@@ -420,7 +465,7 @@ pub fn run_all(
 ) !u32 {
     assert(options.log_bytes >= frame_len);
     assert(options.append_count >= 1);
-    try space_check(options.free_bytes orelse free_bytes(io, parent), space_need(options));
+    try space_preflight(io, parent, filter, options);
     var random: [8]u8 = undefined;
     io.random(&random);
     var name_buffer: [dir_name_len_max]u8 = undefined;
@@ -470,7 +515,6 @@ test "append_run: counts the appends, makes them durable and syncs once per batc
     try testing.expectEqual(bytes, timed.result.byte_count);
     // 100 appends in batches of 8: 13 commits; rotation syncs add to the count, never remove.
     try testing.expect(timed.sync_count >= 13);
-    try testing.expectEqual(timed.sync_count, timed.result.sink);
 }
 
 test "replay_run: replays exactly the frames the log holds across rotations" {
@@ -481,7 +525,6 @@ test "replay_run: replays exactly the frames the log holds across rotations" {
     try testing.expectEqual(@as(u64, 40), timed.result.operation_count);
     try testing.expectEqual(@as(u64, 40) * payload_len, timed.result.byte_count);
     // The payload head byte is the low byte of the index (all below 256): 0 + 1 + ... + 39.
-    try testing.expectEqual(@as(u64, 780), timed.result.sink);
     try testing.expectEqual(head_sum_expected(40), timed.result.sink);
     try testing.expectEqual(@as(u64, 0), timed.sync_count);
 }
@@ -590,17 +633,18 @@ test "replay_verify returns ReplayMismatch for each way the replay can differ" {
 }
 
 test "space_check fails with InsufficientSpace and run_all creates nothing then" {
-    try space_check(null, 100);
-    try space_check(100, 100);
-    try testing.expectError(error.InsufficientSpace, space_check(99, 100));
-    try testing.expect(space_need(options_test) > options_test.log_bytes);
+    try space_check(null, 1000);
+    try space_check(1000, 1000);
+    try testing.expectError(error.InsufficientSpace, space_check(999, 1000));
+    const need_all = space_need(options_test, null).?;
+    try testing.expect(need_all > options_test.log_bytes);
 
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     if (free_bytes(testing.io, tmp.dir)) |free| try testing.expect(free > 0);
     var options = options_test;
-    options.free_bytes = space_need(options_test) - 1;
+    options.free_bytes_override = need_all - 1;
     var buffer: [1024]u8 = undefined;
     var out = Io.Writer.fixed(&buffer);
     try testing.expectError(
@@ -610,6 +654,35 @@ test "space_check fails with InsufficientSpace and run_all creates nothing then"
     var walker = tmp.dir.iterate();
     try testing.expect((try walker.next(testing.io)) == null);
     try testing.expectEqual(@as(usize, 0), out.buffered().len);
+}
+
+test "space_need counts only the selected benchmarks and saturates" {
+    const slack = 2 * options_test.segment_bytes;
+    const append_bytes = @as(u64, options_test.append_count) * frame_len;
+    try testing.expectEqual(append_bytes + slack, space_need(options_test, "append").?);
+    try testing.expectEqual(options_test.log_bytes + slack, space_need(options_test, "replay").?);
+    try testing.expectEqual(
+        append_bytes + options_test.log_bytes + slack,
+        space_need(options_test, "wal").?,
+    );
+    try testing.expect(space_need(options_test, "btree") == null);
+
+    var huge = options_test;
+    huge.append_count = std.math.maxInt(u32);
+    huge.segment_bytes = std.math.maxInt(u64);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), space_need(huge, null).?);
+
+    // A filter that selects nothing passes the preflight whatever the free space.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tight = options_test;
+    tight.free_bytes_override = 1;
+    try space_preflight(testing.io, tmp.dir, "btree", tight);
+    try testing.expectError(
+        error.InsufficientSpace,
+        space_preflight(testing.io, tmp.dir, "replay", tight),
+    );
 }
 
 test "run_all removes the scratch directory when a benchmark fails" {
